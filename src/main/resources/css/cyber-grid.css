@@ -1,0 +1,13 @@
+ .root {
+    -fx-background-color: #0d1b2a;
+}
+.text-field {
+    -fx-background-color: #1b263b;
+    -fx-text-fill: #00ffcc;
+    -fx-font-size: 18px;
+    -fx-alignment: center;
+}
+.text-field:disabled {
+    -fx-background-color: #415a77;
+    -fx-text-fill: #e0e1dd;
+}

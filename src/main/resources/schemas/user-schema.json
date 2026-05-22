@@ -1,0 +1,47 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "SudokuPro User",
+  "type": "object",
+  "properties": {
+    "id": { "type": "integer", "minimum": 1 },
+    "username": { "type": "string", "minLength": 1 },
+    "points": { "type": "integer", "minimum": 0 },
+    "streak": { "type": "integer", "minimum": 0 },
+    "duelWins": { "type": "integer", "minimum": 0 },
+    "duelLosses": { "type": "integer", "minimum": 0 },
+    "gems": { "type": "integer", "minimum": 0 },
+    "themePreference": { "type": "string", "default": "default" },
+    "lastLogin": { "type": "string", "format": "date-time" },
+    "lastLoginIp": { "type": "string" },
+    "platform": { "type": "string" },
+    "level": { "type": "integer", "minimum": 1 },
+    "xp": { "type": "integer", "minimum": 0 },
+    "achievements": {
+      "type": "object",
+      "additionalProperties": { "type": "boolean" }
+    },
+    "powerUps": {
+      "type": "object",
+      "additionalProperties": { "type": "integer", "minimum": 0 }
+    },
+    "friends": {
+      "type": "array",
+      "items": { "type": "integer", "minimum": 1 }
+    },
+    "fanCount": { "type": "integer", "minimum": 0 },
+    "avatarUrl": { "type": "string", "default": "default-avatar.png" },
+    "matchHistory": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "timestamp": { "type": "string", "format": "date-time" },
+          "won": { "type": "boolean" }
+        },
+        "required": ["timestamp", "won"]
+      }
+    },
+    "hypeMeter": { "type": "integer", "minimum": 0 }
+  },
+  "required": ["id", "username", "points", "streak", "duelWins", "duelLosses", "gems", "themePreference", "lastLogin", "level", "xp"]
+}

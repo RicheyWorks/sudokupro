@@ -1,0 +1,19 @@
+# Maven
+target/
+!.mvn/wrapper/maven-wrapper.jar
+ECHO is on.
+# IDE
+.idea/
+*.iml
+.vscode/
+ECHO is on.
+# Docker
+.env
+ECHO is on.
+# OS
+.DS_Store
+Thumbs.db
+ECHO is on.
+# Logs
+*.log
+logs/
