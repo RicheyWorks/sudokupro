@@ -27,6 +27,7 @@ import java.io.FileWriter;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicInteger;
 
 @Component
@@ -53,8 +54,10 @@ public class ThemeManager {
     @Autowired private NotificationService notificationService;
     @Autowired private MeterRegistry meterRegistry;
 
-    private final Map<String, String> customThemes = new HashMap<>();
-    private final Map<String, String> sharedThemes = new HashMap<>();
+    // Fix: plain HashMap is not thread-safe — read by the cycling background thread while
+    // written from JavaFX / Spring request threads. Use ConcurrentHashMap throughout.
+    private final Map<String, String> customThemes = new ConcurrentHashMap<>();
+    private final Map<String, String> sharedThemes = new ConcurrentHashMap<>();
     private final Random random = new Random();
     private volatile boolean isCycling = false;
 
@@ -455,7 +458,7 @@ public class ThemeManager {
         String playerId = authService.getCurrentPlayerId();
         isCycling = !isCycling;
         if (isCycling) {
-            new Thread(() -> {
+            Thread cycler = new Thread(() -> {
                 int index = 0;
                 List<String> allThemes = new ArrayList<>(Arrays.asList(THEMES));
                 allThemes.addAll(customThemes.values());
@@ -475,7 +478,10 @@ public class ThemeManager {
                     }
                     index++;
                 }
-            }).start();
+            });
+            // Fix: mark daemon so this thread cannot prevent JVM shutdown.
+            cycler.setDaemon(true);
+            cycler.start();
             meterRegistry.counter("sudokupro.ui.theme.cycles", GLOBAL_TAGS).increment();
         } else {
             applyUserPreferredTheme(scene, playerId);

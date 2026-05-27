@@ -113,7 +113,15 @@ public class PuzzleEditorService {
             }
         }
 
-        if (!aiSolverService.solveSudoku(board)) {
+        // Solve a deep copy so the user's partial puzzle is not mutated before it is saved.
+        SudokuBoard probe = new SudokuBoard(
+            board.getBoardCopy(),
+            board.isChaosMode(),
+            board.isMirrorMode(),
+            board.getTimeLimitSeconds(),
+            java.util.UUID.randomUUID().toString()
+        );
+        if (!aiSolverService.solveSudoku(probe)) {
             throw new IllegalArgumentException("Not solvable");
         }
     }

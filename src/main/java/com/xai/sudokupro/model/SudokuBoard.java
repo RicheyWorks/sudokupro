@@ -388,18 +388,29 @@ public class SudokuBoard implements Serializable {
     // Replay
     // =====================================================================
 
-    public synchronized void replayMoves(long delayMs, javafx.scene.control.TextArea output) {
-        reset();
-        for (EnhancedMove move : replayHistory) {
-            board[move.row()][move.col()].setValue(move.newVal(), move.source());
+    public void replayMoves(long delayMs, javafx.scene.control.TextArea output) {
+        // Fix: was 'synchronized' but called Thread.sleep() inside the loop, blocking every
+        // other board operation for the full replay duration. Snapshot the history under a
+        // brief lock, then apply each move (locked individually) and sleep without the lock.
+        List<EnhancedMove> snapshot;
+        synchronized (this) {
+            reset();
+            snapshot = new java.util.ArrayList<>(replayHistory);
+        }
+        for (EnhancedMove move : snapshot) {
+            synchronized (this) {
+                board[move.row()][move.col()].setValue(move.newVal(), move.source());
+            }
             if (output != null)
                 output.appendText(String.format("Move: (%d,%d) -> %d [%s]\n",
                     move.row()+1, move.col()+1, move.newVal(), move.source()));
             try { Thread.sleep(delayMs); }
             catch (InterruptedException e) { Thread.currentThread().interrupt(); break; }
         }
-        cosmicDripLevel = calculateCosmicDripLevel();
-        if (isSolved()) solveTime = Duration.ofMillis(System.currentTimeMillis() - startTime);
+        synchronized (this) {
+            cosmicDripLevel = calculateCosmicDripLevel();
+            if (isSolved()) solveTime = Duration.ofMillis(System.currentTimeMillis() - startTime);
+        }
     }
 
     public synchronized void jumpToMove(int index) {

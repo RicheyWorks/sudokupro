@@ -58,6 +58,15 @@ public interface GameRepository extends JpaRepository<SudokuBoard, Long> {
     @Cacheable(value = "activeUnfinishedGames", key = "#since + '-' + #pageable.pageNumber")
     List<SudokuBoard> findActiveUnfinishedGames(@Param("since") LocalDateTime since, Pageable pageable);
 
+    /**
+     * Cheap count variant — used by metrics schedulers that only need the number,
+     * not the full rows.
+     */
+    @Transactional(readOnly = true)
+    @Query(value = "SELECT COUNT(*) FROM sudoku_board b WHERE b.start_time > :since AND b.is_solved = false",
+           nativeQuery = true)
+    long countActiveUnfinishedGames(@Param("since") LocalDateTime since);
+
     @Query("SELECT b FROM SudokuBoard b WHERE b.hintCount >= :minHints AND b.isSolved = false ORDER BY b.hintCount DESC")
     @Cacheable(value = "hintHeavyStrugglers", key = "#minHints + '-' + #pageable.pageNumber")
     List<SudokuBoard> findHintHeavyStrugglers(@Param("minHints") int minHints, Pageable pageable);

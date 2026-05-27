@@ -11,8 +11,11 @@ import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
 
 import java.time.LocalDateTime;
+import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.stream.Collectors;
 
 /**
  * Cosmic timer of SudokuPro's event galaxy.
@@ -50,7 +53,7 @@ public class EventScheduler {
         try {
             LocalDateTime lastTrigger = lastEventTriggers.getOrDefault("daily_challenge", LocalDateTime.MIN);
             if (LocalDateTime.now().isAfter(lastTrigger.plusHours(23))) { // Ensure ~24-hour gap
-                eventEngine.startCosmicEvents(); // Trigger all events, including daily
+                eventEngine.triggerDailyChallenge();
                 lastEventTriggers.put("daily_challenge", LocalDateTime.now());
                 logger.info("Cosmic daily challenge triggered successfully");
             } else {
@@ -72,7 +75,7 @@ public class EventScheduler {
         try {
             LocalDateTime lastTrigger = lastEventTriggers.getOrDefault("cosmic_duel", LocalDateTime.MIN);
             if (LocalDateTime.now().isAfter(lastTrigger.plusMinutes(55))) { // Ensure ~1-hour gap
-                eventEngine.startCosmicEvents(); // Trigger all events, including duel
+                eventEngine.triggerCosmicDuel();
                 lastEventTriggers.put("cosmic_duel", LocalDateTime.now());
                 logger.info("Cosmic duel triggered successfully");
             } else {
@@ -94,7 +97,7 @@ public class EventScheduler {
         try {
             LocalDateTime lastTrigger = lastEventTriggers.getOrDefault("drip_showdown", LocalDateTime.MIN);
             if (LocalDateTime.now().isAfter(lastTrigger.plusMinutes(14))) { // Ensure ~15-minute gap
-                eventEngine.startCosmicEvents(); // Trigger all events, including showdown
+                eventEngine.triggerDripShowdown();
                 lastEventTriggers.put("drip_showdown", LocalDateTime.now());
                 logger.info("Drip showdown triggered successfully");
             } else {
@@ -113,7 +116,11 @@ public class EventScheduler {
         MDC.put("thread", "event-" + eventType);
         logger.info("Manually triggering cosmic event: {}", eventType);
         try {
-            eventEngine.startCosmicEvents(); // Trigger all events, relying on EventEngine's internal logic
+            switch (eventType) {
+                case "daily_challenge" -> eventEngine.triggerDailyChallenge();
+                case "cosmic_duel"     -> eventEngine.triggerCosmicDuel();
+                case "drip_showdown"   -> eventEngine.triggerDripShowdown();
+            }
             lastEventTriggers.put(eventType, LocalDateTime.now());
             logger.info("Cosmic event {} triggered manually", eventType);
         } catch (Exception e) {

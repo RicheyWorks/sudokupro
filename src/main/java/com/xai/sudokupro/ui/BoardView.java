@@ -24,6 +24,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.util.*;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.UnaryOperator;
 import java.util.stream.Collectors;
 
@@ -45,6 +46,11 @@ public class BoardView {
     private final ListView<String>   moveHistoryList;
     private final ComboBox<String>   historyFilter;
     private final ProgressBar        difficultyProgress;
+
+    // Bug 2 fix: guard programmatic setText calls so the text listener doesn't re-fire
+    private final AtomicBoolean updatingCell = new AtomicBoolean(false);
+    // Bug 1 fix: backing list that is never filtered, so filter toggling doesn't lose entries
+    private final List<String>  allMoveHistory = new ArrayList<>();
 
     private boolean       pencilMode      = false;
     private boolean       isPaused        = false;
@@ -127,6 +133,8 @@ public class BoardView {
         }
 
         cell.textProperty().addListener((ChangeListener<String>) (obs, oldVal, newVal) -> {
+            // Bug 2 fix: ignore programmatic setText() fired from refreshCell()
+            if (updatingCell.get()) return;
             String playerId = authService.getCurrentPlayerId();
             try {
                 if (!board.isCellEditable(row, col)) return;
@@ -245,8 +253,10 @@ public class BoardView {
         try {
             board.undo();
             refresh();
-            if (!moveHistoryList.getItems().isEmpty())
-                moveHistoryList.getItems().remove(moveHistoryList.getItems().size() - 1);
+            // Bug 1 fix: remove from allMoveHistory and re-apply filter
+            if (!allMoveHistory.isEmpty())
+                allMoveHistory.remove(allMoveHistory.size() - 1);
+            Platform.runLater(this::filterMoveHistory);
             updateDifficultyProgress();
             notificationService.sendTypedNotification(pid, "ui", "Move undone");
             meterRegistry.counter("sudokupro.ui.undo", GLOBAL_TAGS).increment();
@@ -292,15 +302,21 @@ public class BoardView {
     }
 
     private void resolveConflicts() {
+        // Bug 3 fix: route through gameService so validation, persistence, and
+        // multiplayer broadcast all happen (was calling board.applyMove directly).
         String pid = authService.getCurrentPlayerId();
         boolean resolved = false;
         for (int r = 0; r < GRID_SIZE; r++) for (int c = 0; c < GRID_SIZE; c++) {
             SudokuCell cell = board.getBoard()[r][c];
             if (cell.isConflicted() && !cell.isGiven()) {
                 EnhancedMove clear = new EnhancedMove(r, c, cell.getValue(), 0, SudokuCell.MoveSource.PLAYER);
-                board.applyMove(clear, multiplayerBroadcaster);
-                updateMoveHistory(clear);
-                resolved = true;
+                try {
+                    gameService.applyMove(board.getGameId(), clear, pid);
+                    updateMoveHistory(clear);
+                    resolved = true;
+                } catch (Exception e) {
+                    logger.error("resolveConflicts failed at ({},{}): {}", r, c, e.getMessage());
+                }
             }
         }
         if (resolved) { refresh(); notificationService.sendTypedNotification(pid, "ui", "Conflicts resolved"); }
@@ -323,7 +339,17 @@ public class BoardView {
         String text = sc.getValue() == 0
             ? (sc.getPencilMarks().isEmpty() ? "" : formatPencilMarks(sc.getPencilMarks()))
             : String.valueOf(sc.getValue());
-        if (!cell.getText().equals(text)) Platform.runLater(() -> cell.setText(text));
+        // Bug 2 fix: set guard before setText so the text listener ignores the programmatic update
+        if (!cell.getText().equals(text)) {
+            Platform.runLater(() -> {
+                updatingCell.set(true);
+                try {
+                    cell.setText(text);
+                } finally {
+                    updatingCell.set(false);
+                }
+            });
+        }
         updateCellStyle(cell, row, col);
     }
 
@@ -362,18 +388,23 @@ public class BoardView {
     private void updateMoveHistory(EnhancedMove move) {
         String text = move.source() == SudokuCell.MoveSource.HINT ? "Hint Applied"
             : String.format("(%d,%d)=%d", move.row()+1, move.col()+1, move.newVal());
-        Platform.runLater(() -> { moveHistoryList.getItems().add(text); filterMoveHistory(); });
+        // Bug 1 fix: append to the immutable backing list, then re-render
+        Platform.runLater(() -> {
+            allMoveHistory.add(text);
+            filterMoveHistory();
+        });
     }
 
     private void filterMoveHistory() {
+        // Bug 1 fix: filter from allMoveHistory, not from the currently displayed list,
+        // so switching the filter back to "All" restores entries that were hidden.
         String filter = historyFilter.getValue();
-        List<String> all = new ArrayList<>(moveHistoryList.getItems());
-        List<String> filtered = all.stream().filter(item -> switch (filter) {
+        List<String> filtered = allMoveHistory.stream().filter(item -> switch (filter) {
             case "Player Moves" -> !item.equals("Hint Applied");
             case "Hints"        -> item.equals("Hint Applied");
             default             -> true;
         }).collect(Collectors.toList());
-        Platform.runLater(() -> { moveHistoryList.getItems().setAll(filtered); });
+        moveHistoryList.getItems().setAll(filtered);
     }
 
     private void updateDifficultyProgress() {

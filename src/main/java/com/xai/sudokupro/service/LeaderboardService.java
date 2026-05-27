@@ -43,18 +43,21 @@ public class LeaderboardService {
     private final AnalyticsService analyticsService;
     private final AntiCheatEngine antiCheatEngine;
     private final MultiplayerBroadcaster multiplayerBroadcaster;
+    // Fix 1: eventEngine was referenced (getPlayerEventScores) but never declared — compile error.
+    private final EventEngine eventEngine;
 
     private final Map<String, Integer> scoreDeltas = new ConcurrentHashMap<>(); // Player ID -> recent points delta
 
     @Autowired
-    public LeaderboardService(UserRepository userRepository, LeaderboardRepository leaderboardRepository, 
-                              AnalyticsService analyticsService, AntiCheatEngine antiCheatEngine, 
-                              MultiplayerBroadcaster multiplayerBroadcaster) {
+    public LeaderboardService(UserRepository userRepository, LeaderboardRepository leaderboardRepository,
+                              AnalyticsService analyticsService, AntiCheatEngine antiCheatEngine,
+                              MultiplayerBroadcaster multiplayerBroadcaster, EventEngine eventEngine) {
         this.userRepository = Objects.requireNonNull(userRepository, "UserRepository cannot be null");
         this.leaderboardRepository = Objects.requireNonNull(leaderboardRepository, "LeaderboardRepository cannot be null");
         this.analyticsService = Objects.requireNonNull(analyticsService, "AnalyticsService cannot be null");
         this.antiCheatEngine = Objects.requireNonNull(antiCheatEngine, "AntiCheatEngine cannot be null");
         this.multiplayerBroadcaster = Objects.requireNonNull(multiplayerBroadcaster, "MultiplayerBroadcaster cannot be null");
+        this.eventEngine = Objects.requireNonNull(eventEngine, "EventEngine cannot be null");
         logger.info("LeaderboardService initialized with cosmic dependencies");
     }
 
@@ -136,12 +139,20 @@ public void updateScore(Long userId, int points) {
 
             // Sort the in-memory skill-score map, filter suspicious IDs, then page.
             // Only the page's IDs are loaded from the DB via findAllById.
+            // Fix 3: guard Long.parseLong — non-numeric player IDs (e.g. "anonymous") would
+            // throw NumberFormatException and abort the entire leaderboard fetch.
             List<Long> pageIds = skillScores.entrySet().stream()
                 .filter(e -> suspicionScores.getOrDefault(e.getKey(), 0.0) <= SUSPICION_THRESHOLD)
                 .sorted(Map.Entry.<String, Double>comparingByValue().reversed())
                 .skip((long) page * size)
                 .limit(size)
-                .map(e -> Long.parseLong(e.getKey()))
+                .flatMap(e -> {
+                    try { return java.util.stream.Stream.of(Long.parseLong(e.getKey())); }
+                    catch (NumberFormatException ex) {
+                        logger.warn("Skipping non-numeric player ID in combined leaderboard: {}", e.getKey());
+                        return java.util.stream.Stream.empty();
+                    }
+                })
                 .collect(Collectors.toList());
 
             if (pageIds.isEmpty()) {
@@ -185,9 +196,17 @@ public void updateScore(Long userId, int points) {
                     e -> e.getKey().substring(0, e.getKey().indexOf("-" + eventId)),
                     Map.Entry::getValue
                 ));
-            List<User> topPlayers = userRepository.findAllById(eventScores.keySet().stream()
-                    .map(Long::parseLong)
-                    .collect(Collectors.toList())).stream()
+            // Fix 3 (cont.): same guard for event leaderboard player IDs.
+            List<Long> eventPlayerIds = eventScores.keySet().stream()
+                .flatMap(id -> {
+                    try { return java.util.stream.Stream.of(Long.parseLong(id)); }
+                    catch (NumberFormatException ex) {
+                        logger.warn("Skipping non-numeric player ID in event leaderboard: {}", id);
+                        return java.util.stream.Stream.empty();
+                    }
+                })
+                .collect(Collectors.toList());
+            List<User> topPlayers = userRepository.findAllById(eventPlayerIds).stream()
                 .sorted((u1, u2) -> Integer.compare(
                     eventScores.getOrDefault(u2.getId().toString(), 0), 
                     eventScores.getOrDefault(u1.getId().toString(), 0)))
@@ -306,10 +325,14 @@ public void updateScore(Long userId, int points) {
     }
 
     private void broadcastLeaderboardUpdate(User user, int delta) {
+        // Fix 2: broadcastLeaderboardUpdate() does not exist on MultiplayerBroadcaster — compile error.
+        // Use broadcastEvent() which is the correct existing API.
         String playerId = user.getId().toString();
-        multiplayerBroadcaster.broadcastLeaderboardUpdate(playerId, user.getPoints(), user.getCosmicDrip(), 
-            user.getHypeMeter(), user.getDuelWins(), delta);
-        logger.trace("Broadcasted leaderboard update for player {} with delta {}", playerId, delta);
+        String message = String.format(
+            "{\"playerId\":\"%s\",\"points\":%d,\"cosmicDrip\":%d,\"hypeMeter\":%d,\"duelWins\":%d,\"delta\":%d}",
+            playerId, user.getPoints(), user.getCosmicDrip(), user.getHypeMeter(), user.getDuelWins(), delta);
+        multiplayerBroadcaster.broadcastEvent("leaderboardUpdate", message, null);
+        logger.trace("Broadcast leaderboard update for player {} with delta {}", playerId, delta);
     }
 
     private void validateUserId(Long userId) {

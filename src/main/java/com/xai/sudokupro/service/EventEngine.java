@@ -71,6 +71,21 @@ public class EventEngine {
         scheduleDripShowdown();
     }
 
+    /** Triggers a single daily-challenge cycle immediately. Used by EventScheduler. */
+    public void triggerDailyChallenge() {
+        scheduleDailyChallenge();
+    }
+
+    /** Triggers a single cosmic-duel cycle immediately. Used by EventScheduler. */
+    public void triggerCosmicDuel() {
+        scheduleCosmicDuel();
+    }
+
+    /** Triggers a single drip-showdown cycle immediately. Used by EventScheduler. */
+    public void triggerDripShowdown() {
+        scheduleDripShowdown();
+    }
+
     @Retryable(maxAttempts = 3, backoff = @Backoff(delay = 5000))
     private void scheduleDailyChallenge() {
         scheduler.scheduleAtFixedRate(() -> {

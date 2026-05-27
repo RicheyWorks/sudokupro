@@ -52,11 +52,12 @@ public class SudokuGameController {
     })
     @PostMapping("/new")
     public ResponseEntity<Object> createGame(
-            @RequestParam @Min(1) @Max(5) int difficulty) {
+            @RequestParam @Min(1) @Max(4) int difficulty) {
         try {
-            // FIX: updated signature
-            SudokuBoard board = gameService.createNewGame(difficulty, "guest", false, false);
-            logger.info("New game created with difficulty {}", difficulty);
+            // Use authenticated player ID; falls back to "anonymous" for unauthenticated callers.
+            String playerId = authService.getCurrentPlayerId();
+            SudokuBoard board = gameService.createNewGame(difficulty, playerId, false, false);
+            logger.info("New game created: difficulty={} player={}", difficulty, playerId);
             return ResponseEntity.ok(board);
         } catch (Exception e) {
             logger.error("Failed to create new game: {}", e.getMessage());

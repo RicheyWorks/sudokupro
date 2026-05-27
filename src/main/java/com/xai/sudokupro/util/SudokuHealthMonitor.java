@@ -125,9 +125,31 @@ public class SudokuHealthMonitor {
             jedis.setTimeout(REDIS_TIMEOUT_MS);
             jedis.ping();
             long latency = System.currentTimeMillis() - start;
-            long usedMemory = jedis.info("memory").contains("used_memory:") ?
-                Long.parseLong(jedis.info("memory").split("used_memory:")[1].split("\n")[0].trim()) / 1024 : -1;
-            int clients = Integer.parseInt(jedis.info("clients").split("connected_clients:")[1].split("\n")[0].trim());
+
+            // Fix: cache each INFO response so we only make one round-trip per field,
+            // and parse with individual try/catch so a malformed value doesn't trigger
+            // the outer catch and record a false health failure.
+            String memInfo = jedis.info("memory");
+            long usedMemory = -1;
+            if (memInfo.contains("used_memory:")) {
+                try {
+                    usedMemory = Long.parseLong(
+                        memInfo.split("used_memory:")[1].split("\n")[0].trim()) / 1024;
+                } catch (NumberFormatException ex) {
+                    logger.warn("Could not parse Redis used_memory: {}", ex.getMessage());
+                }
+            }
+
+            String clientInfo = jedis.info("clients");
+            int clients = -1;
+            if (clientInfo.contains("connected_clients:")) {
+                try {
+                    clients = Integer.parseInt(
+                        clientInfo.split("connected_clients:")[1].split("\n")[0].trim());
+                } catch (NumberFormatException ex) {
+                    logger.warn("Could not parse Redis connected_clients: {}", ex.getMessage());
+                }
+            }
             logger.info("Redis health: OK - Latency: {}ms, UsedMemory: {}KB, Clients: {}", latency, usedMemory, clients);
             meterRegistry.gauge("sudokupro.redis.health", 1);
             meterRegistry.gauge("sudokupro.redis.latency_ms", latency);

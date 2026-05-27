@@ -120,8 +120,7 @@ public class RedisSyncScheduler {
         metrics.put("total_gems", String.valueOf(totalGems));
 
         long activeGames = gameRepository
-            .findActiveUnfinishedGames(LocalDateTime.now().minusHours(1), null)
-            .size();
+            .countActiveUnfinishedGames(LocalDateTime.now().minusHours(1));
 
         metrics.put("active_games", String.valueOf(activeGames));
 

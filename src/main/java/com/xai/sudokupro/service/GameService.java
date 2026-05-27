@@ -185,13 +185,6 @@ public class GameService {
         synchronized (lockFor(gameId)) {
             SudokuBoard board = getGame(gameId);
 
-            // Optionally detect cheat
-            if (antiCheatEngine.detectCheating(board.getSolveTime().toMillis(), board.getDifficulty())) {
-                antiCheatEngine.flagPlayer(playerId);
-                chaosEngine.onGameEvent("RAGE", playerId);
-                return;
-            }
-
             if (board.isChaosMode() && randomGenerator.chance(0.1)) triggerChaosSwap(board);
 
             board.applyMove(move, multiplayerBroadcaster);
@@ -206,6 +199,14 @@ public class GameService {
             gameRepository.save(board);
 
             if (board.isSolved()) {
+                // Check for suspiciously fast solve only after the board is actually solved.
+                // detectCheating(solveTime=0, ...) was called before applyMove, which always
+                // returned true (0 < difficulty * 10_000) and blocked every move. The check
+                // only makes sense once getSolveTime() reflects the real elapsed duration.
+                if (antiCheatEngine.detectCheating(board.getSolveTime().toMillis(), board.getDifficulty())) {
+                    antiCheatEngine.flagPlayer(playerId);
+                    chaosEngine.onGameEvent("RAGE", playerId);
+                }
                 playerStreaks.merge(playerId, 1, Integer::sum);
                 chaosEngine.onGameEvent("STREAK", playerId);
                 endGame(gameId, playerId);

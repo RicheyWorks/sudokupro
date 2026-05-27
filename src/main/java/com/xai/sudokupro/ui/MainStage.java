@@ -4,6 +4,7 @@ import com.xai.sudokupro.SudokuProApplication;
 import javafx.application.Platform;
 import javafx.stage.Modality;
 import com.xai.sudokupro.model.EnhancedMove;
+import com.xai.sudokupro.model.Move;
 import com.xai.sudokupro.model.SudokuBoard;
 import com.xai.sudokupro.service.*;
 import com.xai.sudokupro.websocket.MultiplayerBroadcaster;
@@ -74,6 +75,9 @@ public class MainStage extends Application {
     private AudioClip victorySound;
     private volatile boolean isPaused = false;
     private int timerInterval = 1000; // Default 1s
+    // Bug 5 fix: generation counter — each startTimer() call increments this so older
+    // threads see a changed generation and exit, preventing thread accumulation on reset.
+    private volatile int timerGeneration = 0;
 
     @Override
     public void init() {
@@ -99,16 +103,19 @@ public class MainStage extends Application {
                 backgroundMusic.play();
             }
 
-            // Welcome Screen
-            VBox welcomeScreen = createWelcomeScreen(primaryStage);
-            Scene welcomeScene = new Scene(welcomeScreen, 1000, 750);
-            if (cssURL != null) welcomeScene.getStylesheets().add(cssURL.toExternalForm());
-
-            // Main Game Scene
+            // Bug 4 fix: build the game scene FIRST so createWelcomeScreen can reference it.
+            // createWelcomeScreen previously called createGameScene().getScene() inside the
+            // button handler, but BorderPane.getScene() returns null until it is added to a
+            // Scene — causing an NPE crash when the start button was pressed.
             BorderPane gameRoot = createGameScene(primaryStage);
             Scene gameScene = new Scene(gameRoot, 1000, 750);
             if (cssURL != null) gameScene.getStylesheets().add(cssURL.toExternalForm());
             themeManager.applyUserPreferredTheme(gameScene, authService.getCurrentPlayerId());
+
+            // Welcome Screen (receives the already-created gameScene)
+            VBox welcomeScreen = createWelcomeScreen(primaryStage, gameScene);
+            Scene welcomeScene = new Scene(welcomeScreen, 1000, 750);
+            if (cssURL != null) welcomeScene.getStylesheets().add(cssURL.toExternalForm());
 
             // Initial Scene
             primaryStage.setScene(welcomeScene);
@@ -132,7 +139,7 @@ public class MainStage extends Application {
         }
     }
 
-    private VBox createWelcomeScreen(Stage primaryStage) {
+    private VBox createWelcomeScreen(Stage primaryStage, Scene gameScene) {
         Text welcomeTitle = new Text("Welcome to SudokuPro");
         welcomeTitle.setFont(Font.font("Orbitron", 36));
         welcomeTitle.getStyleClass().add("title-fade");
@@ -140,7 +147,9 @@ public class MainStage extends Application {
         Button startButton = new Button("Start Puzzle");
         startButton.setStyle("-fx-background-color: #4B0082; -fx-text-fill: #FFFFFF;");
         startButton.setOnAction(e -> {
-            primaryStage.setScene(createGameScene(primaryStage).getScene());
+            // Bug 4 fix: use the already-constructed gameScene instead of calling
+            // createGameScene().getScene() (BorderPane.getScene() returns null).
+            primaryStage.setScene(gameScene);
             resetBoard(primaryStage);
         });
 
@@ -281,9 +290,12 @@ public class MainStage extends Application {
     }
 
     private void startTimer(SudokuBoard board, Label timerLabel) {
-        new Thread(() -> {
+        // Bug 5 fix: increment generation so any already-running timer thread sees a changed
+        // generation and exits. Mark new thread as daemon so it doesn't block JVM shutdown.
+        final int myGeneration = ++timerGeneration;
+        Thread t = new Thread(() -> {
             long startTime = System.currentTimeMillis();
-            while (!board.isSolved()) {
+            while (!board.isSolved() && timerGeneration == myGeneration) {
                 if (!isPaused) {
                     long elapsed = System.currentTimeMillis() - startTime;
                     long minutes = elapsed / 60000;
@@ -299,16 +311,18 @@ public class MainStage extends Application {
                     break;
                 }
             }
-            if (board.isSolved()) {
+            if (board.isSolved() && timerGeneration == myGeneration) {
                 Platform.runLater(() -> {
                     timerLabel.setText("Solved in " + timerLabel.getText().substring(6));
-                    notificationService.sendTypedNotification(authService.getCurrentPlayerId(), 
+                    notificationService.sendTypedNotification(authService.getCurrentPlayerId(),
                         "game", "Puzzle solved in " + timerLabel.getText().substring(6));
                     playVictoryAnimation(boardView.getView());
                     if (victorySound != null) victorySound.play();
                 });
             }
-        }).start();
+        });
+        t.setDaemon(true);
+        t.start();
     }
 
     private void togglePause() {
@@ -387,18 +401,23 @@ public class MainStage extends Application {
     private void replayGame(Stage primaryStage) {
         try {
             String playerId = authService.getCurrentPlayerId();
-            List<? extends Move> moveHistory = boardView.getBoard().getMoveHistory();
-            resetBoard(primaryStage); // Reset to fresh board
-            new Thread(() -> {
+            // Capture history before reset (getMoveHistory() returns a defensive copy)
+            List<Move> moveHistory = boardView.getBoard().getMoveHistory();
+            resetBoard(primaryStage);
+            Thread replayThread = new Thread(() -> {
                 for (Move move : moveHistory) {
                     try {
                         if (!isPaused) {
-                            gameService.applyMove(boardView.getBoard().getGameId(), move, playerId);
+                            // Bug 6 fix: gameService.applyMove expects EnhancedMove, but
+                            // getMoveHistory() returns List<Move>. Convert each entry.
+                            EnhancedMove em = new EnhancedMove(
+                                move.row(), move.col(), move.oldVal(), move.newVal(), move.source());
+                            gameService.applyMove(boardView.getBoard().getGameId(), em, playerId);
                             Platform.runLater(() -> {
                                 boardView.refresh();
                                 updateStats();
                             });
-                            Thread.sleep(1000); // Replay at 1s intervals
+                            Thread.sleep(1000);
                         }
                     } catch (Exception e) {
                         logger.error("Replay failed for move {}: {}", move, e.getMessage(), e);
@@ -406,7 +425,9 @@ public class MainStage extends Application {
                     }
                 }
                 notificationService.sendTypedNotification(playerId, "ui", "Replay completed");
-            }).start();
+            });
+            replayThread.setDaemon(true);
+            replayThread.start();
             logger.info("Replay started for player {}", playerId);
         } catch (Exception e) {
             logger.error("Failed to start replay: {}", e.getMessage(), e);

@@ -15,6 +15,8 @@ import org.springframework.retry.annotation.Retryable;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
 
+import org.springframework.data.domain.PageRequest;
+
 import java.time.LocalDateTime;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
@@ -238,7 +240,9 @@ public class AntiCheatScheduler {
     }
 
     private void checkBoardPatterns(LocalDateTime cutoff, Map<String, Double> suspicionScores) {
-        List<SudokuBoard> recentBoards = gameRepository.findActiveUnfinishedGames(cutoff, null)
+        // Cap at 500 boards per cycle — avoids loading unbounded rows in production.
+        // The query already filters by start_time > cutoff, so the in-stream filter below is redundant but harmless.
+        List<SudokuBoard> recentBoards = gameRepository.findActiveUnfinishedGames(cutoff, PageRequest.of(0, 500))
             .stream()
             .filter(b -> b.getStartTime().isAfter(cutoff))
             .collect(Collectors.toList());

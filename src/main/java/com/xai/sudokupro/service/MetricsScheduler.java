@@ -129,8 +129,7 @@ public class MetricsScheduler {
             logger.debug("Reported total gems: {}", totalGems);
 
             // Active Games (last hour)
-            List<SudokuBoard> activeGamesList = gameRepository.findActiveUnfinishedGames(LocalDateTime.now().minusHours(1), null);
-            long activeGames = activeGamesList.size();
+            long activeGames = gameRepository.countActiveUnfinishedGames(LocalDateTime.now().minusHours(1));
             activeGamesGauge.set(activeGames);
             logger.debug("Reported active games: {}", activeGames);
 

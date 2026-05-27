@@ -70,6 +70,10 @@ public class AntiCheatEngine {
     }
 
     public synchronized boolean detectCheating(long solveTime, int difficulty) {
+        // solveTime == 0 means the board is not yet solved (Duration.ZERO is the initial value).
+        // Checking an unsolved board always returned true and blocked every move. Defense-in-depth:
+        // only flag when there is an actual elapsed time to compare against the threshold.
+        if (solveTime <= 0) return false;
         return solveTime < (difficulty * MIN_SOLVE_TIME_PER_DIFFICULTY);
     }
 
