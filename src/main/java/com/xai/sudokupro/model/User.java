@@ -10,8 +10,6 @@ import jakarta.validation.constraints.NotBlank;
 import jakarta.validation.constraints.NotNull;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.stereotype.Component;
 
 import java.io.Serializable;
 import java.time.LocalDateTime;
@@ -24,7 +22,6 @@ import java.util.stream.Collectors;
  */
 @Entity
 @Table(name = "users")
-@Component
 public class User implements Serializable {
     private static final long serialVersionUID = 1L;
     private static final Logger logger = LoggerFactory.getLogger(User.class);
@@ -88,11 +85,14 @@ public class User implements Serializable {
     @Min(value = 0, message = "Cosmic drip cannot be negative")
     private int cosmicDrip;
 
-    private final ObjectMapper mapper;
+    // ObjectMapper is thread-safe after construction; a single shared instance is correct here.
+    // It must NOT be injected via @Autowired because JPA creates User instances via its own
+    // no-arg reflection path, completely bypassing Spring's constructor injection.
+    private static final ObjectMapper MAPPER = new ObjectMapper()
+        .findAndRegisterModules(); // picks up JavaTimeModule etc. from the classpath
 
-    @Autowired
-    public User(ObjectMapper mapper) {
-        this.mapper = Objects.requireNonNull(mapper, "ObjectMapper cannot be null");
+    /** Required by JPA — do not call directly from application code. */
+    protected User() {
         this.achievements = new HashMap<>();
         this.powerUps = new HashMap<>();
         this.friends = Collections.synchronizedSet(new HashSet<>());
@@ -102,10 +102,9 @@ public class User implements Serializable {
         this.cosmicDrip = 0;
         initializeAchievements();
         initializePowerUps();
-        logger.info("User initialized with default constructor");
     }
 
-    public User(Long id, String username, ObjectMapper mapper) {
+    public User(Long id, String username) {
         this.id = id;
         this.username = Objects.requireNonNull(username, "Username cannot be null");
         this.points = 0;
@@ -127,7 +126,6 @@ public class User implements Serializable {
         this.matchHistory = Collections.synchronizedList(new ArrayList<>());
         this.hypeMeter = 0;
         this.cosmicDrip = 0;
-        this.mapper = Objects.requireNonNull(mapper, "ObjectMapper cannot be null");
         initializeAchievements();
         initializePowerUps();
         logger.info("User initialized: id={}, username={}", id, username);
@@ -413,7 +411,7 @@ public class User implements Serializable {
             profile.put("gems", gems);
             profile.put("themePreference", themePreference);
             profile.put("lastLogin", lastLogin.toString());
-            profile.put("lastLoginIp", lastLoginIp);
+            // lastLoginIp intentionally omitted — PII, must not be exposed in profile exports
             profile.put("platform", platform);
             profile.put("level", level);
             profile.put("xp", xp);
@@ -426,7 +424,7 @@ public class User implements Serializable {
             profile.put("hypeMeter", hypeMeter);
             profile.put("cosmicDrip", cosmicDrip);
             profile.put("version", "1.0"); // Add versioning
-            String json = mapper.writeValueAsString(profile);
+            String json = MAPPER.writeValueAsString(profile);
             logger.debug("Exported player profile for {}: {} bytes", username, json.length());
             return json;
         } catch (Exception e) {

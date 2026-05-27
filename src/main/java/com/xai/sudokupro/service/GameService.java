@@ -41,6 +41,16 @@ public class GameService {
     private final Map<String, Integer>     playerCosmicPts  = new ConcurrentHashMap<>();
     private final Map<String, Long>        lockedPlayers    = new ConcurrentHashMap<>();
 
+    /**
+     * Per-game mutex objects.  Every state-changing operation on a specific game
+     * synchronizes on {@code gameLocks.get(gameId)} rather than {@code this}, so
+     * games that share no state can proceed in parallel.
+     * Game creation still uses a narrow {@code creationLock} to serialise the
+     * MAX_ACTIVE_GAMES trim — that path is infrequent and unrelated to in-game ops.
+     */
+    private final ConcurrentHashMap<String, Object> gameLocks   = new ConcurrentHashMap<>();
+    private final Object                            creationLock = new Object();
+
     @Autowired
     public GameService(AISolverService aiSolverService, GameRepository gameRepository,
                        MultiplayerBroadcaster multiplayerBroadcaster,
@@ -75,16 +85,16 @@ public class GameService {
     }
 
     /** Full overload. */
-    public synchronized SudokuBoard createNewGame(int difficulty, String playerId,
-                                                   boolean chaosMode, boolean mirrorMode,
-                                                   boolean timeAttack, boolean infiniteMode,
-                                                   boolean cosmicMode) {
+    public SudokuBoard createNewGame(int difficulty, String playerId,
+                                     boolean chaosMode, boolean mirrorMode,
+                                     boolean timeAttack, boolean infiniteMode,
+                                     boolean cosmicMode) {
         validateDifficulty(difficulty);
         String pid = (playerId == null || playerId.isBlank()) ? "anonymous" : playerId;
 
+        // Board construction is expensive (backtracking solver); do it outside the lock.
         String gameId = UUID.randomUUID().toString();
         long timeLimit = timeAttack ? Constants.TIME_ATTACK_SECONDS : 0;
-
         SudokuBoard board = new SudokuBoard(difficulty, chaosMode, mirrorMode, timeLimit, gameId);
         board.setPlayerId(pid);
         if (infiniteMode) board.setLives(Constants.INFINITE_MODE_LIVES);
@@ -93,14 +103,17 @@ public class GameService {
         board.setTimeAttack(timeAttack);
         board.setInfiniteMode(infiniteMode);
 
-        activeGames.put(gameId, board);
+        // Register and trim under a narrow creation lock so MAX_ACTIVE_GAMES is enforced atomically.
+        synchronized (creationLock) {
+            activeGames.put(gameId, board);
+            gameLocks.put(gameId, new Object());
+            trimActiveGames();
+        }
         saveToRedis(gameId, board);
         gameRepository.save(board);
-        aiSolverService.setCurrentBoard(board);
         chaosEngine.onGameEvent("RESET", pid);
         multiplayerBroadcaster.broadcastGameStart(gameId, pid);
         logger.info("Game created id={} player={} difficulty={}", gameId, pid, difficulty);
-        trimActiveGames();
         return board;
     }
 
@@ -108,82 +121,97 @@ public class GameService {
     // getGame
     // =====================================================================
 
-    public synchronized SudokuBoard getGame(String gameId) {
+    public SudokuBoard getGame(String gameId) {
         validateGameId(gameId);
-        SudokuBoard board = activeGames.get(gameId);
-        if (board == null) {
-            board = redisTemplate.opsForValue().get(redisKey(gameId));
+        synchronized (lockFor(gameId)) {
+            SudokuBoard board = activeGames.get(gameId);
             if (board == null) {
-                board = gameRepository.findByGameId(gameId);
+                board = redisTemplate.opsForValue().get(redisKey(gameId));
                 if (board == null) {
-                    throw new IllegalArgumentException("Game not found: " + gameId);
+                    board = gameRepository.findByGameId(gameId);
+                    if (board == null) {
+                        throw new IllegalArgumentException("Game not found: " + gameId);
+                    }
                 }
+                activeGames.put(gameId, board);
+                saveToRedis(gameId, board);
             }
-            activeGames.put(gameId, board);
-            saveToRedis(gameId, board);
+            return board;
         }
-        return board;
     }
 
     // =====================================================================
     // getHint
     // =====================================================================
 
-    /** No-arg version for REST controller (uses last active board). */
-    public String getHint() {
-        if (activeGames.isEmpty()) return "No active game.";
-        String gameId = activeGames.keySet().iterator().next();
+    /** Hint for a specific player — finds their active game, or returns a clear error message. */
+    public String getHintForPlayer(String playerId) {
+        if (playerId == null || playerId.isBlank()) return "No player specified.";
+        String gameId = findActiveGameForPlayer(playerId);
+        if (gameId == null) return "No active game found for player.";
         return getHint(gameId);
     }
 
-    public synchronized String getHint(String gameId) {
+    /** Returns the gameId of the player's current active game, or null if none. */
+    public String findActiveGameForPlayer(String playerId) {
+        return activeGames.entrySet().stream()
+            .filter(e -> playerId.equals(e.getValue().getPlayerId()))
+            .map(Map.Entry::getKey)
+            .findFirst()
+            .orElse(null);
+    }
+
+    public String getHint(String gameId) {
         validateGameId(gameId);
-        SudokuBoard board = getGame(gameId);
-        aiSolverService.setCurrentBoard(board);
-        String hint = aiSolverService.getNextLogicalMove(board);
-        analyticsService.recordEvent(new GameEvent(GameEvent.EventType.HINT, board.getPlayerId(),
-            Map.of("hint", hint, "gameId", gameId)));
-        return hint;
+        synchronized (lockFor(gameId)) {
+            SudokuBoard board = getGame(gameId);
+            String hint = aiSolverService.getNextLogicalMove(board);
+            analyticsService.recordEvent(new GameEvent(GameEvent.EventType.HINT, board.getPlayerId(),
+                Map.of("hint", hint, "gameId", gameId)));
+            return hint;
+        }
     }
 
     // =====================================================================
     // applyMove
     // =====================================================================
 
-    public synchronized void applyMove(String gameId, EnhancedMove move, String playerId) {
+    public void applyMove(String gameId, EnhancedMove move, String playerId) {
         validateGameId(gameId); validateMove(move); validatePlayerId(playerId);
         if (isPlayerLocked(playerId)) {
             logger.warn("Player {} is locked, rejecting move", playerId);
             return;
         }
-        SudokuBoard board = getGame(gameId);
+        synchronized (lockFor(gameId)) {
+            SudokuBoard board = getGame(gameId);
 
-        // Optionally detect cheat
-        if (antiCheatEngine.detectCheating(board.getSolveTime().toMillis(), board.getDifficulty())) {
-            antiCheatEngine.flagPlayer(playerId);
-            chaosEngine.onGameEvent("RAGE", playerId);
-            return;
-        }
+            // Optionally detect cheat
+            if (antiCheatEngine.detectCheating(board.getSolveTime().toMillis(), board.getDifficulty())) {
+                antiCheatEngine.flagPlayer(playerId);
+                chaosEngine.onGameEvent("RAGE", playerId);
+                return;
+            }
 
-        if (board.isChaosMode() && randomGenerator.chance(0.1)) triggerChaosSwap(board);
+            if (board.isChaosMode() && randomGenerator.chance(0.1)) triggerChaosSwap(board);
 
-        board.applyMove(move, multiplayerBroadcaster);
-        antiCheatEngine.recordMove(playerId, false);
+            board.applyMove(move, multiplayerBroadcaster);
+            antiCheatEngine.recordMove(playerId, false);
 
-        analyticsService.recordEvent(new GameEvent(GameEvent.EventType.MOVE, playerId,
-            Map.of("row", String.valueOf(move.row()), "col", String.valueOf(move.col()),
-                   "value", String.valueOf(move.newVal()))));
+            analyticsService.recordEvent(new GameEvent(GameEvent.EventType.MOVE, playerId,
+                Map.of("row", String.valueOf(move.row()), "col", String.valueOf(move.col()),
+                       "value", String.valueOf(move.newVal()))));
 
-        chaosEngine.onGameEvent("MOVE", playerId);
-        saveToRedis(gameId, board);
-        gameRepository.save(board);
+            chaosEngine.onGameEvent("MOVE", playerId);
+            saveToRedis(gameId, board);
+            gameRepository.save(board);
 
-        if (board.isSolved()) {
-            playerStreaks.merge(playerId, 1, Integer::sum);
-            chaosEngine.onGameEvent("STREAK", playerId);
-            endGame(gameId, playerId);
-        } else if (board.isInfiniteMode() && board.getLives() <= 0) {
-            endGame(gameId, playerId);
+            if (board.isSolved()) {
+                playerStreaks.merge(playerId, 1, Integer::sum);
+                chaosEngine.onGameEvent("STREAK", playerId);
+                endGame(gameId, playerId);
+            } else if (board.isInfiniteMode() && board.getLives() <= 0) {
+                endGame(gameId, playerId);
+            }
         }
     }
 
@@ -191,41 +219,54 @@ public class GameService {
     // endGame / solveSudoku / rewind / reset / lock
     // =====================================================================
 
-    public synchronized void endGame(String gameId, String playerId) {
+    public void endGame(String gameId, String playerId) {
         validateGameId(gameId);
-        SudokuBoard board = activeGames.remove(gameId);
-        if (board != null) {
-            redisTemplate.delete(redisKey(gameId));
-            gameRepository.save(board);
-            GameEvent.EventType type = board.isSolved()
-                ? GameEvent.EventType.SOLVE : GameEvent.EventType.LEAVE;
-            analyticsService.recordEvent(new GameEvent(type, playerId,
-                Map.of("solveTimeSeconds", String.valueOf(board.getSolveTime().toSeconds()))));
-            multiplayerBroadcaster.broadcastGameEnd(gameId, playerId);
-            logger.info("Game {} ended for player {}", gameId, playerId);
+        synchronized (lockFor(gameId)) {
+            SudokuBoard board = activeGames.remove(gameId);
+            if (board != null) {
+                gameLocks.remove(gameId);   // release per-game lock entry
+                redisTemplate.delete(redisKey(gameId));
+                gameRepository.save(board);
+                GameEvent.EventType type = board.isSolved()
+                    ? GameEvent.EventType.SOLVE : GameEvent.EventType.LEAVE;
+                analyticsService.recordEvent(new GameEvent(type, playerId,
+                    Map.of("solveTimeSeconds", String.valueOf(board.getSolveTime().toSeconds()))));
+                multiplayerBroadcaster.broadcastGameEnd(gameId, playerId);
+                logger.info("Game {} ended for player {}", gameId, playerId);
+            }
         }
     }
 
-    public synchronized void solveSudoku(String gameId) {
+    public void solveSudoku(String gameId) {
         validateGameId(gameId);
-        SudokuBoard board = getGame(gameId);
-        aiSolverService.setCurrentBoard(board);
-        aiSolverService.solveSudoku();
-        saveToRedis(gameId, board);
+        synchronized (lockFor(gameId)) {
+            SudokuBoard board = getGame(gameId);
+            aiSolverService.solveSudoku(board);
+            saveToRedis(gameId, board);
+        }
     }
 
-    public synchronized void rewindGame(String playerId, int turns) {
+    public void rewindGame(String playerId, int turns) {
         validatePlayerId(playerId);
-        activeGames.values().stream()
-            .filter(b -> playerId.equals(b.getPlayerId()))
-            .forEach(b -> { for (int i = 0; i < turns && !b.getMoveHistory().isEmpty(); i++) b.undo(); });
+        activeGames.entrySet().stream()
+            .filter(e -> playerId.equals(e.getValue().getPlayerId()))
+            .forEach(e -> {
+                synchronized (lockFor(e.getKey())) {
+                    SudokuBoard b = e.getValue();
+                    for (int i = 0; i < turns && !b.getMoveHistory().isEmpty(); i++) b.undo();
+                }
+            });
     }
 
-    public synchronized void resetBoard(String playerId) {
+    public void resetBoard(String playerId) {
         validatePlayerId(playerId);
-        activeGames.values().stream()
-            .filter(b -> playerId.equals(b.getPlayerId()))
-            .forEach(SudokuBoard::reset);
+        activeGames.entrySet().stream()
+            .filter(e -> playerId.equals(e.getValue().getPlayerId()))
+            .forEach(e -> {
+                synchronized (lockFor(e.getKey())) {
+                    e.getValue().reset();
+                }
+            });
     }
 
     public void lockPlayerInput(String playerId, long durationMs) {
@@ -293,6 +334,7 @@ public class GameService {
             catch (Exception e) { logger.error("Shutdown save failed for {}: {}", id, e.getMessage()); }
         });
         activeGames.clear();
+        gameLocks.clear();
         logger.info("GameService shutdown complete");
     }
 
@@ -300,9 +342,15 @@ public class GameService {
     // Private helpers
     // =====================================================================
 
+    /** Returns (and creates if absent) the per-game mutex for {@code gameId}. */
+    private Object lockFor(String gameId) {
+        return gameLocks.computeIfAbsent(gameId, id -> new Object());
+    }
+
     private void validateDifficulty(int d) {
-        if (d < Constants.MIN_DIFFICULTY || d > Constants.MAX_DIFFICULTY)
-            throw new IllegalArgumentException("Difficulty must be " + Constants.MIN_DIFFICULTY + "-" + Constants.MAX_DIFFICULTY);
+        if (d < Constants.MIN_DIFFICULTY_TIER || d > Constants.MAX_DIFFICULTY_TIER)
+            throw new IllegalArgumentException(
+                "Difficulty must be " + Constants.MIN_DIFFICULTY_TIER + "-" + Constants.MAX_DIFFICULTY_TIER);
     }
     private void validateGameId(String id)  { if (id==null||id.isBlank()) throw new IllegalArgumentException("gameId blank"); }
     private void validatePlayerId(String id){ if (id==null||id.isBlank()) throw new IllegalArgumentException("playerId blank"); }
@@ -322,7 +370,9 @@ public class GameService {
             Iterator<Map.Entry<String,SudokuBoard>> it = activeGames.entrySet().iterator();
             while (activeGames.size() > MAX_ACTIVE_GAMES && it.hasNext()) {
                 Map.Entry<String,SudokuBoard> e = it.next();
-                gameRepository.save(e.getValue()); it.remove();
+                gameRepository.save(e.getValue());
+                gameLocks.remove(e.getKey());
+                it.remove();
             }
         }
     }

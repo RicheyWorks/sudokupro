@@ -116,7 +116,10 @@ public class SudokuBoard implements Serializable {
                 board[i][j].setValue(solved[i][j], SudokuCell.MoveSource.INITIAL);
                 board[i][j].setGiven(true);
             }
-        // Remove cells based on difficulty 1-5 → 28-56 removed
+        // Remove cells based on difficulty 1-5 → 28-56 removed.
+        // Each candidate removal is validated with hasUniqueSolution() so the puzzle
+        // always has exactly one solution.  The snapshot is rebuilt from the live board
+        // each time because setValue() mutates cells in-place.
         int toRemove = Math.min(28 + (difficulty - 1) * 7, 56);
         int attempts = 0;
         int removed  = 0;
@@ -124,9 +127,16 @@ public class SudokuBoard implements Serializable {
             int row = BOARD_RNG.nextInt(size);
             int col = BOARD_RNG.nextInt(size);
             if (board[row][col].getValue() != 0) {
+                int saved = board[row][col].getValue();
                 board[row][col].setValue(0);
                 board[row][col].setGiven(false);
-                removed++;
+                if (hasUniqueSolution(copyBoard())) {
+                    removed++;
+                } else {
+                    // Removing this cell breaks uniqueness — put it back
+                    board[row][col].setValue(saved);
+                    board[row][col].setGiven(true);
+                }
             }
             attempts++;
         }
@@ -428,12 +438,23 @@ public class SudokuBoard implements Serializable {
             for (int j = 0; j < size; j++) {
                 int v = board[i][j].getValue();
                 if (v == 0) return false;
-                // Temporarily clear to check validity
-                board[i][j].setValue(0);
-                boolean ok = isValidMove(i, j, v);
-                board[i][j].setValue(v);
-                if (!ok) return false;
+                // Check uniqueness without mutating the board — skip the cell itself
+                if (!isValueUniqueAt(i, j, v)) return false;
             }
+        return true;
+    }
+
+    /** Returns true when {@code value} does not appear elsewhere in the same row, column, or 3×3 box. */
+    private boolean isValueUniqueAt(int row, int col, int value) {
+        for (int c = 0; c < size; c++)
+            if (c != col && board[row][c].getValue() == value) return false;
+        for (int r = 0; r < size; r++)
+            if (r != row && board[r][col].getValue() == value) return false;
+        int[] s = getBoxStart(row, col);
+        for (int i = 0; i < 3; i++)
+            for (int j = 0; j < 3; j++)
+                if ((s[0]+i != row || s[1]+j != col) && board[s[0]+i][s[1]+j].getValue() == value)
+                    return false;
         return true;
     }
 

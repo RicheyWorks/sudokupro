@@ -123,8 +123,8 @@ public class MetricsScheduler {
             meterRegistry.counter("sudokupro.active.users", Tags.concat(GLOBAL_TAGS, Tags.of("period", "24h"))).increment(activeUsers);
             logger.debug("Reported active users: {}", activeUsers);
 
-            // Total Gems in System
-            long totalGems = userRepository.findAll().stream().mapToLong(User::getGems).sum();
+            // Total Gems in System — aggregate query avoids loading all rows into heap
+            long totalGems = userRepository.getTotalGems();
             totalGemsGauge.set(totalGems);
             logger.debug("Reported total gems: {}", totalGems);
 
@@ -196,19 +196,15 @@ public class MetricsScheduler {
             reportSolveTimeBuckets(avgSolveTime);
             logger.debug("Reported average solve time: {}s", avgSolveTime);
 
-            // Total Points by Theme
-            List<User> allUsers = userRepository.findAll();
+            // Total Points by Theme — one aggregate query per theme instead of full table load
             for (String theme : THEMES) {
-                long themePoints = allUsers.stream()
-                    .filter(u -> theme.equals(u.getThemePreference()))
-                    .mapToLong(User::getPoints)
-                    .sum();
+                long themePoints = userRepository.getTotalPointsByTheme(theme);
                 themePointsGauges.get(theme).set(themePoints);
                 logger.debug("Reported total points for theme {}: {}", theme, themePoints);
             }
 
-            // Users by Leaderboard Tier
-            reportUsersByTier(allUsers);
+            // Users by Leaderboard Tier — aggregate COUNT queries, no full table scan
+            reportUsersByTier();
             logger.debug("Reported users by leaderboard tier");
 
             // Suspicious Players (daily reset)
@@ -269,7 +265,12 @@ public class MetricsScheduler {
 
     public void recordDuelOutcome(String playerId, boolean won) {
         validatePlayerId(playerId);
-        LeaderboardService.LeaderboardSnapshot rank = leaderboardService.getPlayerRank(Long.parseLong(playerId));
+        LeaderboardService.LeaderboardSnapshot rank = null;
+        try {
+            rank = leaderboardService.getPlayerRank(Long.parseLong(playerId));
+        } catch (NumberFormatException e) {
+            logger.debug("Cannot look up rank for non-numeric playerId '{}', defaulting to Unranked", playerId);
+        }
         String tier = rank != null ? rank.tier() : "Unranked";
         String outcome = won ? "win" : "loss";
         meterRegistry.counter("sudokupro.duels.by.tier", 
@@ -289,15 +290,12 @@ public class MetricsScheduler {
      * - sudokupro.tiers.gold
      * - sudokupro.tiers.cosmic
      */
-    private void reportUsersByTier(List<User> allUsers) {
-        long bronze = allUsers.stream()
-            .filter(u -> u.getPoints() >= TIER_THRESHOLDS[0] && u.getPoints() < TIER_THRESHOLDS[1]).count();
-        long silver = allUsers.stream()
-            .filter(u -> u.getPoints() >= TIER_THRESHOLDS[1] && u.getPoints() < TIER_THRESHOLDS[2]).count();
-        long gold = allUsers.stream()
-            .filter(u -> u.getPoints() >= TIER_THRESHOLDS[2] && u.getPoints() < TIER_THRESHOLDS[3]).count();
-        long cosmic = allUsers.stream()
-            .filter(u -> u.getPoints() >= TIER_THRESHOLDS[3]).count();
+    /** Uses aggregate COUNT queries — no full table load required. */
+    private void reportUsersByTier() {
+        long bronze = userRepository.countUsersInPointsRange(TIER_THRESHOLDS[0], TIER_THRESHOLDS[1]);
+        long silver = userRepository.countUsersInPointsRange(TIER_THRESHOLDS[1], TIER_THRESHOLDS[2]);
+        long gold   = userRepository.countUsersInPointsRange(TIER_THRESHOLDS[2], TIER_THRESHOLDS[3]);
+        long cosmic = userRepository.countUsersWithMinPoints(TIER_THRESHOLDS[3]);
 
         tierGauges.get("Bronze").set(bronze);
         tierGauges.get("Silver").set(silver);

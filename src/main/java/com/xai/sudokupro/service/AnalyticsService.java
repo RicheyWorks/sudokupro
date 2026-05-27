@@ -13,6 +13,7 @@ import org.springframework.stereotype.Service;
 import java.time.LocalDateTime;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
+import org.springframework.data.domain.PageRequest;
 import java.util.stream.Collectors;
 
 @Service
@@ -99,12 +100,10 @@ public class AnalyticsService {
 
         validatePlayerId(playerId);
 
-        Optional<SudokuBoard> latestBoard = gameRepository.findAll().stream()
-                .filter(b -> playerId.equals(b.getGameId()))
-                .findFirst();
+        // Fetch only the most recent game for this player — avoids full table scan
+        List<SudokuBoard> boards = gameRepository.findByPlayerId(playerId, PageRequest.of(0, 1));
 
-        if (latestBoard.isPresent()) {
-
+        if (!boards.isEmpty()) {
             Map<String, Integer> aiHotspots = aiSolverService.getCosmicHotspotMap();
 
             Map<String, Integer> playerCells =
@@ -184,22 +183,22 @@ public class AnalyticsService {
     }
 
     public Map<String, Integer> getDuelWins() {
-        return duelWins;
+        return Collections.unmodifiableMap(duelWins);
     }
 
     public Map<String, Integer> getMistakeHeatmap() {
-        return mistakeHeatmap;
+        return Collections.unmodifiableMap(mistakeHeatmap);
     }
 
     public Map<String, Integer> getCosmicDripHeatmap() {
-        return cosmicDripHeatmap;
+        return Collections.unmodifiableMap(cosmicDripHeatmap);
     }
 
     public Map<String, Long> getSolveTimes() {
-        return solveTimes;
+        return Collections.unmodifiableMap(solveTimes);
     }
 
     public Map<String, Integer> getHintUsage() {
-        return hintUsage;
+        return Collections.unmodifiableMap(hintUsage);
     }
 }

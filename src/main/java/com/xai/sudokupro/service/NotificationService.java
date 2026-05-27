@@ -62,6 +62,7 @@ public class NotificationService {
             trimQueue();
 
         } catch (Exception e) {
+            logger.warn("WebSocket send failed for player {} — falling back to push queue: {}", playerId, e.getMessage(), e);
             queuePushNotification(notification);
         }
     }
@@ -85,6 +86,7 @@ public class NotificationService {
             trimQueue();
 
         } catch (Exception e) {
+            logger.warn("WebSocket typed send failed for player {} type '{}' — falling back to push queue: {}", playerId, type, e.getMessage(), e);
             queuePushNotification(notification);
         }
     }
@@ -96,7 +98,8 @@ public class NotificationService {
 
         try {
             multiplayerBroadcaster.broadcastEvent(type, message, null);
-        } catch (Exception ignored) {
+        } catch (Exception e) {
+            logger.error("Broadcast failed for type '{}': {}", type, e.getMessage(), e);
         }
     }
 

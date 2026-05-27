@@ -1,5 +1,7 @@
 package com.xai.sudokupro.service;
 
+import com.xai.sudokupro.model.SudokuBoard;
+import com.xai.sudokupro.model.SudokuCell;
 import com.xai.sudokupro.model.User;
 import com.xai.sudokupro.repository.GameRepository;
 import com.xai.sudokupro.repository.UserRepository;
@@ -127,7 +129,7 @@ public class AntiCheatScheduler {
             .filter(e -> analyticsService.getLastEventTimestamps().getOrDefault(e.getKey(), cutoff).isAfter(cutoff))
             .forEach(e -> {
                 String playerId = e.getKey();
-                User user = userRepository.findById(Long.parseLong(playerId)).orElse(null);
+                User user = findUserByPlayerId(playerId);
                 if (user != null) {
                     double suspicionScore = suspicionScores.getOrDefault(playerId, 0.0);
                     LocalDateTime lastSpike = lastCosmicDripSpike.getOrDefault(playerId, cutoff);
@@ -146,7 +148,7 @@ public class AntiCheatScheduler {
             .filter(e -> e.getValue() > MOVE_RATE_THRESHOLD)
             .forEach(e -> {
                 String playerId = e.getKey();
-                User user = userRepository.findById(Long.parseLong(playerId)).orElse(null);
+                User user = findUserByPlayerId(playerId);
                 if (user != null) {
                     double suspicionScore = suspicionScores.getOrDefault(playerId, 0.0);
                     if (suspicionScore >= SUSPICION_SCORE_THRESHOLD) {
@@ -163,7 +165,7 @@ public class AntiCheatScheduler {
             .filter(e -> e.getValue() > COSMIC_STREAK_THRESHOLD)
             .forEach(e -> {
                 String playerId = e.getKey();
-                User user = userRepository.findById(Long.parseLong(playerId)).orElse(null);
+                User user = findUserByPlayerId(playerId);
                 if (user != null) {
                     double suspicionScore = suspicionScores.getOrDefault(playerId, 0.0);
                     if (suspicionScore >= SUSPICION_SCORE_THRESHOLD) {
@@ -181,7 +183,7 @@ public class AntiCheatScheduler {
             .forEach(e -> {
                 String ip = e.getKey();
                 e.getValue().forEach((playerId, count) -> {
-                    User user = userRepository.findById(Long.parseLong(playerId)).orElse(null);
+                    User user = findUserByPlayerId(playerId);
                     if (user != null) {
                         double suspicionScore = suspicionScores.getOrDefault(playerId, 0.0);
                         if (suspicionScore >= SUSPICION_SCORE_THRESHOLD) {
@@ -202,7 +204,7 @@ public class AntiCheatScheduler {
                 .count() > DEVICE_SWITCH_THRESHOLD)
             .forEach(e -> {
                 String playerId = e.getKey();
-                User user = userRepository.findById(Long.parseLong(playerId)).orElse(null);
+                User user = findUserByPlayerId(playerId);
                 if (user != null) {
                     double suspicionScore = suspicionScores.getOrDefault(playerId, 0.0);
                     long switchCount = e.getValue().entrySet().stream()
@@ -223,7 +225,7 @@ public class AntiCheatScheduler {
             .filter(e -> e.getValue() > avgSkill + SKILL_SCORE_ANOMALY_THRESHOLD)
             .forEach(e -> {
                 String playerId = e.getKey();
-                User user = userRepository.findById(Long.parseLong(playerId)).orElse(null);
+                User user = findUserByPlayerId(playerId);
                 if (user != null) {
                     double suspicionScore = suspicionScores.getOrDefault(playerId, 0.0);
                     if (suspicionScore >= SUSPICION_SCORE_THRESHOLD) {
@@ -241,8 +243,8 @@ public class AntiCheatScheduler {
             .filter(b -> b.getStartTime().isAfter(cutoff))
             .collect(Collectors.toList());
         recentBoards.forEach(board -> {
-            String playerId = board.getGameId(); // Assuming gameId ties to playerId for simplicity
-            User user = userRepository.findById(Long.parseLong(playerId)).orElse(null);
+            String playerId = board.getPlayerId();
+            User user = findUserByPlayerId(playerId);
             if (user != null) {
                 double suspicionScore = suspicionScores.getOrDefault(playerId, 0.0);
                 int cosmicMoves = (int) board.getMoveHistory().stream()
@@ -261,6 +263,23 @@ public class AntiCheatScheduler {
                 }
             }
         });
+    }
+
+    /**
+     * Safely resolves a User from a playerId string.
+     * Returns null (and logs a warning) for anonymous, blank, or non-numeric IDs
+     * instead of throwing NumberFormatException.
+     */
+    private User findUserByPlayerId(String playerId) {
+        if (playerId == null || playerId.isBlank() || "anonymous".equals(playerId)) {
+            return null;
+        }
+        try {
+            return userRepository.findById(Long.parseLong(playerId)).orElse(null);
+        } catch (NumberFormatException e) {
+            logger.debug("Skipping non-numeric playerId '{}' in anti-cheat scan", playerId);
+            return null;
+        }
     }
 
     private void flagPlayer(User user, String reason) {

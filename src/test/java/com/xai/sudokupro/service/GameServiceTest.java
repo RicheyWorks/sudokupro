@@ -1,6 +1,7 @@
 package com.xai.sudokupro.service;
 
 import com.xai.sudokupro.model.SudokuBoard;
+import com.xai.sudokupro.util.SecureRandomGenerator;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import static org.junit.jupiter.api.Assertions.*;
@@ -11,7 +12,7 @@ class GameServiceTest {
 
     @BeforeEach
     void setUp() {
-        solverService = new AISolverService(new SudokuBoard(1));
+        solverService = new AISolverService(new SecureRandomGenerator());
         gameService = new GameService();
         gameService.aiSolverService = solverService; // Manual injection for test
     }
@@ -25,8 +26,9 @@ class GameServiceTest {
 
     @Test
     void testGetHint() {
-        gameService.createNewGame(1);
-        String hint = gameService.getHint();
+        // createNewGame(int) defaults playerId to "anonymous"
+        SudokuBoard board = gameService.createNewGame(1);
+        String hint = gameService.getHintForPlayer("anonymous");
         assertNotNull(hint, "Hint should not be null");
         assertFalse(hint.isEmpty(), "Hint should provide some guidance");
     }

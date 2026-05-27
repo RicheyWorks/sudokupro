@@ -94,6 +94,34 @@ public interface UserRepository extends JpaRepository<User, Long>,
     @Cacheable(value = "totalDuelWins")
     long getTotalDuelWins();
 
+    /** Sum of all gems across every user — replaces findAll() + stream sum in schedulers. */
+    @Transactional(readOnly = true)
+    @Query("SELECT COALESCE(SUM(u.gems), 0) FROM User u")
+    long getTotalGems();
+
+    /**
+     * Count users whose points fall within [min, max).
+     * Used by MetricsScheduler to compute tier gauge values without loading all rows.
+     */
+    @Transactional(readOnly = true)
+    @Query("SELECT COUNT(u) FROM User u WHERE u.points >= :min AND u.points < :max")
+    long countUsersInPointsRange(@Param("min") int min, @Param("max") int max);
+
+    /**
+     * Count users whose points are at least {@code min}.
+     * Used for the unbounded top tier (Cosmic).
+     */
+    @Transactional(readOnly = true)
+    @Query("SELECT COUNT(u) FROM User u WHERE u.points >= :min")
+    long countUsersWithMinPoints(@Param("min") int min);
+
+    /**
+     * Count users whose points strictly exceed {@code points}.
+     * Used by LeaderboardService to compute a single player's rank without loading all rows.
+     */
+    @Transactional(readOnly = true)
+    long countByPointsGreaterThan(int points);
+
     @Transactional(readOnly = true)
     @Query("SELECT AVG(u.gems) FROM User u WHERE u.lastLogin >= :cutoff")
     @Cacheable(value = "avgGemsActiveUsers", key = "#cutoff")

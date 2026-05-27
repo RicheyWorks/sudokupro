@@ -1,6 +1,7 @@
 package com.xai.sudokupro.controller;
 
 import com.xai.sudokupro.model.SudokuBoard;
+import com.xai.sudokupro.service.AuthService;
 import com.xai.sudokupro.service.GameService;
 import io.swagger.v3.oas.annotations.Operation;
 import io.swagger.v3.oas.annotations.responses.ApiResponse;
@@ -33,10 +34,12 @@ public class SudokuGameController {
     private static final String HINT_FAILURE_ERROR = "https://sudokupro.com/errors/hint-failure";
 
     private final GameService gameService;
+    private final AuthService authService;
 
     @Autowired
-    public SudokuGameController(GameService gameService) {
-        this.gameService = gameService;
+    public SudokuGameController(GameService gameService, AuthService authService) {
+        this.gameService  = gameService;
+        this.authService  = authService;
     }
 
     @Operation(summary = "Create a new Sudoku game with specified difficulty")
@@ -74,9 +77,16 @@ public class SudokuGameController {
                 content = @io.swagger.v3.oas.annotations.media.Content(mediaType = "application/problem+json"))
     })
     @GetMapping("/hint")
-    public ResponseEntity<Object> getHint() {
+    public ResponseEntity<Object> getHint(
+            @RequestParam(required = false) String gameId) {
         try {
-            String hint = gameService.getHint();
+            String hint;
+            if (gameId != null && !gameId.isBlank()) {
+                hint = gameService.getHint(gameId);
+            } else {
+                String playerId = authService.getCurrentPlayerId();
+                hint = gameService.getHintForPlayer(playerId);
+            }
             if (hint == null || hint.isEmpty()) {
                 logger.debug("No hint available for current game state");
                 return ResponseEntity.ok(Map.of("hint", "No hint available—keep solving!"));

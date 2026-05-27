@@ -94,7 +94,7 @@ public class ThemeManager {
         validateScene(scene);
         validatePlayerId(playerId);
         try {
-            User user = userRepository.findById(Long.parseLong(playerId))
+            User user = findUserByPlayerId(playerId)
                 .orElseThrow(() -> new IllegalStateException("User not found: " + playerId));
             String preferredTheme = user.getThemePreference().toLowerCase();
             if (customThemes.containsKey(playerId)) {
@@ -196,7 +196,7 @@ public class ThemeManager {
     private void updateUserPreference(int themeIndex) {
         String playerId = authService.getCurrentPlayerId();
         try {
-            User user = userRepository.findById(Long.parseLong(playerId))
+            User user = findUserByPlayerId(playerId)
                 .orElseThrow(() -> new IllegalStateException("User not found: " + playerId));
             String newTheme = THEME_NAMES[themeIndex].toLowerCase().replace(" ", "-");
             user.setThemePreference(newTheme);
@@ -374,7 +374,7 @@ public class ThemeManager {
     private String getCurrentThemeName() {
         String playerId = authService.getCurrentPlayerId();
         if (customThemes.containsKey(playerId)) return "Custom Theme";
-        User user = userRepository.findById(Long.parseLong(playerId)).orElse(null);
+        User user = findUserByPlayerId(playerId).orElse(null);
         if (user != null) {
             String pref = user.getThemePreference();
             if (sharedThemes.containsKey(pref)) return pref;
@@ -409,7 +409,7 @@ public class ThemeManager {
         String playerId = authService.getCurrentPlayerId();
         try {
             customThemes.remove(playerId);
-            User user = userRepository.findById(Long.parseLong(playerId))
+            User user = findUserByPlayerId(playerId)
                 .orElseThrow(() -> new IllegalStateException("User not found: " + playerId));
             user.setThemePreference("default");
             userRepository.save(user);
@@ -536,5 +536,17 @@ public class ThemeManager {
     private void validatePlayerId(String playerId) {
         if (playerId == null || playerId.trim().isEmpty())
             throw new IllegalArgumentException("Player ID cannot be null or empty");
+    }
+
+    private Optional<User> findUserByPlayerId(String playerId) {
+        if (playerId == null || playerId.isBlank() || "anonymous".equals(playerId)) {
+            return Optional.empty();
+        }
+        try {
+            return userRepository.findById(Long.parseLong(playerId));
+        } catch (NumberFormatException e) {
+            logger.debug("Skipping non-numeric playerId '{}' in theme manager", playerId);
+            return Optional.empty();
+        }
     }
 }

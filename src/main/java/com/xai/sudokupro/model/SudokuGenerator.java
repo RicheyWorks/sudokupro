@@ -65,7 +65,7 @@ public class SudokuGenerator {
                 populateConflictZones(board);
                 populateCosmicSignatures(board);
                 generationLog.add("Board generated successfully");
-                SudokuBoard result = new SudokuBoard(board, chaosMode, mirrorMode, timeLimit, UUID.randomUUID().toString(), new AISolverService());
+                SudokuBoard result = new SudokuBoard(board, chaosMode, mirrorMode, timeLimit, UUID.randomUUID().toString());
                 logger.info("Generated SudokuBoard with gameId: {}", result.getGameId());
                 return result;
             } catch (Exception e) {

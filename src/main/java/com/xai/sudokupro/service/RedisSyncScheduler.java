@@ -1,6 +1,5 @@
 package com.xai.sudokupro.service;
 
-import com.xai.sudokupro.model.User;
 import com.xai.sudokupro.repository.GameRepository;
 import com.xai.sudokupro.repository.UserRepository;
 import io.micrometer.core.instrument.MeterRegistry;
@@ -116,9 +115,7 @@ public class RedisSyncScheduler {
         long totalUsers = userRepository.count();
         metrics.put("total_users", String.valueOf(totalUsers));
 
-        long totalGems = userRepository.findAll().stream()
-            .mapToLong(User::getGems)
-            .sum();
+        long totalGems = userRepository.getTotalGems();
 
         metrics.put("total_gems", String.valueOf(totalGems));
 

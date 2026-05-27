@@ -113,9 +113,7 @@ public class PuzzleEditorService {
             }
         }
 
-        aiSolverService.setCurrentBoard(board);
-
-        if (!aiSolverService.solveSudoku()) {
+        if (!aiSolverService.solveSudoku(board)) {
             throw new IllegalArgumentException("Not solvable");
         }
     }

@@ -159,7 +159,7 @@ public class EventEngine {
             logger.warn("Player {} submitted score for expired event {}", playerId, eventId);
             return;
         }
-        User user = userRepository.findById(Long.parseLong(playerId)).orElse(null);
+        User user = findUserByPlayerId(playerId);
         if (user == null) {
             logger.error("Unknown player {} attempted to submit score for event {}", playerId, eventId);
             return;
@@ -218,7 +218,7 @@ public class EventEngine {
             .forEach(e -> {
                 String playerId = e.getKey();
                 int score = e.getValue();
-                User user = userRepository.findById(Long.parseLong(playerId)).orElse(null);
+                User user = findUserByPlayerId(playerId);
                 if (user != null) {
                     int gems = score / 100; // 1 gem per 100 points
                     int xp = score / 10; // 10 XP per 100 points
@@ -241,7 +241,11 @@ public class EventEngine {
     }
 
     public synchronized Map<String, Set<String>> getEventParticipants() {
-        return new ConcurrentHashMap<>(eventParticipants);
+        // Shallow copy exposes mutable inner Sets — return a deep unmodifiable snapshot.
+        Map<String, Set<String>> snapshot = new HashMap<>();
+        eventParticipants.forEach((eventId, participants) ->
+            snapshot.put(eventId, Collections.unmodifiableSet(new HashSet<>(participants))));
+        return Collections.unmodifiableMap(snapshot);
     }
 
     public synchronized void joinEvent(String playerId, String eventId) {
@@ -257,7 +261,7 @@ public class EventEngine {
             logger.warn("Player {} cannot join event {}—participant limit ({}) reached", playerId, eventId, maxParticipants);
             return;
         }
-        User user = userRepository.findById(Long.parseLong(playerId)).orElse(null);
+        User user = findUserByPlayerId(playerId);
         if (user != null && participants.add(playerId)) {
             logger.info("Player {} joins event {}—cosmic grid ID: {}", user.getUsername(), eventId, event.getBoard().getGameId());
             MultiplayerBroadcaster.sendToPlayer(playerId, "event_join", "Joined Event " + eventId, event.getBoard().getGameId());
@@ -285,6 +289,18 @@ public class EventEngine {
         if (playerId == null || playerId.trim().isEmpty()) {
             logger.error("Invalid playerId: {}", playerId);
             throw new IllegalArgumentException("Player ID cannot be null or empty");
+        }
+    }
+
+    private User findUserByPlayerId(String playerId) {
+        if (playerId == null || playerId.isBlank() || "anonymous".equals(playerId)) {
+            return null;
+        }
+        try {
+            return userRepository.findById(Long.parseLong(playerId)).orElse(null);
+        } catch (NumberFormatException e) {
+            logger.debug("Skipping non-numeric playerId '{}' in event engine", playerId);
+            return null;
         }
     }
 

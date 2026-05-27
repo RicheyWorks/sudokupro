@@ -7,8 +7,10 @@ ECHO is on.
 *.iml
 .vscode/
 ECHO is on.
-# Docker
+# Docker / secrets
 .env
+# Local dev property overrides (contain plaintext passwords)
+src/main/resources/application-local.properties
 ECHO is on.
 # OS
 .DS_Store

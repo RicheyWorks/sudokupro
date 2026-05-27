@@ -32,6 +32,9 @@ public interface GameRepository extends JpaRepository<SudokuBoard, Long> {
     @Cacheable(value = "gameById", key = "#gameId")
     SudokuBoard findByGameId(@Param("gameId") String gameId);
 
+    @Query("SELECT b FROM SudokuBoard b WHERE b.playerId = :playerId ORDER BY b.startTime DESC")
+    List<SudokuBoard> findByPlayerId(@Param("playerId") String playerId, Pageable pageable);
+
     @Query("SELECT b FROM SudokuBoard b WHERE b.cosmicDripLevel >= :minDrip ORDER BY b.cosmicDripLevel DESC, b.solveTime ASC")
     @Cacheable(value = "cosmicDripGames", key = "#minDrip + '-' + #pageable.pageNumber")
     List<SudokuBoard> findCosmicDripGames(@Param("minDrip") int minDrip, Pageable pageable);

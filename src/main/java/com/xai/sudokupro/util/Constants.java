@@ -5,17 +5,10 @@ import lombok.Setter;
 import org.apache.commons.codec.digest.DigestUtils;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.context.properties.ConfigurationProperties;
-import org.springframework.http.ResponseEntity;
 import org.springframework.stereotype.Component;
-import org.springframework.web.bind.annotation.GetMapping;
-import org.springframework.web.bind.annotation.PostMapping;
-import org.springframework.web.bind.annotation.RequestMapping;
-import org.springframework.web.bind.annotation.RestController;
-import com.fasterxml.jackson.databind.ObjectMapper;
 import com.xai.sudokupro.service.TelemetryService;
 
 import jakarta.annotation.PostConstruct;
-import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.MissingResourceException;
 import java.util.ResourceBundle;
@@ -48,10 +41,15 @@ public class Constants {
     public static final int BOARD_SIZE = 9;
     public static final int BOX_SIZE = 3;
 
-    // ✅ NEW REQUIRED STATICS
-    public static int MIN_DIFFICULTY = 40;
-    public static int MAX_DIFFICULTY = 80;
-    public static int DEFAULT_DIFFICULTY = 50;
+    // Difficulty tier range (1–5, used by the REST API and GameService validation)
+    public static final int MIN_DIFFICULTY_TIER = 1;
+    public static final int MAX_DIFFICULTY_TIER = 5;
+    public static final int DEFAULT_DIFFICULTY_TIER = 3;
+
+    // Cells-removed range (28–56, used by board generation — mapped from tiers via Difficulty enum)
+    public static final int MIN_CELLS_REMOVED = 28;
+    public static final int MAX_CELLS_REMOVED = 56;
+
     public static int TIME_ATTACK_SECONDS = 300;
     public static int INFINITE_MODE_LIVES = 3;
     public static int COSMIC_MODE_EVENTS = 3;
@@ -199,41 +197,4 @@ public class Constants {
     public static final String WEBSOCKET_ENDPOINT_TAUNT = "/taunt";
     public static final String WEBSOCKET_ENDPOINT_GUILD = "/guild";
     public static final String WEBSOCKET_ENDPOINT_GLOBAL_CHAT = "/chat";
-}
-
-// Admin REST Controller
-@RestController(value = "ConstantsAdminController")
-@RequestMapping("/admin/constants")
-class ConstantsController {
-
-    @Autowired
-    private Constants constants;
-
-    private static final ObjectMapper mapper = new ObjectMapper();
-
-    @GetMapping
-    public Map<String, Object> getConstants() {
-        Map<String, Object> config = new LinkedHashMap<>();
-        config.put("XP Config", Map.of(
-            "XP Per Level", constants.getXpPerLevel(),
-            "XP Per Solve Easy", constants.getXpPerSolveEasy()
-        ));
-        return config;
-    }
-
-    @GetMapping("/hash")
-    public String getHash() {
-        return constants.getIntegrityHash();
-    }
-
-    @PostMapping("/reload")
-    public String reload() {
-        return "Reload triggered";
-    }
-
-    @GetMapping("/export")
-    public ResponseEntity<String> exportJson() throws Exception {
-        String json = mapper.writeValueAsString(constants);
-        return ResponseEntity.ok().body(json);
-    }
 }

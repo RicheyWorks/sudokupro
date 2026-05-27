@@ -133,13 +133,27 @@ public void updateScore(Long userId, int points) {
         return safeFetch(() -> {
             Map<String, Double> skillScores = analyticsService.getPlayerSkillScores();
             Map<String, Double> suspicionScores = antiCheatEngine.getCheatSuspicionScores();
-            List<User> topPlayers = userRepository.findAll().stream()
-                .filter(u -> suspicionScores.getOrDefault(u.getId().toString(), 0.0) <= SUSPICION_THRESHOLD)
-                .sorted((u1, u2) -> Double.compare(
-                    skillScores.getOrDefault(u2.getId().toString(), 0.0),
-                    skillScores.getOrDefault(u1.getId().toString(), 0.0)))
-                .skip(page * size)
+
+            // Sort the in-memory skill-score map, filter suspicious IDs, then page.
+            // Only the page's IDs are loaded from the DB via findAllById.
+            List<Long> pageIds = skillScores.entrySet().stream()
+                .filter(e -> suspicionScores.getOrDefault(e.getKey(), 0.0) <= SUSPICION_THRESHOLD)
+                .sorted(Map.Entry.<String, Double>comparingByValue().reversed())
+                .skip((long) page * size)
                 .limit(size)
+                .map(e -> Long.parseLong(e.getKey()))
+                .collect(Collectors.toList());
+
+            if (pageIds.isEmpty()) {
+                return Collections.emptyList();
+            }
+
+            // findAllById returns rows in arbitrary order; re-sort to match skill-score ranking.
+            Map<Long, User> userMap = userRepository.findAllById(pageIds).stream()
+                .collect(Collectors.toMap(User::getId, u -> u));
+            List<User> topPlayers = pageIds.stream()
+                .map(userMap::get)
+                .filter(java.util.Objects::nonNull)
                 .collect(Collectors.toList());
             List<LeaderboardSnapshot> snapshots = mapToSnapshots(topPlayers, page, size, "combined");
             logLeaderboardFetch("combined skill", snapshots.size());
@@ -215,11 +229,9 @@ public void updateScore(Long userId, int points) {
                 return null;
             }
             User user = userOpt.get();
-            List<User> allPlayers = userRepository.findAll();
-            long rank = allPlayers.stream()
-                .sorted((u1, u2) -> Integer.compare(u2.getPoints(), u1.getPoints()))
-                .collect(Collectors.toList())
-                .indexOf(user) + 1;
+            // Rank = number of users with strictly more points + 1.
+            // A single COUNT aggregate avoids loading all rows.
+            long rank = userRepository.countByPointsGreaterThan(user.getPoints()) + 1;
             LeaderboardSnapshot snapshot = new LeaderboardSnapshot(
                 user.getUsername(), user.getPoints(), (int) rank, getTier(user.getPoints()),
                 user.getCosmicDrip(), user.getHypeMeter(), user.getDuelWins(),
