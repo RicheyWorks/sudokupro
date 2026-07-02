@@ -1,19 +1,33 @@
 # SudokuPro
 
-A multiplayer Sudoku platform with real-time duels, daily challenges, leaderboards, and an anti-cheat engine. Built with Spring Boot 3.2 and a JavaFX desktop client.
+A multiplayer Sudoku platform with real-time duels, daily challenges, leaderboards, and an anti-cheat engine. Spring Boot 3.2 backend, JavaFX desktop client, deployable to Docker or Kubernetes (multi-replica ready).
+
+---
+
+## Modules
+
+```
+sudokupro/
+├── model/    Shared domain: board, cells, moves, generator, constants.
+│             No web, no JavaFX — JPA/validation annotations only.
+├── server/   Spring Boot backend. Produces the deployable boot jar
+│             (sudokupro-server-*-exec.jar). All tests live here.
+└── client/   JavaFX desktop app. Owns all JavaFX dependencies and the
+              per-OS platform profiles; embeds the server in-process.
+```
 
 ---
 
 ## Features
 
-- **Puzzle engine** — backtracking generator that guarantees a unique solution at every difficulty level
-- **Real-time multiplayer** — WebSocket-based duels, drip showdowns, and daily challenges via `EventEngine`
+- **Puzzle engine** — backtracking generator with a verified unique solution at every difficulty
+- **Real-time multiplayer** — raw-WebSocket duels, drip showdowns, and daily challenges; broadcasts fan out across server replicas via Redis pub/sub
 - **AI solver & hints** — logical move hints with cosmic hotspot ranking; full backtracking auto-solve
-- **Leaderboards** — points, cosmic drip, hype meter, duel wins, combined skill score, and per-event rankings
-- **Anti-cheat** — solve-time, move-rate, peer-skill, and cosmic-drip signal scoring with automatic flagging
+- **Leaderboards** — points, cosmic drip, hype meter, duel wins, combined skill score
+- **Anti-cheat** — solve-time, move-rate, complexity, and peer-skill signal scoring with automatic flagging (random flavor mechanics deliberately excluded from enforcement)
 - **Economy** — gems, XP, power-ups, and tier progression (Unranked → Bronze → Silver → Gold → Cosmic)
 - **Themes** — Astral Nebula, Cyber Grid, Manga Mode, Retro Pixel
-- **Observability** — Micrometer metrics, Spring Actuator, Redis-cached dashboard sync
+- **Observability** — Micrometer metrics and Spring Actuator health (db, Redis, disk, and a game-engine self-test at `/actuator/health`)
 
 ---
 
@@ -23,140 +37,148 @@ A multiplayer Sudoku platform with real-time duels, daily challenges, leaderboar
 |---|---|
 | Language | Java 17 |
 | Framework | Spring Boot 3.2 |
-| Security | Spring Security 6 + OAuth2 |
-| Persistence | PostgreSQL + Spring Data JPA |
-| Cache / Pub-Sub | Redis (Jedis) |
-| Real-time | Spring WebSocket (STOMP) |
-| API Docs | springdoc-openapi (Swagger UI) |
+| Security | Spring Security 6 + OAuth2, fail-fast credential guard |
+| Persistence | PostgreSQL + Spring Data JPA, Flyway migrations |
+| Cache / Pub-Sub / Locks | Redis (Spring Data Redis + Jedis) |
+| Real-time | Raw WebSocket (`/ws/game`) with cross-replica Redis relay |
+| API docs | springdoc-openapi (Swagger UI) |
 | Desktop client | JavaFX 21 |
-| Metrics | Micrometer + Spring Actuator |
-| Build | Maven |
-
----
-
-## Prerequisites
-
-- Java 17+
-- PostgreSQL 14+
-- Redis 7+
-- Maven 3.9+ (or use the Maven wrapper if present)
+| Testing | JUnit 5, Mockito, H2, Testcontainers (Postgres + Redis) |
+| Build / Deploy | Maven multi-module, Docker, docker-compose, Kubernetes, GitHub Actions |
 
 ---
 
 ## Quick Start
 
-**1. Clone**
+### Option A — Docker Compose (app + Postgres + Redis)
 
 ```bash
-git clone https://github.com/RicheyWorks/sudokupro.git
-cd sudokupro
+cp .env.example .env    # set real DB_PASSWORD and ADMIN_PASSWORD
+docker compose up --build
 ```
 
-**2. Configure environment**
+The app runs with the `prod` profile: startup **fails on missing or well-known
+credentials** (`secret`, `sudoku123`, `CHANGE_ME`, …) by design. Flyway creates
+and migrates the schema automatically.
+
+### Option B — Local development
+
+Prerequisites: Java 17+, Maven 3.9+, PostgreSQL 14+ (Redis 7+ optional — the
+app degrades gracefully without it).
 
 ```bash
-cp .env.example .env
-# Edit .env and set DB_PASSWORD and ADMIN_PASSWORD
-```
+createdb sudokupro       # or: CREATE DATABASE sudokupro;
 
-Create `src/main/resources/application-local.properties` for local overrides:
-
-```properties
-spring.datasource.password=yourpassword
-spring.jpa.hibernate.ddl-auto=update
-spring.security.user.password=secret
-```
-
-**3. Create the database**
-
-```sql
-CREATE DATABASE sudokupro;
-```
-
-**4. Run**
-
-```bash
-# Server only (headless API):
+# Headless API server (dev profile is the default for bare local runs):
 mvn -pl server -am spring-boot:run
 
 # Desktop app (JavaFX UI + embedded server):
 mvn -pl client -am javafx:run
 ```
 
-The repo is split into three Maven modules: `model` (shared domain),
-`server` (Spring Boot backend — the deployable artifact), and `client`
-(JavaFX desktop app). Bare local runs default to the `dev` profile.
+The `dev` profile ships working local defaults (Hibernate `ddl-auto=update`,
+Flyway off). Production must set `SPRING_PROFILES_ACTIVE=prod` and provide real
+credentials via the environment.
 
-The API is available at `http://localhost:8080`.  
-Swagger UI: `http://localhost:8080/swagger-ui.html`
+- API: `http://localhost:8080`
+- Swagger UI: `http://localhost:8080/swagger-ui.html`
+- Health: `http://localhost:8080/actuator/health`
 
 ---
 
 ## Environment Variables
 
 All credentials are injected via environment variables — never hardcoded.
+Outside the `dev`/`test` profiles, `SecretsGuard` refuses to start on missing
+or well-known values.
 
 | Variable | Default | Description |
 |---|---|---|
 | `DB_URL` | `jdbc:postgresql://localhost:5432/sudokupro` | JDBC connection URL |
 | `DB_USERNAME` | `postgres` | Database user |
-| `DB_PASSWORD` | *(required)* | Database password |
+| `DB_PASSWORD` | *(required outside dev)* | Database password |
 | `REDIS_HOST` | `localhost` | Redis hostname |
 | `REDIS_PORT` | `6379` | Redis port |
-| `DDL_AUTO` | `validate` | Hibernate DDL strategy (`validate` in prod, `update` locally) |
+| `DDL_AUTO` | `validate` | Hibernate DDL strategy — Flyway owns the schema |
 | `ADMIN_USERNAME` | `admin` | Default admin account username |
-| `ADMIN_PASSWORD` | *(required)* | Default admin account password |
+| `ADMIN_PASSWORD` | *(required outside dev)* | Default admin account password |
 
 See `.env.example` for a full template.
 
 ---
 
-## Project Structure
+## Database Migrations
 
-```
-src/main/java/com/xai/sudokupro/
-├── config/          # Security, Redis, WebSocket, app config
-├── controller/      # REST controllers (game, WebSocket, admin)
-├── engine/          # ChaosEngine, FateEntityManager
-├── model/           # JPA entities and domain objects
-├── repository/      # Spring Data JPA repositories
-├── service/         # Business logic: GameService, EventEngine,
-│                    #   LeaderboardService, AntiCheatEngine,
-│                    #   AISolverService, NotificationService, …
-├── ui/              # JavaFX desktop client
-├── util/            # Constants, SecureRandomGenerator, etc.
-└── websocket/       # MultiplayerBroadcaster
-```
+Flyway owns the schema; Hibernate only validates it.
+
+- `server/src/main/resources/db/migration/common/` — portable migrations.
+  `V1__baseline_schema.sql` was generated by Hibernate itself from the JPA
+  entities, so `validate` passes by construction.
+- `server/src/main/resources/db/migration/postgresql/` — vendor-specific
+  migrations (e.g. `V2` converts the legacy `start_time` BIGINT column).
+- Pre-Flyway databases are baselined automatically
+  (`baseline-on-migrate=true`, `baseline-version=1`): V1 is skipped, V2+ run.
+
+Both the fresh-install and legacy-upgrade paths are verified against real
+PostgreSQL in CI (`FlywayMigrationTest`).
 
 ---
 
-## API Endpoints
+## Scaling
+
+The Kubernetes deployment supports multiple replicas, provided a shared Redis
+is available:
+
+- Boards are Redis/DB-backed; each pod keeps only a cache.
+- Player streaks, cosmic points, and input locks live in Redis (`PlayerStateStore`).
+- Game mutations take a cross-replica Redis lock (`GameLockManager`).
+- WebSocket broadcasts fan out to all pods via Redis pub/sub (`RedisBroadcastRelay`),
+  so players in the same game see each other regardless of which pod they hit.
+
+Without Redis, every component degrades to single-replica behavior (logged once).
+Cross-pod delivery is verified by a two-pod integration test on real Redis in CI.
+
+---
+
+## API
 
 | Method | Path | Description |
 |---|---|---|
-| `POST` | `/api/game/new` | Create a new game |
-| `GET` | `/api/game/{id}` | Get game state |
-| `POST` | `/api/game/{id}/move` | Submit a move |
-| `GET` | `/api/game/hint` | Request a hint |
-| `POST` | `/api/game/{id}/solve` | Auto-solve the board |
-| `GET` | `/api/leaderboard` | Paginated leaderboard |
-| `GET` | `/api/leaderboard/rank/{userId}` | Single player rank |
+| `POST` | `/api/game/new?difficulty=1..4` | Create a new game for the authenticated player |
+| `GET` | `/api/game/hint` | AI hint for the player's active game |
+| `WS` | `/ws/game` | Gameplay channel — moves, joins, broadcasts (authenticated principal required) |
+| `GET` | `/admin/constants` | Game constants (admin) |
+| `POST` | `/admin/constants/reload` | Hot-reload constants (admin) |
+| `GET` | `/actuator/health` | Health: db, Redis, disk, game-engine self-test |
+
+WebSocket envelope format: `{"type", "from", "payload"}` — types include
+`move`, `join`, `leave`, `event`, `status`, `hint`, `error`.
 
 Full interactive docs at `/swagger-ui.html` when running locally.
 
 ---
 
-## Running Tests
+## Testing
 
 ```bash
 mvn test
 ```
 
+Unit and context tests run anywhere (H2-backed, no local services needed).
+Four integration tests are Docker-gated and skip automatically without Docker:
+Flyway migrations on real PostgreSQL and cross-replica broadcast on real Redis.
+CI (GitHub Actions) runs the full suite including the Docker-gated tests, then
+builds the server Docker image.
+
 ---
 
 ## Security Notes
 
+- Unauthenticated WebSocket connections are rejected at session establishment
+- `SecretsGuard` fails startup on missing or well-known credentials outside dev/test
 - CSRF protection enabled with `CookieCsrfTokenRepository` (WebSocket endpoints exempted)
 - Security headers: CSP, HSTS (1 year), `X-Frame-Options: DENY`, `X-Content-Type-Options: nosniff`, `Referrer-Policy`
+- WebSocket origins restricted via `sudokupro.ws.allowed-origins` (defaults to localhost)
 - All credentials sourced from environment variables — no secrets in source
-- `application-local.properties` is gitignored
+
+See `AUDIT.md` for the full code-health audit and its resolution history.
