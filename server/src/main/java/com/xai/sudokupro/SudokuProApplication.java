@@ -2,7 +2,6 @@ package com.xai.sudokupro;
 
 import com.xai.sudokupro.repository.UserRepository;
 import com.xai.sudokupro.service.*;
-import com.xai.sudokupro.ui.MainStage;
 import io.micrometer.core.instrument.MeterRegistry;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -24,7 +23,23 @@ public class SudokuProApplication {
     private static volatile ConfigurableApplicationContext context;
     private static final AtomicBoolean chaosActive = new AtomicBoolean(false);
 
+    /** Headless server entry point. The desktop app starts via the client module's ClientLauncher. */
     public static void main(String[] args) {
+        try {
+            start(args);
+            logger.info("SudokuPro server started (headless) — web server threads keep the JVM alive");
+        } catch (Exception e) {
+            logger.error("SudokuPro startup failed", e);
+            shutdown();
+        }
+    }
+
+    /**
+     * Boots the Spring context and runs the shared startup sequence. Used by both the
+     * headless server main above and the client module's ClientLauncher, which shares
+     * this context with the JavaFX UI (single JVM, no second port-8080 collision).
+     */
+    public static ConfigurableApplicationContext start(String[] args) {
 
         SpringApplication app = new SpringApplication(SudokuProApplication.class);
 
@@ -37,54 +52,28 @@ public class SudokuProApplication {
             "sudokupro.chaos.enabled", "false"
         ));
 
-        try {
-            optimizeStartup(app);
+        optimizeStartup(app);
 
-            context = app.run(args);
+        context = app.run(args);
 
-            Environment env = context.getBean(Environment.class);
+        Environment env = context.getBean(Environment.class);
 
-            MeterRegistry meterRegistry = context.getBean(MeterRegistry.class);
-            meterRegistry.gauge("startup.time", System.currentTimeMillis());
+        MeterRegistry meterRegistry = context.getBean(MeterRegistry.class);
+        meterRegistry.gauge("startup.time", System.currentTimeMillis());
 
-            if (Boolean.parseBoolean(env.getProperty("sudokupro.chaos.enabled"))) {
-                chaosActive.set(true);
-                context.getBean(MetricsScheduler.class).triggerChaosMode("startup");
-                triggerChaosEvents();
-            }
-
-            kickoffGuildSync(context);
-
-            broadcastCosmicEvent("SudokuPro Online - Grid War Begins!");
-
-            // Register the shutdown hook BEFORE launching JavaFX — launch() blocks until the
-            // window closes, so anything after it runs only after the user exits the UI.
-            Runtime.getRuntime().addShutdownHook(new Thread(SudokuProApplication::shutdown));
-
-            // Headless/server mode (containers, k8s): skip the desktop UI entirely.
-            // JavaFX toolkit init throws unrecoverable Errors (not Exceptions) without a
-            // display, so guarding with try/catch is not enough. Set SUDOKUPRO_UI_ENABLED=false
-            // (or -Dsudokupro.ui.enabled=false); the Docker image sets it by default.
-            boolean uiEnabled = Boolean.parseBoolean(env.getProperty("sudokupro.ui.enabled", "true"));
-            if (uiEnabled) {
-                // Share the already-running Spring context with MainStage so that its init()
-                // skips the second SpringApplication.run() that would collide on port 8080.
-                MainStage.setSpringContext(context);
-
-                try {
-                    javafx.application.Application.launch(MainStage.class, args);
-                } catch (Exception e) {
-                    logger.warn("JavaFX launch failed, using fallback mode", e);
-                    startFallbackTerminalMode();
-                }
-            } else {
-                logger.info("UI disabled (sudokupro.ui.enabled=false) — headless server mode; web server threads keep the JVM alive");
-            }
-
-        } catch (Exception e) {
-            logger.error("SudokuPro startup failed", e);
-            shutdown();
+        if (Boolean.parseBoolean(env.getProperty("sudokupro.chaos.enabled"))) {
+            chaosActive.set(true);
+            context.getBean(MetricsScheduler.class).triggerChaosMode("startup");
+            triggerChaosEvents();
         }
+
+        kickoffGuildSync(context);
+
+        broadcastCosmicEvent("SudokuPro Online - Grid War Begins!");
+
+        Runtime.getRuntime().addShutdownHook(new Thread(SudokuProApplication::shutdown));
+
+        return context;
     }
 
     private static void optimizeStartup(SpringApplication app) {
@@ -116,15 +105,12 @@ public class SudokuProApplication {
         notifier.broadcastNotification("system", message);
     }
 
-    private static void shutdown() {
+    /** Public so ClientLauncher can trigger an orderly stop when the UI exits. */
+    public static void shutdown() {
         if (context != null && context.isActive()) {
             context.close();
         }
         System.exit(0);
-    }
-
-    private static void startFallbackTerminalMode() {
-        System.out.println("Fallback Mode Active");
     }
 
     private static class SudokuProBanner implements Banner {

@@ -7,7 +7,6 @@ import org.apache.commons.codec.digest.DigestUtils;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.context.properties.ConfigurationProperties;
 import org.springframework.stereotype.Component;
-import com.xai.sudokupro.service.TelemetryService;
 
 import jakarta.annotation.PostConstruct;
 import java.util.Map;
@@ -155,7 +154,7 @@ public class Constants {
     public static int SOLVER_DETECTION_THRESHOLD = 100;
 
     @Autowired
-    public Constants(TelemetryService telemetry) {
+    public Constants(DifficultyTuner telemetry) {
         int adjust = telemetry != null ? telemetry.getDifficultyAdjustmentFactor() : 0;
         xpPerSolveEasy += adjust;
         pointsPerSolveEasy += adjust / 2;

@@ -9,7 +9,7 @@ import org.springframework.stereotype.Service;
  * Wire in real analytics data here when ready.
  */
 @Service
-public class TelemetryService {
+public class TelemetryService implements com.xai.sudokupro.util.DifficultyTuner {
 
     private static final Logger logger = LoggerFactory.getLogger(TelemetryService.class);
 
@@ -17,6 +17,7 @@ public class TelemetryService {
      * Returns an XP/points adjustment factor derived from live telemetry.
      * Returns 0 (no adjustment) until real data pipeline is connected.
      */
+    @Override
     public int getDifficultyAdjustmentFactor() {
         logger.debug("TelemetryService: getDifficultyAdjustmentFactor called — returning 0 (stub)");
         return 0;

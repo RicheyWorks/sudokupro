@@ -2,24 +2,28 @@
 # ── Build stage ─────────────────────────────────────────────────────────────
 FROM maven:3.9-eclipse-temurin-17 AS build
 WORKDIR /build
-# Warm the dependency cache so source changes don't re-download the world.
+# Module split (AUDIT P1-2): only model + server are needed for the deployable
+# jar — the client module (JavaFX desktop app) is never built here, so no
+# platform-classified natives enter the server image.
 COPY pom.xml .
-RUN mvn -B -q dependency:go-offline || true
-COPY src ./src
-RUN mvn -B -DskipTests package
+COPY model/pom.xml model/
+COPY server/pom.xml server/
+COPY client/pom.xml client/
+RUN mvn -B -q -pl server -am dependency:go-offline || true
+COPY model/src model/src
+COPY server/src server/src
+RUN mvn -B -DskipTests -pl server -am package
 
 # ── Runtime stage ───────────────────────────────────────────────────────────
 FROM eclipse-temurin:17-jre-jammy
 RUN useradd --system --no-create-home --uid 1001 sudokupro
 WORKDIR /app
-COPY --from=build /build/target/sudokupro-*.jar app.jar
+COPY --from=build /build/server/target/sudokupro-server-*-exec.jar app.jar
 USER sudokupro
 EXPOSE 8080
 
-# Headless server mode: containers have no display, and JavaFX toolkit init
-# fails with unrecoverable Errors without one. The desktop client is launched
-# separately (see AUDIT P1-2 — client/server module split pending).
-ENV SUDOKUPRO_UI_ENABLED=false
+# The server main is headless by design; the desktop UI lives in the separate
+# client module (AUDIT P1-2) and never ships in this image.
 
 # main() defaults spring.profiles.active=prod, so SecretsGuard requires real
 # DB_PASSWORD / ADMIN_PASSWORD env vars — the container refuses to start with

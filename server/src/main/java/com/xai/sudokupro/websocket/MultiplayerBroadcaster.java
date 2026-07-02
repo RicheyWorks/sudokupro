@@ -17,7 +17,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Consumer;
 
 @Component
-public class MultiplayerBroadcaster {
+public class MultiplayerBroadcaster implements com.xai.sudokupro.model.MoveBroadcaster {
 
     private static final Logger logger = LoggerFactory.getLogger(MultiplayerBroadcaster.class);
     private static final String SERVER = "server";
@@ -51,6 +51,7 @@ public class MultiplayerBroadcaster {
 
     // ---- Core topic broadcasts ------------------------------------------
 
+    @Override
     public void sendMove(String gameId, EnhancedMove move) {
         broadcast(gameId, "move", move, "move_broadcast",
                 Map.of("gameId", gameId, "move", move.toString()));

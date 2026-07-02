@@ -76,8 +76,16 @@ CREATE DATABASE sudokupro;
 **4. Run**
 
 ```bash
-mvn spring-boot:run -Dspring-boot.run.profiles=local
+# Server only (headless API):
+mvn -pl server -am spring-boot:run
+
+# Desktop app (JavaFX UI + embedded server):
+mvn -pl client -am javafx:run
 ```
+
+The repo is split into three Maven modules: `model` (shared domain),
+`server` (Spring Boot backend — the deployable artifact), and `client`
+(JavaFX desktop app). Bare local runs default to the `dev` profile.
 
 The API is available at `http://localhost:8080`.  
 Swagger UI: `http://localhost:8080/swagger-ui.html`

@@ -3,7 +3,6 @@ package com.xai.sudokupro.model;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.xai.sudokupro.util.Constants;
-import com.xai.sudokupro.websocket.MultiplayerBroadcaster;
 import jakarta.persistence.*;
 import jakarta.validation.constraints.NotNull;
 import org.slf4j.Logger;
@@ -222,7 +221,7 @@ public class SudokuBoard implements Serializable {
     }
 
     /** Apply an external move and optionally broadcast. */
-    public synchronized void applyMove(EnhancedMove move, MultiplayerBroadcaster broadcaster) {
+    public synchronized void applyMove(EnhancedMove move, MoveBroadcaster broadcaster) {
         applyExternalMove(move);
         if (broadcaster != null) broadcaster.sendMove(gameId, move);
     }
@@ -436,7 +435,8 @@ public class SudokuBoard implements Serializable {
     // Replay
     // =====================================================================
 
-    public void replayMoves(long delayMs, javafx.scene.control.TextArea output) {
+    /** Replays move history; each line is fed to {@code output} (UI-agnostic — AUDIT P1-2). */
+    public void replayMoves(long delayMs, java.util.function.Consumer<String> output) {
         // Fix: was 'synchronized' but called Thread.sleep() inside the loop, blocking every
         // other board operation for the full replay duration. Snapshot the history under a
         // brief lock, then apply each move (locked individually) and sleep without the lock.
@@ -450,7 +450,7 @@ public class SudokuBoard implements Serializable {
                 board[move.row()][move.col()].setValue(move.newVal(), move.source());
             }
             if (output != null)
-                output.appendText(String.format("Move: (%d,%d) -> %d [%s]\n",
+                output.accept(String.format("Move: (%d,%d) -> %d [%s]\n",
                     move.row()+1, move.col()+1, move.newVal(), move.source()));
             try { Thread.sleep(delayMs); }
             catch (InterruptedException e) { Thread.currentThread().interrupt(); break; }

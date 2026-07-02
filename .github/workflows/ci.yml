@@ -17,7 +17,8 @@ jobs:
           distribution: 'temurin'
           cache: maven
 
-      # Full suite — runs on H2 via the test profile, no services needed.
+      # Full suite across all modules (model/server/client) — server tests run
+      # on H2 via the test profile, no services needed.
       - name: Build and test
         run: mvn -B verify
 

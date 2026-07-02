@@ -1,4 +1,6 @@
 target/
+*/target/
+client/
 .git/
 .github/
 kubernetes/
