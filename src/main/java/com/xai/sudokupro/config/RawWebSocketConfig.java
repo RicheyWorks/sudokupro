@@ -9,10 +9,9 @@ import org.springframework.web.socket.config.annotation.WebSocketConfigurer;
 import org.springframework.web.socket.config.annotation.WebSocketHandlerRegistry;
 
 /**
- * Raw WebSocket handler registration.
- * Kept separate from WebSocketConfig (STOMP) so both can coexist:
- *   - /ws/game  → WebSocketController (raw, used by the JavaFX client)
- *   - /ws/stomp → STOMP broker (used by MultiplayerBroadcaster via SimpMessagingTemplate)
+ * Raw WebSocket handler registration — the single WebSocket stack (AUDIT P2-2).
+ * /ws/game → WebSocketController; server broadcasts flow through GameSessionRegistry.
+ * The parallel STOMP broker (/ws/stomp) was removed: no client ever subscribed to it.
  */
 @Configuration
 @EnableWebSocket

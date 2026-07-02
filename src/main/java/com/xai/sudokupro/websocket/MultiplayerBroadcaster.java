@@ -7,17 +7,12 @@ import com.xai.sudokupro.service.AnalyticsService;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.messaging.simp.SimpMessagingTemplate;
 import org.springframework.stereotype.Component;
 
-import jakarta.annotation.PreDestroy;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
-import java.util.concurrent.Executors;
-import java.util.concurrent.ScheduledExecutorService;
-import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Consumer;
 
@@ -25,9 +20,12 @@ import java.util.function.Consumer;
 public class MultiplayerBroadcaster {
 
     private static final Logger logger = LoggerFactory.getLogger(MultiplayerBroadcaster.class);
-    private static final int MAX_RETRY = 3;
+    private static final String SERVER = "server";
 
-    private final SimpMessagingTemplate messagingTemplate;
+    // WebSocket convergence (AUDIT P2-2): messages go out over the raw /ws/game sessions
+    // in GameSessionRegistry. The old SimpMessagingTemplate/STOMP path published to
+    // /topic and /queue destinations no client ever subscribed to.
+    private final GameSessionRegistry sessionRegistry;
     private final ObjectMapper objectMapper;
     private final AnalyticsService analyticsService;
 
@@ -42,20 +40,11 @@ public class MultiplayerBroadcaster {
     private final AtomicInteger activeClientCount = new AtomicInteger(0);
     private final AtomicInteger messageRateCounter = new AtomicInteger(0);
 
-    // Fix: retry delays must not block the calling thread (which may be a WebSocket handler,
-    // a @Scheduled method, or the JavaFX Application Thread). Use a single background thread
-    // so retries are scheduled without holding any caller.
-    private final ScheduledExecutorService retryExecutor = Executors.newSingleThreadScheduledExecutor(r -> {
-        Thread t = new Thread(r, "ws-broadcast-retry");
-        t.setDaemon(true);
-        return t;
-    });
-
     @Autowired
-    public MultiplayerBroadcaster(SimpMessagingTemplate messagingTemplate,
+    public MultiplayerBroadcaster(GameSessionRegistry sessionRegistry,
                                  ObjectMapper objectMapper,
                                  AnalyticsService analyticsService) {
-        this.messagingTemplate = messagingTemplate;
+        this.sessionRegistry = sessionRegistry;
         this.objectMapper = objectMapper;
         this.analyticsService = analyticsService;
     }
@@ -63,27 +52,27 @@ public class MultiplayerBroadcaster {
     // ---- Core topic broadcasts ------------------------------------------
 
     public void sendMove(String gameId, EnhancedMove move) {
-        broadcast(gameId, "/topic/board/", move, "move_broadcast",
+        broadcast(gameId, "move", move, "move_broadcast",
                 Map.of("gameId", gameId, "move", move.toString()));
         notifyGameSubscribers(gameId);
     }
 
     public void sendGameEvent(String gameId, GameEvent event) {
-        broadcast(gameId, "/topic/events/", event, "event_broadcast",
+        broadcast(gameId, "event", event, "event_broadcast",
                 Map.of("gameId", gameId, "eventType", event.getType().toString()));
     }
 
     public void sendBatchMoves(String gameId, List<EnhancedMove> moves) {
         if (moves == null || moves.isEmpty()) return;
 
-        broadcast(gameId, "/topic/board/", moves, "batch_move_broadcast",
+        broadcast(gameId, "batch_moves", moves, "batch_move_broadcast",
                 Map.of("gameId", gameId, "moveCount", moves.size()));
 
         notifyGameSubscribers(gameId);
     }
 
     public void sendGameStatus(String gameId, String status) {
-        broadcast(gameId, "/topic/status/",
+        broadcast(gameId, "status",
                 Map.of("status", status), "status_update",
                 Map.of("gameId", gameId, "status", status));
     }
@@ -99,28 +88,28 @@ public class MultiplayerBroadcaster {
     // ---- Player-targeted messages ---------------------------------------
 
     public void sendToPlayer(String playerId, String type, String message) {
-        String destination = "/queue/player/" + playerId + "/" + type;
-        try {
-            messagingTemplate.convertAndSend(destination, message);
+        boolean delivered = sessionRegistry.sendToPlayer(playerId,
+                Map.of("type", type, "from", SERVER, "payload", message));
+        if (delivered) {
             messageRateCounter.incrementAndGet();
             logger.debug("Sent [{}] to {}: {}", type, playerId, message);
-        } catch (Exception e) {
-            logger.error("Failed to send [{}] to {}: {}", type, playerId, e.getMessage());
+        } else {
+            logger.debug("Player {} not connected; [{}] not delivered", playerId, type);
         }
     }
 
     // ---- Broadcast events (all players) ---------------------------------
 
     public void broadcastEvent(String type, String message, String gameId) {
-        String destination = gameId != null ? "/topic/events/" + gameId : "/topic/events/global";
-        try {
-            messagingTemplate.convertAndSend(destination, Map.of("type", type, "message", message));
-            messageRateCounter.incrementAndGet();
-            notifyEventSubscribers(type, message);
-            logger.debug("Broadcast [{}]: {}", type, message);
-        } catch (Exception e) {
-            logger.error("Broadcast [{}] failed: {}", type, e.getMessage());
+        Map<String, Object> envelope = Map.of("type", type, "from", SERVER, "payload", message);
+        if (gameId != null) {
+            sessionRegistry.broadcastToGame(gameId, null, envelope);
+        } else {
+            sessionRegistry.broadcastToAll(envelope);
         }
+        messageRateCounter.incrementAndGet();
+        notifyEventSubscribers(type, message);
+        logger.debug("Broadcast [{}]: {}", type, message);
     }
 
     public void broadcastGameStart(String gameId, String playerId) {
@@ -134,11 +123,7 @@ public class MultiplayerBroadcaster {
     // ---- Health / monitoring --------------------------------------------
 
     public void broadcastHealthPing() {
-        try {
-            messagingTemplate.convertAndSend("/topic/health", "PING");
-        } catch (Exception e) {
-            logger.warn("Health ping failed: {}", e.getMessage());
-        }
+        sessionRegistry.broadcastToAll(Map.of("type", "health", "from", SERVER, "payload", "PING"));
     }
 
     public int getActiveClientCount() {
@@ -169,44 +154,13 @@ public class MultiplayerBroadcaster {
 
     // ---- Private --------------------------------------------------------
 
-    private void broadcast(String gameId, String prefix, Object payload,
+    private void broadcast(String gameId, String type, Object payload,
                            String analyticsEvent, Map<String, Object> analyticsData) {
-        String dest = prefix + gameId;
-        String msg;
-        try {
-            msg = objectMapper.writeValueAsString(payload);
-        } catch (Exception e) {
-            logger.error("Serialization failed for {}: {}", dest, e.getMessage());
-            return;
-        }
-        // Attempt 1 happens immediately on the calling thread; on failure, subsequent
-        // attempts are scheduled on retryExecutor so the caller is never blocked.
-        attemptBroadcast(dest, msg, analyticsEvent, analyticsData, 1);
-    }
-
-    private void attemptBroadcast(String dest, String msg, String analyticsEvent,
-                                   Map<String, Object> analyticsData, int attempt) {
-        try {
-            messagingTemplate.convertAndSend(dest, msg);
-            messageRateCounter.incrementAndGet();
-            analyticsService.logEvent(analyticsEvent, analyticsData);
-        } catch (Exception e) {
-            if (attempt >= MAX_RETRY) {
-                logger.error("All {} retries failed for {}: {}", MAX_RETRY, dest, e.getMessage());
-            } else {
-                logger.warn("Broadcast attempt {}/{} failed for {}, retrying in {}s: {}",
-                        attempt, MAX_RETRY, dest, attempt, e.getMessage());
-                retryExecutor.schedule(
-                        () -> attemptBroadcast(dest, msg, analyticsEvent, analyticsData, attempt + 1),
-                        attempt, TimeUnit.SECONDS);
-            }
-        }
-    }
-
-    @PreDestroy
-    public void shutdown() {
-        retryExecutor.shutdown();
-        logger.info("MultiplayerBroadcaster retry executor shut down");
+        // Per-session delivery failures are handled (and logged) inside the registry;
+        // the broker-level retry executor the STOMP path needed is gone with it.
+        sessionRegistry.broadcastToGame(gameId, null, Map.of("type", type, "from", SERVER, "payload", payload));
+        messageRateCounter.incrementAndGet();
+        analyticsService.logEvent(analyticsEvent, analyticsData);
     }
 
     private void notifyGameSubscribers(String gameId) {

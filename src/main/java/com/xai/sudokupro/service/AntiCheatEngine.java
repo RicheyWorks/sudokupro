@@ -104,8 +104,11 @@ public class AntiCheatEngine {
             signals++;
         }
 
+        // Flavor/enforcement decoupling (AUDIT P2-3): cosmic-drip levels are driven by
+        // FateEntityManager RNG events, so spikes are random outcomes, not evidence of
+        // cheating. Logged for observability, but they no longer add enforcement signals.
         if (cosmicDrip > (moves / 5) + MAX_COSMIC_DRIP_SPIKE) {
-            signals++;
+            logger.debug("Cosmic drip spike for {} (drip={}, moves={}) — flavor metric, not scored", playerId, cosmicDrip, moves);
         }
 
         if (moves < MIN_MOVES_FOR_COMPLEXITY && hints == 0 && difficulty > 3) {
@@ -139,18 +142,8 @@ public class AntiCheatEngine {
             signals++;
         }
 
-        int cosmicMoves = (int) board.getMoveHistory().stream()
-            .filter(m -> {
-                // Hint sentinel moves use row=-1, col=-1 — skip out-of-bounds coords
-                // to avoid ArrayIndexOutOfBoundsException inside getCell().
-                if (m.row() < 0 || m.row() >= 9 || m.col() < 0 || m.col() >= 9) return false;
-                return board.getCell(m.row(), m.col()).getStrategy() == SudokuCell.Strategy.COSMIC;
-            })
-            .count();
-
-        if (cosmicDrip > cosmicMoves * 2 && cosmicMoves > 0) {
-            signals++;
-        }
+        // (AUDIT P2-3) The former cosmicDrip-vs-cosmicMoves ratio signal was likewise
+        // an RNG-outcome comparison and has been removed from enforcement entirely.
 
         // Update running suspicion score: add weight per signal, or decay if clean.
         if (signals > 0) {

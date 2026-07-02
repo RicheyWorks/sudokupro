@@ -3,6 +3,7 @@ package com.xai.sudokupro.controller;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.xai.sudokupro.model.SudokuBoard;
 import com.xai.sudokupro.service.GameService;
+import com.xai.sudokupro.websocket.GameSessionRegistry;
 import com.xai.sudokupro.websocket.MultiplayerBroadcaster;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -43,7 +44,8 @@ class WebSocketControllerTest {
 
     @BeforeEach
     void setUp() {
-        controller = new WebSocketController(gameService, new ObjectMapper(), broadcaster);
+        controller = new WebSocketController(gameService, new ObjectMapper(), broadcaster,
+            new GameSessionRegistry(new ObjectMapper()));
         lenient().when(session.getAttributes()).thenReturn(attributes);
         lenient().when(session.getId()).thenReturn("sess-1");
     }

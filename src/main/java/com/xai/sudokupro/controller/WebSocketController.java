@@ -5,6 +5,7 @@ import com.xai.sudokupro.model.EnhancedMove;
 import com.xai.sudokupro.model.SudokuBoard;
 import com.xai.sudokupro.model.SudokuCell;
 import com.xai.sudokupro.service.GameService;
+import com.xai.sudokupro.websocket.GameSessionRegistry;
 import com.xai.sudokupro.websocket.MultiplayerBroadcaster;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -17,7 +18,6 @@ import org.springframework.web.socket.handler.TextWebSocketHandler;
 
 import java.io.IOException;
 import java.util.Map;
-import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 
@@ -29,21 +29,22 @@ public class WebSocketController extends TextWebSocketHandler {
     static final CloseStatus UNAUTHENTICATED = CloseStatus.POLICY_VIOLATION.withReason("Authentication required");
 
     private final ConcurrentMap<WebSocketSession, String> playerMap = new ConcurrentHashMap<>();
-    // gameId → all sessions currently in that game; used to scope broadcasts correctly.
-    // Game boards themselves live in GameService (single source of truth, capped +
-    // Redis/DB backed) — this class deliberately holds no board state. (AUDIT P0-1)
-    private final ConcurrentMap<String, Set<WebSocketSession>> gameSessions = new ConcurrentHashMap<>();
 
+    // Session bookkeeping lives in GameSessionRegistry (shared with MultiplayerBroadcaster —
+    // AUDIT P2-2); game boards live in GameService (AUDIT P0-1). This class holds no
+    // broadcast or board state of its own.
     private final GameService            gameService;
     private final ObjectMapper           objectMapper;
     private final MultiplayerBroadcaster broadcaster;
+    private final GameSessionRegistry    sessionRegistry;
 
     @Autowired
     public WebSocketController(GameService gameService, ObjectMapper objectMapper,
-                                MultiplayerBroadcaster broadcaster) {
-        this.gameService   = gameService;
-        this.objectMapper  = objectMapper;
-        this.broadcaster   = broadcaster;
+                                MultiplayerBroadcaster broadcaster, GameSessionRegistry sessionRegistry) {
+        this.gameService     = gameService;
+        this.objectMapper    = objectMapper;
+        this.broadcaster     = broadcaster;
+        this.sessionRegistry = sessionRegistry;
     }
 
     @Override
@@ -84,7 +85,7 @@ public class WebSocketController extends TextWebSocketHandler {
         session.getAttributes().put("gameId", gameId);
 
         // Register this session under its game so broadcasts stay scoped to the right players
-        gameSessions.computeIfAbsent(gameId, id -> ConcurrentHashMap.newKeySet()).add(session);
+        sessionRegistry.register(gameId, playerId, session);
 
         logger.info("Connected: session={} player={} game={}", session.getId(), playerId, gameId);
         broadcastToGame(gameId, session, buildEnvelope("join", playerId, Map.of("player", playerId, "gameId", gameId)));
@@ -141,7 +142,7 @@ public class WebSocketController extends TextWebSocketHandler {
             return;
         }
         String gameId = (String) session.getAttributes().get("gameId");
-        removeFromGameSessions(gameId, session);
+        sessionRegistry.unregister(gameId, playerId, session);
         broadcaster.unregisterClient();
         logger.info("Disconnected: player={} game={} status={}", playerId, gameId, status);
         broadcastToGame(gameId, session, buildEnvelope("leave", playerId, Map.of("player", playerId)));
@@ -151,8 +152,9 @@ public class WebSocketController extends TextWebSocketHandler {
     public void handleTransportError(WebSocketSession session, Throwable ex) {
         logger.error("Transport error {}: {}", session.getId(), ex.getMessage());
         String gameId = (String) session.getAttributes().get("gameId");
-        if (playerMap.remove(session) != null) {
-            removeFromGameSessions(gameId, session);
+        String playerId = playerMap.remove(session);
+        if (playerId != null) {
+            sessionRegistry.unregister(gameId, playerId, session);
             broadcaster.unregisterClient();
         }
     }
@@ -161,29 +163,7 @@ public class WebSocketController extends TextWebSocketHandler {
 
     /** Sends to every session in the same game, excluding the sender. */
     private void broadcastToGame(String gameId, WebSocketSession sender, Map<String,Object> envelope) {
-        if (gameId == null) return;
-        Set<WebSocketSession> sessions = gameSessions.get(gameId);
-        if (sessions == null || sessions.isEmpty()) return;
-        String msg;
-        try { msg = objectMapper.writeValueAsString(envelope); }
-        catch (IOException e) { logger.error("Serialization failed: {}", e.getMessage()); return; }
-        for (WebSocketSession s : sessions) {
-            if (s.isOpen() && !s.equals(sender)) {
-                try { s.sendMessage(new TextMessage(msg)); }
-                catch (IOException ex) {
-                    logger.error("Broadcast to {} failed: {}", playerMap.get(s), ex.getMessage());
-                }
-            }
-        }
-    }
-
-    private void removeFromGameSessions(String gameId, WebSocketSession session) {
-        if (gameId == null) return;
-        Set<WebSocketSession> sessions = gameSessions.get(gameId);
-        if (sessions != null) {
-            sessions.remove(session);
-            if (sessions.isEmpty()) gameSessions.remove(gameId);
-        }
+        sessionRegistry.broadcastToGame(gameId, sender, envelope);
     }
 
     private void send(WebSocketSession session, Map<String,Object> envelope) throws IOException {
