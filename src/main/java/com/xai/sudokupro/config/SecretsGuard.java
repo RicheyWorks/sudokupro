@@ -28,7 +28,7 @@ public class SecretsGuard implements InitializingBean {
 
     /** Values that must never guard a non-dev deployment. */
     private static final Set<String> WELL_KNOWN = Set.of(
-        "sudoku123", "secret", "admin", "password", "changeme", "postgres");
+        "sudoku123", "secret", "admin", "password", "changeme", "change_me", "postgres");
 
     private final String dbPassword;
     private final String adminPassword;

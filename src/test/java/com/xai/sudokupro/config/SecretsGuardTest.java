@@ -26,6 +26,9 @@ class SecretsGuardTest {
             () -> new SecretsGuard("sudoku123", "a-real-secret-9x!").afterPropertiesSet());
         assertThrows(IllegalStateException.class,
             () -> new SecretsGuard("a-real-secret-9x!", "Secret").afterPropertiesSet());
+        // The .env.example placeholder must also be rejected.
+        assertThrows(IllegalStateException.class,
+            () -> new SecretsGuard("CHANGE_ME", "a-real-secret-9x!").afterPropertiesSet());
     }
 
     @Test

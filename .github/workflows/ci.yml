@@ -1,0 +1,31 @@
+# Full CI (AUDIT P1-6): build, run the entire test suite, and prove the Docker
+# image actually builds. Replaces test-constants.yml, which exercised one test.
+name: CI
+
+on: [push, pull_request]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+          cache: maven
+
+      # Full suite — runs on H2 via the test profile, no services needed.
+      - name: Build and test
+        run: mvn -B verify
+
+  docker:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build Docker image
+        run: docker build -t sudokupro:${{ github.sha }} .

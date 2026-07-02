@@ -1,1 +1,77 @@
- 
+# SudokuPro server deployment. (AUDIT P1-6)
+#
+# Prerequisites:
+#   - Image built from the repo Dockerfile and pushed to your registry
+#     (update spec.template.spec.containers[0].image below).
+#   - Secret with real credentials (SecretsGuard refuses weak/missing values):
+#       kubectl create secret generic sudokupro-secrets \
+#         --from-literal=DB_PASSWORD='...' --from-literal=ADMIN_PASSWORD='...'
+#   - Postgres reachable as "postgres:5432" and Redis as "redis:6379"
+#     (adjust DB_URL / REDIS_HOST for your environment).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sudokupro
+  labels:
+    app: sudokupro
+spec:
+  # MUST stay at 1: game state (activeGames, streaks, locks) is per-JVM
+  # (AUDIT P1-7). With >1 replica, players land on pods with different state.
+  # Scale only after hot state moves to Redis.
+  replicas: 1
+  selector:
+    matchLabels:
+      app: sudokupro
+  template:
+    metadata:
+      labels:
+        app: sudokupro
+    spec:
+      containers:
+        - name: sudokupro
+          image: REGISTRY/sudokupro:latest  # ← set to your registry/tag
+          ports:
+            - containerPort: 8080
+          env:
+            - name: SUDOKUPRO_UI_ENABLED
+              value: "false"
+            - name: DB_URL
+              value: jdbc:postgresql://postgres:5432/sudokupro
+            - name: DB_USERNAME
+              value: postgres
+            - name: REDIS_HOST
+              value: redis
+            - name: REDIS_PORT
+              value: "6379"
+            - name: DDL_AUTO
+              value: validate
+            - name: ADMIN_USERNAME
+              value: admin
+            - name: DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: sudokupro-secrets
+                  key: DB_PASSWORD
+            - name: ADMIN_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: sudokupro-secrets
+                  key: ADMIN_PASSWORD
+          readinessProbe:
+            httpGet:
+              path: /actuator/health
+              port: 8080
+            initialDelaySeconds: 30
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /actuator/health
+              port: 8080
+            initialDelaySeconds: 60
+            periodSeconds: 20
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+            limits:
+              memory: 1Gi

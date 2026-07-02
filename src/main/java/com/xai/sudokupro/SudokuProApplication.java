@@ -62,20 +62,29 @@ public class SudokuProApplication {
             // window closes, so anything after it runs only after the user exits the UI.
             Runtime.getRuntime().addShutdownHook(new Thread(SudokuProApplication::shutdown));
 
-            // Share the already-running Spring context with MainStage so that its init()
-            // skips the second SpringApplication.run() that would collide on port 8080.
-            MainStage.setSpringContext(context);
+            // Headless/server mode (containers, k8s): skip the desktop UI entirely.
+            // JavaFX toolkit init throws unrecoverable Errors (not Exceptions) without a
+            // display, so guarding with try/catch is not enough. Set SUDOKUPRO_UI_ENABLED=false
+            // (or -Dsudokupro.ui.enabled=false); the Docker image sets it by default.
+            boolean uiEnabled = Boolean.parseBoolean(env.getProperty("sudokupro.ui.enabled", "true"));
+            if (uiEnabled) {
+                // Share the already-running Spring context with MainStage so that its init()
+                // skips the second SpringApplication.run() that would collide on port 8080.
+                MainStage.setSpringContext(context);
 
-            try {
-                javafx.application.Application.launch(MainStage.class, args);
-            } catch (Exception e) {
-                logger.warn("JavaFX launch failed, using fallback mode", e);
-                startFallbackTerminalMode();
-            }
+                try {
+                    javafx.application.Application.launch(MainStage.class, args);
+                } catch (Exception e) {
+                    logger.warn("JavaFX launch failed, using fallback mode", e);
+                    startFallbackTerminalMode();
+                }
 
-            // Post-UI-close health snapshot — guard against context already closed by stop().
-            if (context != null && context.isActive()) {
-                context.getBean(SudokuHealthMonitor.class).runChecks();
+                // Post-UI-close health snapshot — guard against context already closed by stop().
+                if (context != null && context.isActive()) {
+                    context.getBean(SudokuHealthMonitor.class).runChecks();
+                }
+            } else {
+                logger.info("UI disabled (sudokupro.ui.enabled=false) — headless server mode; web server threads keep the JVM alive");
             }
 
         } catch (Exception e) {

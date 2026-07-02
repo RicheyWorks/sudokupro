@@ -1,0 +1,7 @@
+target/
+.git/
+.github/
+kubernetes/
+*.md
+.env
+.env.example
