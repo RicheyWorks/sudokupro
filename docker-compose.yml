@@ -16,10 +16,8 @@ services:
       ADMIN_PASSWORD: ${ADMIN_PASSWORD:?set ADMIN_PASSWORD in .env}
       REDIS_HOST: redis
       REDIS_PORT: "6379"
-      # First run needs the schema created; no migration tool is adopted yet
-      # (AUDIT P0-3 recommends Flyway). Until then compose defaults to update;
-      # switch to validate once the schema exists.
-      DDL_AUTO: ${DDL_AUTO:-update}
+      # Flyway creates/migrates the schema on startup; Hibernate only validates.
+      DDL_AUTO: ${DDL_AUTO:-validate}
     depends_on:
       postgres:
         condition: service_healthy

@@ -104,14 +104,6 @@ public class SecureRandomGenerator {
         return localRand.get().nextDouble() < probability;
     }
 
-    public byte[] generateRandomBytes(int length) {
-        if (length < 0) throw new IllegalArgumentException("Length must be non-negative");
-        methodLog.add("generateRandomBytes");
-        byte[] bytes = new byte[length];
-        localRand.get().nextBytes(bytes);
-        return bytes;
-    }
-
     public double gaussianDouble(double mean, double stdDev) {
         if (stdDev < 0) throw new IllegalArgumentException("StdDev must be non-negative");
         methodLog.add("gaussianDouble");
@@ -140,17 +132,6 @@ public class SecureRandomGenerator {
         return mean + stddev * localRand.get().nextGaussian();
     }
 
-    public int getSystemEntropyBits() {
-        methodLog.add("getSystemEntropyBits");
-        try {
-            String output = new String(java.nio.file.Files.readAllBytes(java.nio.file.Paths.get("/proc/sys/kernel/random/entropy_avail")));
-            return Integer.parseInt(output.trim());
-        } catch (Exception e) {
-            log.warn("Could not read entropy stats: {}", e.getMessage());
-            return -1;
-        }
-    }
-
     public interface DistributionFunction {
         double generate(SecureRandom random);
     }
@@ -158,11 +139,6 @@ public class SecureRandomGenerator {
     public long getSeedSnapshot() {
         methodLog.add("getSeedSnapshot");
         return localRand.get().nextLong();
-    }
-
-    public void replayWithSeed(long seed) {
-        methodLog.add("replayWithSeed");
-        setSeed(seed);
     }
 
     public void boostEntropy(byte[] extraBytes) {

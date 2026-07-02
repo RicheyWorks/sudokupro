@@ -119,6 +119,12 @@
             <scope>test</scope>
         </dependency>
 
+        <!-- Schema migrations (AUDIT P0-3): Flyway owns the schema; ddl-auto stays validate. -->
+        <dependency>
+            <groupId>org.flywaydb</groupId>
+            <artifactId>flyway-core</artifactId>
+        </dependency>
+
         <!-- JavaFX — classifier selects the platform-native JAR (set by OS-activated profiles). -->
         <dependency>
             <groupId>org.openjfx</groupId>

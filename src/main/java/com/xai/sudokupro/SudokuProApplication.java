@@ -3,7 +3,6 @@ package com.xai.sudokupro;
 import com.xai.sudokupro.repository.UserRepository;
 import com.xai.sudokupro.service.*;
 import com.xai.sudokupro.ui.MainStage;
-import com.xai.sudokupro.util.SudokuHealthMonitor;
 import io.micrometer.core.instrument.MeterRegistry;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -77,11 +76,6 @@ public class SudokuProApplication {
                 } catch (Exception e) {
                     logger.warn("JavaFX launch failed, using fallback mode", e);
                     startFallbackTerminalMode();
-                }
-
-                // Post-UI-close health snapshot — guard against context already closed by stop().
-                if (context != null && context.isActive()) {
-                    context.getBean(SudokuHealthMonitor.class).runChecks();
                 }
             } else {
                 logger.info("UI disabled (sudokupro.ui.enabled=false) — headless server mode; web server threads keep the JVM alive");

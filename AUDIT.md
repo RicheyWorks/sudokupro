@@ -74,6 +74,7 @@ The repo had 56 modified files uncommitted (~8k insertions). Triage shows most o
 - **P1-5** — Dead FCM legacy integration removed (PushNotificationService, `fcm.server-key`, FCM_SERVER_KEY). NotificationService queue + rate-limit retained as a hook for a future HTTP-v1 integration.
 - **P1-6** — Real multi-stage Dockerfile, compose stack (Postgres/Redis, healthchecks), k8s manifests (secret-backed creds, actuator probes), full-suite CI + docker build gate. Headless mode added (`sudokupro.ui.enabled`) since JavaFX cannot start in containers.
 - **P1-7** — Documented: k8s replicas pinned to 1 with rationale inline.
-- **P2-1 (partial)** — SecureRandomGenerator 833→175 lines (61 unused methods cut). SudokuHealthMonitor trimmed 12 dead methods; the full Actuator HealthIndicator migration remains.
+- **P2-1** — SecureRandomGenerator 833→151 lines (64 unused methods cut). SudokuHealthMonitor (1,532 lines) deleted: infrastructure checks now come from Boot's autoconfigured HealthIndicators (db, redis, diskSpace); the one genuinely custom check lives in `GameEngineHealthIndicator` (solver self-test + active-game count), feeding /actuator/health, which the Docker HEALTHCHECK and k8s probes already hit.
+- **Flyway adopted** — `flyway-core` + V1 baseline (Hibernate-generated PostgreSQL DDL) + V2 (legacy start_time BIGINT→TIMESTAMP, vendor-specific location). `baseline-on-migrate=true, baseline-version=1` so pre-Flyway databases skip V1 and apply V2+. Dev profile keeps ddl-auto=update with Flyway off; everywhere else Flyway owns the schema and Hibernate validates. compose now defaults DDL_AUTO=validate.
 
-**Remaining**: P1-2 module split (server/client/model), P2-1 SudokuHealthMonitor→Actuator, P2-2 WebSocket stack convergence, P2-3 flavor/enforcement decoupling, Flyway adoption.
+**Remaining**: P1-2 module split (server/client/model), P2-2 WebSocket stack convergence, P2-3 flavor/enforcement decoupling.
