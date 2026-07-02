@@ -24,9 +24,27 @@ import java.util.concurrent.ConcurrentMap;
  * broadcast went nowhere. All traffic now flows through this registry.
  *
  * Envelope format (unchanged from the raw protocol): {"type", "from", "payload"}.
+ *
+ * Multi-replica (Phase 5): when a RemotePublisher is attached (RedisBroadcastRelay),
+ * every broadcast is also published to Redis pub/sub so replicas deliver it to THEIR
+ * sessions of the same game. The deliver*Local methods are the receive path and never
+ * republish (no loops). Without a publisher the registry is single-pod, as before.
  */
 @Component
 public class GameSessionRegistry {
+
+    /** Cross-replica publish hook; see RedisBroadcastRelay. */
+    public interface RemotePublisher {
+        void publishToGame(String gameId, Map<String, Object> envelope);
+        void publishToAll(Map<String, Object> envelope);
+        void publishToPlayer(String playerId, Map<String, Object> envelope);
+    }
+
+    private volatile RemotePublisher remotePublisher;
+
+    public void setRemotePublisher(RemotePublisher publisher) {
+        this.remotePublisher = publisher;
+    }
 
     private static final Logger logger = LoggerFactory.getLogger(GameSessionRegistry.class);
 
@@ -56,6 +74,32 @@ public class GameSessionRegistry {
 
     /** Sends to every open session in the game, excluding {@code excludeSender} (may be null). */
     public void broadcastToGame(String gameId, WebSocketSession excludeSender, Map<String, Object> envelope) {
+        deliverToGameLocal(gameId, excludeSender, envelope);
+        RemotePublisher rp = remotePublisher;
+        if (rp != null) rp.publishToGame(gameId, envelope);
+    }
+
+    /** Sends to every open session across all games (global announcements, health pings). */
+    public void broadcastToAll(Map<String, Object> envelope) {
+        deliverToAllLocal(envelope);
+        RemotePublisher rp = remotePublisher;
+        if (rp != null) rp.publishToAll(envelope);
+    }
+
+    /**
+     * Sends to a single player's session. Returns true when delivered locally; when the
+     * player is on another replica the message is relayed and delivery happens there.
+     */
+    public boolean sendToPlayer(String playerId, Map<String, Object> envelope) {
+        if (deliverToPlayerLocal(playerId, envelope)) return true;
+        RemotePublisher rp = remotePublisher;
+        if (rp != null) rp.publishToPlayer(playerId, envelope);
+        return false;
+    }
+
+    // ---- local delivery (also the receive path for relayed messages; never republishes) ----
+
+    public void deliverToGameLocal(String gameId, WebSocketSession excludeSender, Map<String, Object> envelope) {
         if (gameId == null) return;
         Set<WebSocketSession> sessions = gameSessions.get(gameId);
         if (sessions == null || sessions.isEmpty()) return;
@@ -66,8 +110,7 @@ public class GameSessionRegistry {
         }
     }
 
-    /** Sends to every open session across all games (global announcements, health pings). */
-    public void broadcastToAll(Map<String, Object> envelope) {
+    public void deliverToAllLocal(Map<String, Object> envelope) {
         String msg = serialize(envelope);
         if (msg == null) return;
         for (Set<WebSocketSession> sessions : gameSessions.values()) {
@@ -77,8 +120,7 @@ public class GameSessionRegistry {
         }
     }
 
-    /** Sends to a single player's session, if connected. Returns true when delivered. */
-    public boolean sendToPlayer(String playerId, Map<String, Object> envelope) {
+    public boolean deliverToPlayerLocal(String playerId, Map<String, Object> envelope) {
         WebSocketSession s = playerSessions.get(playerId);
         if (s == null || !s.isOpen()) return false;
         String msg = serialize(envelope);

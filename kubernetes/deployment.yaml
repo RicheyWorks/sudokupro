@@ -15,9 +15,13 @@ metadata:
   labels:
     app: sudokupro
 spec:
-  # MUST stay at 1: game state (activeGames, streaks, locks) is per-JVM
-  # (AUDIT P1-7). With >1 replica, players land on pods with different state.
-  # Scale only after hot state moves to Redis.
+  # Multi-replica ready (Phase 5): boards are Redis/DB-backed with per-pod
+  # caching, player streaks/points/input-locks live in Redis (PlayerStateStore),
+  # game mutations take a cross-replica Redis lock (GameLockManager), and
+  # WebSocket broadcasts fan out to all pods via Redis pub/sub
+  # (RedisBroadcastRelay). Requires a healthy shared Redis — without one,
+  # pods degrade to independent single-replica behavior. Start at 1 and scale
+  # once Redis is provisioned.
   replicas: 1
   selector:
     matchLabels:

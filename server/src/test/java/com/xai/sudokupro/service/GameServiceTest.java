@@ -50,9 +50,18 @@ class GameServiceTest {
         SecureRandomGenerator rng = new SecureRandomGenerator(new SimpleMeterRegistry());
         AISolverService realSolver = new AISolverService(rng);
 
+        // Every call on this mock throws like a down Redis, exercising the stores'
+        // in-memory fallback — the single-replica code path.
+        org.springframework.data.redis.core.StringRedisTemplate stringRedis =
+            mock(org.springframework.data.redis.core.StringRedisTemplate.class,
+                inv -> { throw new org.springframework.data.redis.RedisConnectionFailureException("down (test)"); });
+        PlayerStateStore playerState = new PlayerStateStore(stringRedis);
+        GameLockManager gameLockManager = new GameLockManager(stringRedis);
+
         gameService = new GameService(
             realSolver, gameRepository, multiplayerBroadcaster,
-            redisTemplate, rng, analyticsService, antiCheatEngine, chaosEngine
+            redisTemplate, rng, playerState, gameLockManager,
+            analyticsService, antiCheatEngine, chaosEngine
         );
     }
 

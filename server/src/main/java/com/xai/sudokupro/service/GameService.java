@@ -37,26 +37,22 @@ public class GameService {
     private final AntiCheatEngine      antiCheatEngine;
     private final ChaosEngine          chaosEngine;
 
-    private final Map<String, SudokuBoard> activeGames      = new ConcurrentHashMap<>();
-    private final Map<String, Integer>     playerStreaks     = new ConcurrentHashMap<>();
-    private final Map<String, Integer>     playerCosmicPts  = new ConcurrentHashMap<>();
-    private final Map<String, Long>        lockedPlayers    = new ConcurrentHashMap<>();
-
-    /**
-     * Per-game mutex objects.  Every state-changing operation on a specific game
-     * synchronizes on {@code gameLocks.get(gameId)} rather than {@code this}, so
-     * games that share no state can proceed in parallel.
-     * Game creation still uses a narrow {@code creationLock} to serialise the
-     * MAX_ACTIVE_GAMES trim — that path is infrequent and unrelated to in-game ops.
-     */
-    private final ConcurrentHashMap<String, Object> gameLocks   = new ConcurrentHashMap<>();
-    private final Object                            creationLock = new Object();
+    // activeGames is a per-pod CACHE of boards — the authoritative copy lives in
+    // Redis/DB (getGame reads through, mutations write through). Player streaks,
+    // cosmic points, and input locks live in PlayerStateStore; per-game mutual
+    // exclusion (across replicas) in GameLockManager. (Phase 5 / AUDIT P1-7)
+    private final Map<String, SudokuBoard> activeGames = new ConcurrentHashMap<>();
+    private final PlayerStateStore playerState;
+    private final GameLockManager  gameLocks;
+    private final Object           creationLock = new Object();
 
     @Autowired
     public GameService(AISolverService aiSolverService, GameRepository gameRepository,
                        MultiplayerBroadcaster multiplayerBroadcaster,
                        @Qualifier("gameStateRedisTemplate") RedisTemplate<String, SudokuBoard> redisTemplate,
                        SecureRandomGenerator randomGenerator,
+                       PlayerStateStore playerState,
+                       GameLockManager gameLockManager,
                        AnalyticsService analyticsService,
                        AntiCheatEngine antiCheatEngine,
                        ChaosEngine chaosEngine) {
@@ -65,6 +61,8 @@ public class GameService {
         this.multiplayerBroadcaster= Objects.requireNonNull(multiplayerBroadcaster);
         this.redisTemplate         = Objects.requireNonNull(redisTemplate);
         this.randomGenerator       = Objects.requireNonNull(randomGenerator);
+        this.playerState           = Objects.requireNonNull(playerState);
+        this.gameLocks             = Objects.requireNonNull(gameLockManager);
         this.analyticsService      = Objects.requireNonNull(analyticsService);
         this.antiCheatEngine       = Objects.requireNonNull(antiCheatEngine);
         this.chaosEngine           = Objects.requireNonNull(chaosEngine);
@@ -107,7 +105,6 @@ public class GameService {
         // Register and trim under a narrow creation lock so MAX_ACTIVE_GAMES is enforced atomically.
         synchronized (creationLock) {
             activeGames.put(gameId, board);
-            gameLocks.put(gameId, new Object());
             trimActiveGames();
         }
         saveToRedis(gameId, board);
@@ -124,7 +121,7 @@ public class GameService {
 
     public SudokuBoard getGame(String gameId) {
         validateGameId(gameId);
-        synchronized (lockFor(gameId)) {
+        try (var lock = gameLocks.lock(gameId)) {
             SudokuBoard board = activeGames.get(gameId);
             if (board == null) {
                 board = redisTemplate.opsForValue().get(redisKey(gameId));
@@ -164,7 +161,7 @@ public class GameService {
 
     public String getHint(String gameId) {
         validateGameId(gameId);
-        synchronized (lockFor(gameId)) {
+        try (var lock = gameLocks.lock(gameId)) {
             SudokuBoard board = getGame(gameId);
             String hint = aiSolverService.getNextLogicalMove(board);
             analyticsService.recordEvent(new GameEvent(GameEvent.EventType.HINT, board.getPlayerId(),
@@ -183,7 +180,7 @@ public class GameService {
             logger.warn("Player {} is locked, rejecting move", playerId);
             return;
         }
-        synchronized (lockFor(gameId)) {
+        try (var lock = gameLocks.lock(gameId)) {
             SudokuBoard board = getGame(gameId);
 
             if (board.isChaosMode() && randomGenerator.chance(0.1)) triggerChaosSwap(board);
@@ -208,7 +205,7 @@ public class GameService {
                     antiCheatEngine.flagPlayer(playerId);
                     chaosEngine.onGameEvent("RAGE", playerId);
                 }
-                playerStreaks.merge(playerId, 1, Integer::sum);
+                playerState.incrementStreak(playerId);
                 chaosEngine.onGameEvent("STREAK", playerId);
                 endGame(gameId, playerId);
             } else if (board.isInfiniteMode() && board.getLives() <= 0) {
@@ -223,10 +220,10 @@ public class GameService {
 
     public void endGame(String gameId, String playerId) {
         validateGameId(gameId);
-        synchronized (lockFor(gameId)) {
+        try (var lock = gameLocks.lock(gameId)) {
             SudokuBoard board = activeGames.remove(gameId);
             if (board != null) {
-                gameLocks.remove(gameId);   // release per-game lock entry
+                gameLocks.releaseGame(gameId);   // drop the per-game local lock entry
                 redisTemplate.delete(redisKey(gameId));
                 gameRepository.save(board);
                 GameEvent.EventType type = board.isSolved()
@@ -241,7 +238,7 @@ public class GameService {
 
     public void solveSudoku(String gameId) {
         validateGameId(gameId);
-        synchronized (lockFor(gameId)) {
+        try (var lock = gameLocks.lock(gameId)) {
             SudokuBoard board = getGame(gameId);
             aiSolverService.solveSudoku(board);
             saveToRedis(gameId, board);
@@ -253,7 +250,7 @@ public class GameService {
         activeGames.entrySet().stream()
             .filter(e -> playerId.equals(e.getValue().getPlayerId()))
             .forEach(e -> {
-                synchronized (lockFor(e.getKey())) {
+                try (var lock = gameLocks.lock(e.getKey())) {
                     SudokuBoard b = e.getValue();
                     for (int i = 0; i < turns && !b.getMoveHistory().isEmpty(); i++) b.undo();
                 }
@@ -265,22 +262,19 @@ public class GameService {
         activeGames.entrySet().stream()
             .filter(e -> playerId.equals(e.getValue().getPlayerId()))
             .forEach(e -> {
-                synchronized (lockFor(e.getKey())) {
+                try (var lock = gameLocks.lock(e.getKey())) {
                     e.getValue().reset();
                 }
             });
     }
 
     public void lockPlayerInput(String playerId, long durationMs) {
-        lockedPlayers.put(playerId, System.currentTimeMillis() + durationMs);
+        playerState.lockPlayerInput(playerId, durationMs);
         logger.info("Locked player {} for {}ms", playerId, durationMs);
     }
 
     private boolean isPlayerLocked(String playerId) {
-        Long until = lockedPlayers.get(playerId);
-        if (until == null) return false;
-        if (System.currentTimeMillis() > until) { lockedPlayers.remove(playerId); return false; }
-        return true;
+        return playerState.isPlayerLocked(playerId);
     }
 
     public void alterGameRulesTemporarily(String playerId) {
@@ -299,7 +293,7 @@ public class GameService {
             case 2 -> board.invertRandomBox(randomGenerator);
         }
         chaosEngine.updateLuck(playerId, 0.05);
-        playerCosmicPts.merge(playerId, 2, Integer::sum);
+        playerState.addCosmicPoints(playerId, 2);
     }
 
     /** Validate a WebSocket DuelMove. */
@@ -317,11 +311,11 @@ public class GameService {
     public int  getActiveGamesCount()           { return activeGames.size(); }
     public Map<String,SudokuBoard> getActiveGames() { return Collections.unmodifiableMap(activeGames); }
     public String getPlayerLuckProfile(String p)    { return chaosEngine.exportLuckProfileJson(p); }
-    public int  getPlayerCosmicPoints(String p)     { return playerCosmicPts.getOrDefault(p, 0); }
-    public int  getPlayerStreak(String p)           { return playerStreaks.getOrDefault(p, 0); }
+    public int  getPlayerCosmicPoints(String p)     { return playerState.getCosmicPoints(p); }
+    public int  getPlayerStreak(String p)           { return playerState.getStreak(p); }
 
     public void resetPlayerStats(String playerId) {
-        playerStreaks.remove(playerId); playerCosmicPts.remove(playerId);
+        playerState.resetPlayer(playerId);
         chaosEngine.resetPlayerState(playerId);
     }
 
@@ -369,16 +363,12 @@ public class GameService {
         return "game:" + gameId;
     }
 
-    private Object lockFor(String gameId) {
-        return gameLocks.computeIfAbsent(gameId, k -> new Object());
-    }
-
     private void trimActiveGames() {
         // Called under creationLock. Remove oldest entries when over limit.
         while (activeGames.size() > MAX_ACTIVE_GAMES) {
             String oldest = activeGames.keySet().iterator().next();
             activeGames.remove(oldest);
-            gameLocks.remove(oldest);
+            gameLocks.releaseGame(oldest);
             logger.warn("Active games limit reached; evicted game {}", oldest);
         }
     }
