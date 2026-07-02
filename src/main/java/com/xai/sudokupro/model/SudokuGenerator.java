@@ -132,15 +132,19 @@ public class SudokuGenerator {
             int col = rand.nextInt(size);
             if (board[row][col].getValue() != 0) {
                 int temp = board[row][col].getValue();
-                board[row][col].setValue(0, SudokuCell.MoveSource.INITIAL);
+                // Bug fix: setGiven(false) must precede setValue(0) — SudokuCell.setValue
+                // silently refuses to modify a given cell, so the old order left the value
+                // in place while removed++ still counted it (a "phantom removal": the
+                // board ended up with fewer empty cells than the difficulty requires).
                 board[row][col].setGiven(false);
+                board[row][col].setValue(0, SudokuCell.MoveSource.INITIAL);
                 if (enforceSymmetry) {
                     int symRow = size - 1 - row;
                     int symCol = size - 1 - col;
                     if (symRow >= 0 && symCol >= 0 && board[symRow][symCol].getValue() != 0) {
                         int symTemp = board[symRow][symCol].getValue();
-                        board[symRow][symCol].setValue(0, SudokuCell.MoveSource.INITIAL);
                         board[symRow][symCol].setGiven(false);
+                        board[symRow][symCol].setValue(0, SudokuCell.MoveSource.INITIAL);
                         if (hasUniqueSolution(board)) {
                             removed += 2;
                             logger.debug("Symmetric removal at ({},{}) and ({},{}): {}, {}", row, col, symRow, symCol, temp, symTemp);
@@ -414,13 +418,22 @@ public class SudokuGenerator {
 
     // Validation and Insights
     public boolean validateBoard(SudokuCell[][] board) {
+        // Bug fix: isValidMove sees the cell's own value in its row/col/box, so calling it
+        // on a FILLED cell always failed and validateBoard rejected every non-empty board.
+        // Check each filled cell against a copy with that cell blanked instead.
+        int[][] temp = copyBoard(board);
         for (int i = 0; i < size; i++) {
             for (int j = 0; j < size; j++) {
-                int val = board[i][j].getValue();
-                if (val != 0 && !isValidMove(board, i, j, val)) {
-                    logger.warn("Invalid move detected at ({},{}): {}", i, j, val);
-                    generationLog.add("Invalid move detected at (" + i + "," + j + "): " + val);
-                    return false;
+                int val = temp[i][j];
+                if (val != 0) {
+                    temp[i][j] = 0;
+                    boolean ok = isValidTempMove(temp, i, j, val);
+                    temp[i][j] = val;
+                    if (!ok) {
+                        logger.warn("Invalid move detected at ({},{}): {}", i, j, val);
+                        generationLog.add("Invalid move detected at (" + i + "," + j + "): " + val);
+                        return false;
+                    }
                 }
             }
         }
@@ -473,8 +486,11 @@ public class SudokuGenerator {
             int col = rand.nextInt(size);
             if (board[row][col].getValue() != 0 && board[row][col].isGiven()) {
                 int temp = board[row][col].getValue();
-                board[row][col].setValue(0, SudokuCell.MoveSource.INITIAL);
+                // Bug fix: same ordering issue as removeNumbers — these cells are given,
+                // so setValue(0) before setGiven(false) was ALWAYS a silent no-op and this
+                // method never actually increased difficulty.
                 board[row][col].setGiven(false);
+                board[row][col].setValue(0, SudokuCell.MoveSource.INITIAL);
                 if (hasUniqueSolution(board)) {
                     logger.debug("Enforced difficulty by removing ({},{}): {}", row, col, temp);
                     generationLog.add("Enforced difficulty by removing (" + row + "," + col + "): " + temp);

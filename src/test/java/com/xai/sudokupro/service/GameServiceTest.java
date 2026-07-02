@@ -2,6 +2,8 @@ package com.xai.sudokupro.service;
 
 import com.xai.sudokupro.engine.ChaosEngine;
 import com.xai.sudokupro.model.SudokuBoard;
+import com.xai.sudokupro.model.EnhancedMove;
+import com.xai.sudokupro.model.SudokuCell;
 import com.xai.sudokupro.repository.GameRepository;
 import com.xai.sudokupro.util.SecureRandomGenerator;
 import com.xai.sudokupro.websocket.MultiplayerBroadcaster;
@@ -68,5 +70,53 @@ class GameServiceTest {
         String hint = gameService.getHintForPlayer("anonymous");
         assertNotNull(hint, "Hint should not be null");
         assertFalse(hint.isEmpty(), "Hint should provide some guidance");
+    }
+
+    // ---- move / lock logic (AUDIT P1-1) ----
+
+    /** Finds an empty cell and a legal value for it. Returns {row, col, value}. */
+    private static int[] findLegalMove(SudokuBoard board) {
+        SudokuCell[][] cells = board.getBoard();
+        for (int i = 0; i < 9; i++)
+            for (int j = 0; j < 9; j++)
+                if (cells[i][j].getValue() == 0)
+                    for (int v = 1; v <= 9; v++)
+                        if (board.isValidMove(i, j, v)) return new int[]{i, j, v};
+        throw new IllegalStateException("Generated board has no legal move");
+    }
+
+    @Test
+    void applyMoveUpdatesBoardAndRecordsForAntiCheat() {
+        SudokuBoard board = gameService.createNewGame(1, "p-move", false, false);
+        int[] m = findLegalMove(board);
+        EnhancedMove move = new EnhancedMove(m[0], m[1], m[2], SudokuCell.MoveSource.PLAYER);
+
+        gameService.applyMove(board.getGameId(), move, "p-move");
+
+        assertEquals(m[2], board.getBoard()[m[0]][m[1]].getValue(),
+            "Move must be applied to the board held by GameService");
+        verify(antiCheatEngine).recordMove("p-move", false);
+    }
+
+    @Test
+    void lockedPlayerMovesAreRejected() {
+        SudokuBoard board = gameService.createNewGame(1, "p-lock", false, false);
+        int[] m = findLegalMove(board);
+        EnhancedMove move = new EnhancedMove(m[0], m[1], m[2], SudokuCell.MoveSource.PLAYER);
+
+        gameService.lockPlayerInput("p-lock", 60_000);
+        gameService.applyMove(board.getGameId(), move, "p-lock");
+
+        assertEquals(0, board.getBoard()[m[0]][m[1]].getValue(),
+            "A locked player's move must not reach the board");
+        verify(antiCheatEngine, never()).recordMove(anyString(), anyBoolean());
+    }
+
+    @Test
+    void unknownGameIdThrows() {
+        gameService.createNewGame(1, "p-x", false, false);
+        assertThrows(IllegalArgumentException.class,
+            () -> gameService.getGame("no-such-game"),
+            "getGame must throw for unknown ids (WebSocketController relies on this)");
     }
 }
