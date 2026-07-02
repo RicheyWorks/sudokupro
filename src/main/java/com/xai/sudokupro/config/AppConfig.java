@@ -62,12 +62,18 @@ public class AppConfig {
     @Bean
     public ConcurrentHashMap<Long, String> playerStatsCache() { return new ConcurrentHashMap<>(); }
 
+    // Single JedisPool for the remaining raw-Jedis consumers (RedisSyncScheduler,
+    // RedisHealthIndicator, SudokuHealthMonitor). Reads the SAME spring.data.redis.*
+    // properties as Boot's connection factory so both clients always target the same
+    // server — previously this was hardcoded to localhost while a second pool in
+    // RedisConfig read custom spring.redis.* keys. (AUDIT P1-4)
     @Bean
     @ConditionalOnMissingBean(JedisPool.class)
-    public JedisPool jedisPool() {
+    public JedisPool jedisPool(@org.springframework.beans.factory.annotation.Value("${spring.data.redis.host:localhost}") String host,
+                               @org.springframework.beans.factory.annotation.Value("${spring.data.redis.port:6379}") int port) {
         JedisPoolConfig cfg = new JedisPoolConfig();
         cfg.setMaxTotal(128); cfg.setMaxIdle(128); cfg.setMinIdle(16); cfg.setTestOnBorrow(true);
-        return new JedisPool(cfg, "localhost", 6379, 2000);
+        return new JedisPool(cfg, host, port, 2000);
     }
 
     @Bean

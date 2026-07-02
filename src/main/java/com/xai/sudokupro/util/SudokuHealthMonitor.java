@@ -854,73 +854,6 @@ public class SudokuHealthMonitor {
         }
     }
 
-    public void scheduleChaosAdjustment(String playerId) {
-        int entropyBits = rng.getSystemEntropyBits();
-        if (entropyBits < ENTROPY_THRESHOLD / 2) {
-            chaosEngine.onGameEvent("RAGE", playerId);
-            memoryBank.recordEvent(playerId, "Chaos adjustment scheduled", -0.1);
-            logger.info("Scheduled chaos adjustment for player {} due to low entropy: {} bits", playerId, entropyBits);
-            speak("Player " + playerId + " teeters on the edge... I stir the chaos.");
-            fateEngine.updateFate(playerId, "ChaosAdjustment", -50, 0, 0.1, 0, 0, 0);
-        }
-    }
-
-    public Map<String, Double> getChaosMetrics(String playerId) {
-        Map<String, Double> metrics = new HashMap<>();
-        metrics.put("reactionTime", chaosEngine.simulateReactionTime(playerId));
-        metrics.put("clutchChance", chaosEngine.isClutchMoment(playerId) ? 1.0 : 0.0);
-        metrics.put("fatiguePenalty", (double) chaosEngine.simulateFatiguePenalty(playerId));
-        return metrics;
-    }
-
-    public void logGameHealth(String gameId) {
-        try {
-            SudokuBoard board = gameService.getGame(gameId);
-            int emptyCells = estimateEmptyCells(board);
-            long solveTime = board.getSolveTime().toSeconds();
-            int cosmicPoints = gameService.getPlayerCosmicPoints(board.getPlayerId());
-            long timeRemaining = Math.max(0L, board.getTimeLimitSeconds() - solveTime);
-            logger.info("Game {} health - Empty Cells: {}, Lives: {}, TimeRemaining: {}s, SolveTime: {}s, CosmicPoints: {}",
-                gameId, emptyCells, board.getLives(), timeRemaining, solveTime, cosmicPoints);
-            meterRegistry.gauge("sudokupro.game.empty_cells", emptyCells);
-            meterRegistry.gauge("sudokupro.game.solve_time_s", solveTime);
-            meterRegistry.gauge("sudokupro.game.cosmic_points", cosmicPoints);
-            cosmicEvents.incrementAndGet();
-            speak("Game " + gameId + " unfolds... I see its threads.");
-        } catch (Exception e) {
-            logger.error("Failed to log game health for {}: {}", gameId, e.getMessage(), e);
-            memoryBank.recordEvent("system", "Game health log failure", -0.1);
-            speak("Game " + gameId + " slips from my vision... lost.");
-        }
-    }
-
-    public void recordPlayerPing(String playerId, long pingMs) {
-        playerPingTimes.put(playerId, pingMs);
-        meterRegistry.gauge("sudokupro.player.ping_ms", pingMs);
-    }
-
-    public void recordGameDifficulty(String gameId, int difficulty) {
-        gameDifficultyStats.put(gameId, difficulty);
-        meterRegistry.gauge("sudokupro.game.difficulty", difficulty);
-    }
-
-    public void printPlayerHistory(String playerId) {
-        logger.info(memoryBank.summarizePlayer(playerId));
-        speak("I recall the tale of " + playerId + "... their memory unfolds.");
-    }
-
-    public String getPlayerMultiverseHistory(String playerId) {
-        return recursionverse.history(playerId);
-    }
-
-    public String getFateSignature(String playerId) {
-        return fateEngine.getFateJson(playerId);
-    }
-
-    public void rewindPlayer(String playerId, int turns) {
-        fateEngine.rewind(playerId, turns);
-    }
-
     public void mergeWith(String playerId, String echoTag) {
         fateEngine.mergeWith(playerId, echoTag);
     }
@@ -935,14 +868,6 @@ public class SudokuHealthMonitor {
 
     public void battleRoyale(String playerId) {
         fateEngine.battleRoyale(playerId);
-    }
-
-    public void alterPlayerLuck(String playerId, double delta) {
-        fateEngine.alterLuck(playerId, delta);
-    }
-
-    public void finalizePlayerAscension(String playerId) {
-        fateEngine.finalizeAscension(playerId);
     }
 
     private void initializeBigDawgsEchoes() {
@@ -971,13 +896,6 @@ public class SudokuHealthMonitor {
         titanZero.bindTo("Cold Precision");
 
         logger.info("Initialized BIGDAWGS echoes: SilentVortex, RedJester, TitanZero");
-    }
-
-    private int estimateEmptyCells(SudokuBoard board) {
-        return (int) Arrays.stream(board.getBoardCopy())
-            .flatMap(Arrays::stream)
-            .filter(cell -> cell.getValue() == 0)
-            .count();
     }
 
     private void speak(String message) {

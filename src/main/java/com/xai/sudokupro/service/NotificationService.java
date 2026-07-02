@@ -26,7 +26,6 @@ public class NotificationService {
     private static final long PUSH_RATE_LIMIT_MINUTES = 5;
 
     private final MultiplayerBroadcaster multiplayerBroadcaster;
-    private final PushNotificationService pushNotificationService;
     private final MeterRegistry meterRegistry;
 
     private final ConcurrentLinkedQueue<Notification> notificationQueue = new ConcurrentLinkedQueue<>();
@@ -34,11 +33,9 @@ public class NotificationService {
 
     @Autowired
     public NotificationService(MultiplayerBroadcaster multiplayerBroadcaster,
-                               PushNotificationService pushNotificationService,
                                MeterRegistry meterRegistry) {
 
         this.multiplayerBroadcaster = Objects.requireNonNull(multiplayerBroadcaster);
-        this.pushNotificationService = Objects.requireNonNull(pushNotificationService);
         this.meterRegistry = Objects.requireNonNull(meterRegistry);
 
         meterRegistry.gauge("sudokupro.notification.queue.size", notificationQueue, Queue::size);
@@ -120,9 +117,12 @@ public class NotificationService {
         // the shouldSendPush() rate-limit in the callers. When the WebSocket fails, the push
         // would fire on every exception regardless of the 5-minute cooldown. Guard with the
         // same rate-limit check and update lastNotificationTimes so the cooldown is respected.
+        // Push delivery removed (AUDIT P1-5): the FCM legacy server-key API was shut
+        // down by Google in 2024, so the old PushNotificationService could never work.
+        // Queue + rate-limit stay so a future HTTP-v1 integration can hook in here.
         String playerId = notification.playerId();
         if (shouldSendPush(playerId)) {
-            pushNotificationService.send(playerId, notification.message(), null);
+            logger.debug("Push suppressed for {} — no push provider configured (FCM legacy removed)", playerId);
             lastNotificationTimes.put(playerId, LocalDateTime.now());
         }
     }

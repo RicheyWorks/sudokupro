@@ -12,8 +12,6 @@ import org.springframework.data.redis.connection.RedisConnectionFactory;
 import org.springframework.data.redis.core.RedisTemplate;
 import org.springframework.data.redis.serializer.Jackson2JsonRedisSerializer;
 import org.springframework.data.redis.serializer.StringRedisSerializer;
-import redis.clients.jedis.JedisPool;
-import redis.clients.jedis.JedisPoolConfig;
 
 @Profile("redis")
 @Configuration
@@ -21,36 +19,17 @@ public class RedisConfig {
 
     private static final Logger logger = LoggerFactory.getLogger(RedisConfig.class);
 
-    @Value("${spring.redis.key-prefix:sudokupro:}")
+    // Consolidation (AUDIT P1-4): connection settings live ONLY in spring.data.redis.*,
+    // consumed by Boot's autoconfigured RedisConnectionFactory. The duplicate JedisPool
+    // this class used to build from custom spring.redis.* bindings is gone — AppConfig
+    // provides the single JedisPool for the remaining raw-Jedis consumers, reading the
+    // same canonical properties. App-level knobs use the sudokupro.redis.* namespace.
+
+    @Value("${sudokupro.redis.key-prefix:sudokupro:}")
     private String keyPrefix;
 
-    @Value("${spring.redis.ttl.seconds:600}")
+    @Value("${sudokupro.redis.ttl-seconds:600}")
     private long defaultTtl;
-
-    @Value("${spring.redis.timeout:2000}")
-    private int timeout;
-
-    @Value("${spring.redis.host:localhost}")
-    private String host;
-
-    @Value("${spring.redis.port:6379}")
-    private int port;
-
-    @Value("${spring.redis.password:}")
-    private String redisPassword;
-
-    @Bean
-    public JedisPool jedisPool() {
-        JedisPoolConfig poolConfig = new JedisPoolConfig();
-        poolConfig.setMaxTotal(128);
-        poolConfig.setMaxIdle(128);
-        poolConfig.setMinIdle(16);
-        poolConfig.setTestOnBorrow(true);
-
-        return redisPassword.isEmpty()
-            ? new JedisPool(poolConfig, host, port, timeout)
-            : new JedisPool(poolConfig, host, port, timeout, redisPassword);
-    }
 
     @Bean
     public RedisTemplate<String, Object> redisTemplate(RedisConnectionFactory connectionFactory,

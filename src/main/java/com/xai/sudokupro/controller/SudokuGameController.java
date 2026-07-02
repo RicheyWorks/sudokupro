@@ -110,31 +110,8 @@ public class SudokuGameController {
         return Map.of("type", type, "title", title, "detail", detail);
     }
 
-    // Future expansion stubs (UNCHANGED)
-    /*
-    @PostMapping("/save")
-    public ResponseEntity<Object> saveGame(@RequestBody SudokuBoard board) {
-        logger.info("Game save requested");
-        return ResponseEntity.ok(Map.of("status", "saved", "gameId", "TBD"));
-    }
-
-    @GetMapping("/load/{id}")
-    public ResponseEntity<Object> loadGame(@PathVariable String id) {
-        logger.info("Game load requested for ID: {}", id);
-        return ResponseEntity.status(HttpStatus.NOT_IMPLEMENTED).body(null);
-    }
-
-    @PostMapping("/move")
-    public ResponseEntity<Object> submitMove(@RequestBody Map<String, Object> move) {
-        logger.info("Move submitted: {}", move);
-        return ResponseEntity.status(HttpStatus.NOT_IMPLEMENTED).body(null);
-    }
-
-    @GetMapping("/validate")
-    public ResponseEntity<Object> validateBoard() {
-        logger.info("Board validation requested");
-        return ResponseEntity.status(HttpStatus.NOT_IMPLEMENTED).body(null);
-    }
-    */
+    // Save/load/move/validate REST endpoints were removed (AUDIT P1-3): the /save
+    // stub claimed success while persisting nothing. Reintroduce only with a real
+    // implementation; gameplay currently runs over the WebSocket channel.
 }
 

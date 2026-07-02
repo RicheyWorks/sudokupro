@@ -33,8 +33,8 @@ public class SudokuProApplication {
         app.setDefaultProperties(java.util.Map.of(
             "spring.profiles.active", "prod",
             "server.port", "8080",
-            "spring.redis.host", "localhost",
-            "spring.redis.port", "6379",
+            "spring.data.redis.host", "localhost",
+            "spring.data.redis.port", "6379",
             "sudokupro.chaos.enabled", "false"
         ));
 

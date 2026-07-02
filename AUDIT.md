@@ -61,3 +61,19 @@ The repo had 56 modified files uncommitted (~8k insertions). Triage shows most o
 ---
 
 *Baseline evidence: `mvn test-compile` clean; surefire 4/5 green (ConstantsTest fails on missing localhost Postgres — environmental). Dependency survey and file-level findings from direct source inspection, 2026-07-01.*
+
+---
+
+## Status update — 2026-07-02
+
+**Done** (commits 701581f, 0137871, c08e35e, + Phase 3a):
+- **P0-1/P0-2/P0-3** — WebSocket auth required, SecretsGuard fail-fast (also rejects CHANGE_ME), ddl-auto=validate with dev-profile opt-out. Regression tests in place.
+- **P1-1** — Test profile on H2 (`application-test.properties` + `@ActiveProfiles`); suite now 25 tests, green without local infra. New generator tests exposed and fixed two engine bugs (phantom cell removals; validateBoard self-collision).
+- **P1-3** — Dead commented save/load/move/validate stub block deleted.
+- **P1-4** — Consolidated on `spring.data.redis.*`: one JedisPool (AppConfig, reads canonical props), RedisConfig's duplicate pool and custom `spring.redis.*` bindings removed; app-level knobs moved to `sudokupro.redis.*`.
+- **P1-5** — Dead FCM legacy integration removed (PushNotificationService, `fcm.server-key`, FCM_SERVER_KEY). NotificationService queue + rate-limit retained as a hook for a future HTTP-v1 integration.
+- **P1-6** — Real multi-stage Dockerfile, compose stack (Postgres/Redis, healthchecks), k8s manifests (secret-backed creds, actuator probes), full-suite CI + docker build gate. Headless mode added (`sudokupro.ui.enabled`) since JavaFX cannot start in containers.
+- **P1-7** — Documented: k8s replicas pinned to 1 with rationale inline.
+- **P2-1 (partial)** — SecureRandomGenerator 833→175 lines (61 unused methods cut). SudokuHealthMonitor trimmed 12 dead methods; the full Actuator HealthIndicator migration remains.
+
+**Remaining**: P1-2 module split (server/client/model), P2-1 SudokuHealthMonitor→Actuator, P2-2 WebSocket stack convergence, P2-3 flavor/enforcement decoupling, Flyway adoption.
