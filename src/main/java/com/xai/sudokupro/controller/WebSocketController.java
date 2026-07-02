@@ -18,7 +18,6 @@ import org.springframework.web.socket.handler.TextWebSocketHandler;
 import java.io.IOException;
 import java.util.Map;
 import java.util.Set;
-import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 
@@ -26,9 +25,13 @@ import java.util.concurrent.ConcurrentMap;
 public class WebSocketController extends TextWebSocketHandler {
     private static final Logger logger = LoggerFactory.getLogger(WebSocketController.class);
 
-    private final ConcurrentMap<WebSocketSession, String> playerMap  = new ConcurrentHashMap<>();
-    private final ConcurrentMap<String, SudokuBoard>      gameBoards = new ConcurrentHashMap<>();
-    // gameId → all sessions currently in that game; used to scope broadcasts correctly
+    /** Close code sent when a connection arrives without an authenticated principal. */
+    static final CloseStatus UNAUTHENTICATED = CloseStatus.POLICY_VIOLATION.withReason("Authentication required");
+
+    private final ConcurrentMap<WebSocketSession, String> playerMap = new ConcurrentHashMap<>();
+    // gameId → all sessions currently in that game; used to scope broadcasts correctly.
+    // Game boards themselves live in GameService (single source of truth, capped +
+    // Redis/DB backed) — this class deliberately holds no board state. (AUDIT P0-1)
     private final ConcurrentMap<String, Set<WebSocketSession>> gameSessions = new ConcurrentHashMap<>();
 
     private final GameService            gameService;
@@ -44,15 +47,41 @@ public class WebSocketController extends TextWebSocketHandler {
     }
 
     @Override
-    public void afterConnectionEstablished(WebSocketSession session) {
-        String playerId = extractPlayerId(session);
+    public void afterConnectionEstablished(WebSocketSession session) throws IOException {
+        // Security fix (AUDIT P0-1): /ws/** is permitAll at the HTTP layer so the handshake
+        // can complete, but gameplay requires an authenticated principal. Previously an
+        // anonymous connection was given a synthetic "player_<sessionId>" identity and a
+        // freshly created server-side game — unauthenticated players and unbounded state.
+        if (session.getPrincipal() == null) {
+            logger.warn("Rejecting unauthenticated WebSocket connection: session={}", session.getId());
+            session.close(UNAUTHENTICATED);
+            return;
+        }
+        String playerId = session.getPrincipal().getName();
         playerMap.put(session, playerId);
         broadcaster.registerClient();
 
-        String gameId = (String) session.getAttributes().getOrDefault("gameId",
-            UUID.randomUUID().toString());
+        // Join the game named in the handshake (set by an interceptor / query param), or
+        // create a new one. Bug fix: the previous code invented its own UUID as the map key
+        // while createNewGame registered the board under a *different* internal gameId, so
+        // applyMove could never find the game. Always use the board's real gameId.
+        String requestedGameId = (String) session.getAttributes().get("gameId");
+        SudokuBoard board;
+        if (requestedGameId != null) {
+            try {
+                board = gameService.getGame(requestedGameId);
+            } catch (IllegalArgumentException e) {
+                logger.warn("Rejecting join of unknown game {}: session={}", requestedGameId, session.getId());
+                session.close(CloseStatus.POLICY_VIOLATION.withReason("Unknown game"));
+                playerMap.remove(session);
+                broadcaster.unregisterClient();
+                return;
+            }
+        } else {
+            board = gameService.createNewGame(1, playerId, false, false);
+        }
+        String gameId = board.getGameId();
         session.getAttributes().put("gameId", gameId);
-        gameBoards.computeIfAbsent(gameId, id -> gameService.createNewGame(1, playerId, false, false));
 
         // Register this session under its game so broadcasts stay scoped to the right players
         gameSessions.computeIfAbsent(gameId, id -> ConcurrentHashMap.newKeySet()).add(session);
@@ -64,10 +93,14 @@ public class WebSocketController extends TextWebSocketHandler {
     @Override
     protected void handleTextMessage(WebSocketSession session, TextMessage message) {
         try {
-            String playerId = playerMap.getOrDefault(session, session.getId());
-            String gameId   = (String) session.getAttributes().get("gameId");
-            SudokuBoard board = gameBoards.get(gameId);
-            if (board == null) { logger.error("No board for game {}", gameId); return; }
+            String playerId = playerMap.get(session);
+            if (playerId == null) {
+                // Never registered (unauthenticated connections are closed above).
+                session.close(UNAUTHENTICATED);
+                return;
+            }
+            String gameId = (String) session.getAttributes().get("gameId");
+            SudokuBoard board = gameService.getGame(gameId);
 
             Map<?,?> payload = objectMapper.readValue(message.getPayload(), Map.class);
             String type = payload.get("type") instanceof String s ? s : "unknown";
@@ -103,23 +136,25 @@ public class WebSocketController extends TextWebSocketHandler {
     @Override
     public void afterConnectionClosed(WebSocketSession session, CloseStatus status) {
         String playerId = playerMap.remove(session);
-        // Bug fix: playerId is null if the session was never registered (e.g. closed before
-        // afterConnectionEstablished completed). Guard to avoid NPE in Map.of() and log.
-        String safePlayerId = playerId != null ? playerId : "unknown_" + session.getId();
-        String gameId   = (String) session.getAttributes().get("gameId");
+        if (playerId == null) {
+            // Rejected before registration (e.g. unauthenticated) — nothing to clean up.
+            return;
+        }
+        String gameId = (String) session.getAttributes().get("gameId");
         removeFromGameSessions(gameId, session);
         broadcaster.unregisterClient();
-        logger.info("Disconnected: player={} game={} status={}", safePlayerId, gameId, status);
-        broadcastToGame(gameId, session, buildEnvelope("leave", safePlayerId, Map.of("player", safePlayerId)));
+        logger.info("Disconnected: player={} game={} status={}", playerId, gameId, status);
+        broadcastToGame(gameId, session, buildEnvelope("leave", playerId, Map.of("player", playerId)));
     }
 
     @Override
     public void handleTransportError(WebSocketSession session, Throwable ex) {
         logger.error("Transport error {}: {}", session.getId(), ex.getMessage());
         String gameId = (String) session.getAttributes().get("gameId");
-        playerMap.remove(session);
-        removeFromGameSessions(gameId, session);
-        broadcaster.unregisterClient();
+        if (playerMap.remove(session) != null) {
+            removeFromGameSessions(gameId, session);
+            broadcaster.unregisterClient();
+        }
     }
 
     // ---- helpers ----
@@ -157,11 +192,5 @@ public class WebSocketController extends TextWebSocketHandler {
 
     private Map<String,Object> buildEnvelope(String type, String from, Object payload) {
         return Map.of("type", type, "from", from != null ? from : "unknown", "payload", payload);
-    }
-
-    private String extractPlayerId(WebSocketSession session) {
-        return session.getPrincipal() != null
-            ? session.getPrincipal().getName()
-            : "player_" + session.getId();
     }
 }
