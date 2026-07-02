@@ -92,6 +92,12 @@ public class PuzzleEditorService {
         return Math.min(10, Math.max(0, difficulty));
     }
 
+    private void validatePlayerId(String playerId) {
+        if (playerId == null || playerId.isBlank()) {
+            throw new IllegalArgumentException("Player ID must not be null or blank");
+        }
+    }
+
     private void validateGrid(int[][] grid) {
         if (grid == null || grid.length != GRID_SIZE) {
             throw new IllegalArgumentException("Invalid grid");
@@ -122,13 +128,7 @@ public class PuzzleEditorService {
             java.util.UUID.randomUUID().toString()
         );
         if (!aiSolverService.solveSudoku(probe)) {
-            throw new IllegalArgumentException("Not solvable");
-        }
-    }
-
-    private void validatePlayerId(String playerId) {
-        if (playerId == null || playerId.isBlank()) {
-            throw new IllegalArgumentException("Invalid playerId");
+            throw new IllegalArgumentException("Board has no solution");
         }
     }
 }

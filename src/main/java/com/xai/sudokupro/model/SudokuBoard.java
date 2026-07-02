@@ -4,6 +4,7 @@ import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.xai.sudokupro.util.Constants;
 import com.xai.sudokupro.websocket.MultiplayerBroadcaster;
+import jakarta.persistence.*;
 import jakarta.validation.constraints.NotNull;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -17,16 +18,23 @@ import java.nio.file.Paths;
 import java.security.MessageDigest;
 import java.security.SecureRandom;
 import java.time.Duration;
+import java.time.LocalDateTime;
 import java.util.*;
 import java.util.stream.Collectors;
 
+@Entity
+@Table(name = "sudoku_boards")
 public class SudokuBoard implements Serializable {
     private static final long serialVersionUID = 1L;
     private static final Logger logger = LoggerFactory.getLogger(SudokuBoard.class);
     private static final ObjectMapper MAPPER = new ObjectMapper();
     private static final SecureRandom BOARD_RNG = new SecureRandom();
 
-    @NotNull private final SudokuCell[][] board;
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    private Long id;
+
+    @Transient @NotNull private SudokuCell[][] board;
     private final int size = Constants.BOARD_SIZE;
 
     // Core state
@@ -36,7 +44,12 @@ public class SudokuBoard implements Serializable {
     private volatile boolean mirrorMode;
     private long timeLimitSeconds;
     private String gameId;
-    private long startTime;
+    private LocalDateTime startTime;
+
+    // Persisted derived state (computed fields are @Transient and can't be queried)
+    private boolean solved = false;
+    private long solveTimeSeconds = 0L;
+    private int moveCount = 0;
 
     // Lives / scoring
     private int lives      = 3;
@@ -53,21 +66,31 @@ public class SudokuBoard implements Serializable {
     private boolean diagonalRules;
 
     // Move history
-    private final Deque<Move>        moveHistory    = new ArrayDeque<>();
-    private final Deque<Move>        redoStack      = new ArrayDeque<>();
-    private final List<EnhancedMove> replayHistory  = new ArrayList<>();
-    private final Map<String, String> replayMetadata = new HashMap<>();
+    @Transient private final Deque<Move>        moveHistory    = new ArrayDeque<>();
+    @Transient private final Deque<Move>        redoStack      = new ArrayDeque<>();
+    @Transient private final List<EnhancedMove> replayHistory  = new ArrayList<>();
+    @Transient private final Map<String, String> replayMetadata = new HashMap<>();
 
     // Analytics
-    private final Map<String, Integer> heatmapMistakeCounter = new HashMap<>();
+    @Transient private final Map<String, Integer> heatmapMistakeCounter = new HashMap<>();
     private int      hintCount;
     private boolean  usedUndo;
-    private Duration solveTime = Duration.ZERO;
+    @Transient private Duration solveTime = Duration.ZERO;
     private int      cosmicDripLevel;
 
     // =====================================================================
     // Constructors
     // =====================================================================
+
+    /** Required by JPA — do not use directly. */
+    protected SudokuBoard() {
+        this.board = new SudokuCell[9][9];
+        for (int i = 0; i < 9; i++)
+            for (int j = 0; j < 9; j++)
+                this.board[i][j] = new SudokuCell();
+        this.startTime = LocalDateTime.now();
+        this.solveTime = Duration.ZERO;
+    }
 
     /** Generate a new board from difficulty (1-5). */
     public SudokuBoard(int difficulty, boolean chaosMode, boolean mirrorMode,
@@ -82,7 +105,7 @@ public class SudokuBoard implements Serializable {
         this.timeLimitSeconds = timeLimitSeconds;
         this.timeAttack = timeLimitSeconds > 0;
         this.gameId = gameId != null ? gameId : UUID.randomUUID().toString();
-        this.startTime = System.currentTimeMillis();
+        this.startTime = LocalDateTime.now();
         generateBoard(difficulty);
         this.cosmicDripLevel = calculateCosmicDripLevel();
         logger.info("SudokuBoard generated difficulty={} gameId={}", difficulty, this.gameId);
@@ -97,7 +120,7 @@ public class SudokuBoard implements Serializable {
         this.timeLimitSeconds = timeLimitSeconds;
         this.timeAttack = timeLimitSeconds > 0;
         this.gameId = gameId != null ? gameId : UUID.randomUUID().toString();
-        this.startTime = System.currentTimeMillis();
+        this.startTime = LocalDateTime.now();
         this.cosmicDripLevel = calculateCosmicDripLevel();
         if (!isValidBoardState()) throw new IllegalArgumentException("Invalid board state on creation");
         logger.info("SudokuBoard initialized for gameId: {}", this.gameId);
@@ -188,9 +211,14 @@ public class SudokuBoard implements Serializable {
         moveHistory.push(move);
         replayHistory.add(new EnhancedMove(row, col, oldVal, value, source));
         redoStack.clear();
+        moveCount++;
         if (mirrorMode) applyMirrorMove(row, col, value, source);
         cosmicDripLevel = calculateCosmicDripLevel();
-        if (isSolved()) solveTime = Duration.ofMillis(System.currentTimeMillis() - startTime);
+        if (isSolved()) {
+            solveTime = Duration.between(startTime, LocalDateTime.now());
+            solved = true;
+            solveTimeSeconds = solveTime.getSeconds();
+        }
     }
 
     /** Apply an external move and optionally broadcast. */
@@ -206,9 +234,14 @@ public class SudokuBoard implements Serializable {
         moveHistory.push(new Move(move.row(), move.col(), oldVal, move.newVal(), move.source()));
         replayHistory.add(move);
         redoStack.clear();
+        moveCount++;
         if (mirrorMode) applyMirrorMove(move.row(), move.col(), move.newVal(), move.source());
         cosmicDripLevel = calculateCosmicDripLevel();
-        if (isSolved()) solveTime = Duration.ofMillis(System.currentTimeMillis() - startTime);
+        if (isSolved()) {
+            solveTime = Duration.between(startTime, LocalDateTime.now());
+            solved = true;
+            solveTimeSeconds = solveTime.getSeconds();
+        }
     }
 
     public synchronized void applyBatchMoves(List<EnhancedMove> moves) {
@@ -223,8 +256,13 @@ public class SudokuBoard implements Serializable {
             }
         }
         redoStack.clear();
+        moveCount += moves.size();
         cosmicDripLevel = calculateCosmicDripLevel();
-        if (isSolved()) solveTime = Duration.ofMillis(System.currentTimeMillis() - startTime);
+        if (isSolved()) {
+            solveTime = Duration.between(startTime, LocalDateTime.now());
+            solved = true;
+            solveTimeSeconds = solveTime.getSeconds();
+        }
     }
 
     private void applyMirrorMove(int row, int col, int value, SudokuCell.MoveSource source) {
@@ -265,7 +303,8 @@ public class SudokuBoard implements Serializable {
         moveHistory.clear(); redoStack.clear(); replayHistory.clear();
         heatmapMistakeCounter.clear(); replayMetadata.clear();
         hintCount = 0; usedUndo = false; solveTime = Duration.ZERO;
-        startTime = System.currentTimeMillis();
+        solved = false; solveTimeSeconds = 0L; moveCount = 0;
+        startTime = LocalDateTime.now();
         cosmicDripLevel = calculateCosmicDripLevel();
         logger.info("Board reset for gameId: {}", gameId);
     }
@@ -287,7 +326,10 @@ public class SudokuBoard implements Serializable {
                         moves.add(new EnhancedMove(i, j, old, temp[i][j], SudokuCell.MoveSource.AUTOSOLVE));
                     }
             replayHistory.addAll(moves);
-            solveTime = Duration.ofMillis(System.currentTimeMillis() - startTime);
+            moveCount += moves.size();
+            solveTime = Duration.between(startTime, LocalDateTime.now());
+            solved = true;
+            solveTimeSeconds = solveTime.getSeconds();
             cosmicDripLevel = calculateCosmicDripLevel();
         }
     }
@@ -313,8 +355,11 @@ public class SudokuBoard implements Serializable {
     public synchronized void evolveChaos() {
         if (!chaosMode) return;
         int events = Constants.BOARD_SIZE; // use a safe default
+        // Bug fix: unbounded while loop hangs forever when all non-zero cells are givens.
+        // Add a hard attempt cap (size*size*2) so we don't spin indefinitely.
+        int maxAttempts = size * size * 2;
         List<EnhancedMove> chaosMoves = new ArrayList<>();
-        while (events > 0) {
+        while (events > 0 && maxAttempts-- > 0) {
             int r = BOARD_RNG.nextInt(size), c = BOARD_RNG.nextInt(size);
             if (board[r][c].getValue() != 0 && !board[r][c].isGiven()) {
                 int old = board[r][c].getValue();
@@ -323,6 +368,9 @@ public class SudokuBoard implements Serializable {
                 moveHistory.push(new Move(r, c, old, 0, SudokuCell.MoveSource.CHAOS));
                 events--;
             }
+        }
+        if (maxAttempts <= 0 && events > 0) {
+            logger.warn("evolveChaos: could not clear {} more cells — no eligible non-given cells found", events);
         }
         replayHistory.addAll(chaosMoves);
         cosmicDripLevel = calculateCosmicDripLevel();
@@ -409,7 +457,11 @@ public class SudokuBoard implements Serializable {
         }
         synchronized (this) {
             cosmicDripLevel = calculateCosmicDripLevel();
-            if (isSolved()) solveTime = Duration.ofMillis(System.currentTimeMillis() - startTime);
+            if (isSolved()) {
+                solveTime = Duration.between(startTime, LocalDateTime.now());
+                solved = true;
+                solveTimeSeconds = solveTime.getSeconds();
+            }
         }
     }
 
@@ -627,6 +679,9 @@ public class SudokuBoard implements Serializable {
     // Getters & setters
     // =====================================================================
 
+    public Long getId()                  { return id; }
+    public void setId(Long id)           { this.id = id; }
+
     public SudokuCell[][] getBoard()     { return board; }
     public SudokuCell[][] getBoardCopy() {
         SudokuCell[][] c = new SudokuCell[size][size];
@@ -658,55 +713,46 @@ public class SudokuBoard implements Serializable {
     public boolean isCosmicMode() { return cosmicMode; }
     public void setCosmicMode(boolean v) { this.cosmicMode = v; }
     public int  getCosmicEvents() { return cosmicEvents; }
-    public void setCosmicEvents(int n) { this.cosmicEvents = Math.max(0,n); }
-    public boolean isTimeAttack() { return timeAttack; }
+    public void setCosmicEvents(int n) { this.cosmicEvents = n; }
+    public boolean isTimeAttack()  { return timeAttack; }
     public void setTimeAttack(boolean v) { this.timeAttack = v; }
     public boolean isInfiniteMode() { return infiniteMode; }
     public void setInfiniteMode(boolean v) { this.infiniteMode = v; }
+    public boolean isTensRule()     { return tensRule; }
+    public boolean isDiagonalRules(){ return diagonalRules; }
 
-    public long getTimeLimitSeconds() { return timeLimitSeconds; }
-    public void setTimeLimitSeconds(long s) { this.timeLimitSeconds = Math.max(0,s); }
+    public long   getTimeLimitSeconds() { return timeLimitSeconds; }
+    public void   setTimeLimitSeconds(long v) { this.timeLimitSeconds = v; }
 
-    public long getTimeRemaining() {
-        if (!timeAttack || timeLimitSeconds == 0) return Long.MAX_VALUE;
-        long elapsed = (System.currentTimeMillis() - startTime) / 1000;
-        return Math.max(0, timeLimitSeconds - elapsed);
-    }
+    public String getGameId()  { return gameId; }
+    public void   setGameId(String g) { this.gameId = g; }
 
-    public int getMovesMade()        { return moveHistory.size(); }
-    public int getHintCount()        { return hintCount; }
-    public void setHintCount(int n)  { this.hintCount = Math.max(0,n); }
-    public void incrementHintCount() { hintCount++; }
-    public boolean hasUsedUndo()     { return usedUndo; }
-    public void setUsedUndo(boolean v){ this.usedUndo = v; }
-    public Duration getSolveTime()   { return solveTime; }
-    public void setSolveTimeSeconds(long s){ this.solveTime = Duration.ofSeconds(Math.max(0,s)); }
+    public LocalDateTime getStartTime() { return startTime; }
 
-    public List<Move> getMoveHistory()               { return new ArrayList<>(moveHistory); }
+    public boolean isSolvedState()     { return solved; }
+    public long    getSolveTimeSeconds() { return solveTimeSeconds; }
+    public int     getMoveCount()       { return moveCount; }
+
+    public int     getHintCount()       { return hintCount; }
+    public synchronized void incrementHintCount() { this.hintCount++; }
+
+    public boolean isUsedUndo()        { return usedUndo; }
+
+    public Duration getSolveTime()     { return solveTime == null ? Duration.ZERO : solveTime; }
+
+    public int  getCosmicDripLevel()   { return cosmicDripLevel; }
+
+    public int  getRevives()           { return revives; }
+
+    public synchronized Deque<Move> getMoveHistory() { return new ArrayDeque<>(moveHistory); }
+
     public synchronized List<EnhancedMove> getReplayHistory() { return new ArrayList<>(replayHistory); }
-    public void setReplayHistory(List<EnhancedMove> h) {
-        replayHistory.clear();
-        if (h != null) replayHistory.addAll(h);
-    }
 
-    public Map<String,Integer> getHeatmapMistakeCounter() { return new HashMap<>(heatmapMistakeCounter); }
-    public void setHeatmapMistakeCounter(Map<String,Integer> m) { heatmapMistakeCounter.putAll(m); }
+    // ── Inner types ────────────────────────────────────────────────────────
 
-    public String getGameId()        { return gameId; }
-    public void setGameId(String id) { this.gameId = id != null ? id : UUID.randomUUID().toString(); }
-    public int  getCosmicDripLevel() { return cosmicDripLevel; }
-    public void setCosmicDripLevel(int n) { this.cosmicDripLevel = Math.max(0,n); }
+    public record Move(int row, int col, int oldVal, int newVal, SudokuCell.MoveSource source) {}
 
-    public Map<String,String> getReplayMetadata()     { return new HashMap<>(replayMetadata); }
-    public void setReplayMetadata(Map<String,String> m){ replayMetadata.clear(); if(m!=null) replayMetadata.putAll(m); }
-    public void addReplayTag(String k,String v)        { replayMetadata.put(k,v); }
-
-    @Override public String toString() {
-        StringBuilder sb = new StringBuilder();
-        for (int i = 0; i < size; i++) {
-            for (int j = 0; j < size; j++) sb.append(board[i][j]).append(" ");
-            sb.append("\n");
-        }
-        return sb.toString();
+    public record Hint(int row, int col, Object value, Strategy strategy) {
+        public enum Strategy { NAKED_SINGLE, CANDIDATE, HIDDEN_SINGLE, POINTING_PAIR }
     }
 }

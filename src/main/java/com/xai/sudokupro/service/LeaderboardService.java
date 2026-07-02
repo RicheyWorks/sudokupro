@@ -177,8 +177,14 @@ public void updateScore(Long userId, int points) {
         validatePagination(page, size);
         LocalDateTime cutoff = LocalDateTime.now().minusDays(RECENT_ACTIVITY_DAYS);
         return safeFetch(() -> {
-            List<User> topPlayers = leaderboardRepository.findActiveUsersSince(cutoff, 
-                PageRequest.of(page, size, Sort.by(Sort.Direction.DESC, "points")));
+            // findActiveUsersSince not in LeaderboardRepository; use active-streak cosmonauts as proxy,
+            // falling back to top-by-points when the active list is empty.
+            List<User> topPlayers = leaderboardRepository.findActiveStreakCosmonauts(
+                0, cutoff, PageRequest.of(page, size));
+            if (topPlayers.isEmpty()) {
+                topPlayers = leaderboardRepository.findTopUsersByPoints(
+                    PageRequest.of(page, size, Sort.by(Sort.Direction.DESC, "points")));
+            }
             List<LeaderboardSnapshot> snapshots = mapToSnapshots(topPlayers, page, size, "points");
             logLeaderboardFetch("recent activity", snapshots.size());
             return snapshots;
@@ -269,6 +275,19 @@ public void updateScore(Long userId, int points) {
             logLeaderboardFetch("public", snapshots.size());
             return snapshots;
         }, "public leaderboard");
+    }
+
+    /** Evicts all leaderboard caches so the next read returns fresh data. */
+    @CacheEvict(value = {"topPlayers", "leaderboardSummary", "publicLeaderboard"}, allEntries = true)
+    public void refreshLeaderboard() {
+        logger.info("Leaderboard caches evicted");
+    }
+
+    private void validateLimit(int limit) {
+        if (limit <= 0 || limit > MAX_TOP_LIMIT) {
+            logger.warn("Invalid limit: {}. Must be between 1 and {}", limit, MAX_TOP_LIMIT);
+            throw new IllegalArgumentException("Limit must be between 1 and " + MAX_TOP_LIMIT);
+        }
     }
 
     private <T> T safeFetch(Supplier<T> action, String context) {

@@ -25,6 +25,7 @@ import org.springframework.stereotype.Component;
 import java.io.File;
 import java.io.FileWriter;
 import java.io.IOException;
+import java.net.URL;
 import java.nio.file.Files;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
@@ -80,8 +81,14 @@ public class ThemeManager {
         validateScene(scene);
         int normalizedIndex = themeIndex % THEMES.length;
         try {
+            URL url = getClass().getResource(THEMES[normalizedIndex]);
+            if (url == null) {
+                logger.warn("Stylesheet not found on classpath: {}", THEMES[normalizedIndex]);
+                applyDefaultTheme(scene);
+                return;
+            }
             scene.getStylesheets().clear();
-            scene.getStylesheets().add(THEMES[normalizedIndex]);
+            scene.getStylesheets().add(url.toExternalForm());
             meterRegistry.counter("sudokupro.ui.theme.switches",
                 Tags.concat(GLOBAL_TAGS, Tags.of("theme", THEME_NAMES[normalizedIndex]))).increment();
             logger.debug("Applied theme '{}' (index {}) to scene", THEME_NAMES[normalizedIndex], normalizedIndex);
@@ -212,8 +219,9 @@ public class ThemeManager {
     }
 
     private void applyDefaultTheme(Scene scene) {
+        URL url = getClass().getResource(THEMES[DEFAULT_THEME_INDEX]);
         scene.getStylesheets().clear();
-        scene.getStylesheets().add(THEMES[DEFAULT_THEME_INDEX]);
+        if (url != null) scene.getStylesheets().add(url.toExternalForm());
         logger.warn("Applied default theme '{}' due to error", THEME_NAMES[DEFAULT_THEME_INDEX]);
     }
 

@@ -156,9 +156,9 @@ public interface UserRepository extends JpaRepository<User, Long>,
     long countRichInactiveUsers(@Param("threshold") int threshold, @Param("cutoff") LocalDateTime cutoff);
 
     @Transactional(readOnly = true)
-    @Query("SELECT SUM(u.points) FROM User u WHERE u.themePreference = :theme")
+    @Query("SELECT COALESCE(SUM(u.points), 0) FROM User u WHERE u.themePreference = :theme")
     @Cacheable(value = "totalPointsByTheme", key = "#theme")
-    long getTotalPointsByTheme(@Param("theme") String theme);
+    Long getTotalPointsByTheme(@Param("theme") String theme);
 
     @Transactional(readOnly = true)
     @Query("SELECT COUNT(u) FROM User u WHERE u.streak > 0 AND u.duelWins > 0 AND u.gems > 0")

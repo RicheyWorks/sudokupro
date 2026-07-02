@@ -135,7 +135,9 @@ public class AntiCheatScheduler {
                 if (user != null) {
                     double suspicionScore = suspicionScores.getOrDefault(playerId, 0.0);
                     LocalDateTime lastSpike = lastCosmicDripSpike.getOrDefault(playerId, cutoff);
-                    if (suspicionScore >= SUSPICION_SCORE_THRESHOLD || now().minusMinutes(30).isBefore(lastSpike)) {
+                    // Bug fix: same inverted time check as checkBoardPatterns.
+                    // Use lastSpike.isBefore(now().minusMinutes(30)) to rate-limit repeated flags.
+                    if (suspicionScore >= SUSPICION_SCORE_THRESHOLD || lastSpike.isBefore(now().minusMinutes(30))) {
                         flagPlayer(user, "Cosmic drip spike: " + e.getValue() + ", Suspicion Score: " + suspicionScore);
                         lastCosmicDripSpike.put(playerId, now());
                     } else {
@@ -242,9 +244,9 @@ public class AntiCheatScheduler {
     private void checkBoardPatterns(LocalDateTime cutoff, Map<String, Double> suspicionScores) {
         // Cap at 500 boards per cycle — avoids loading unbounded rows in production.
         // The query already filters by start_time > cutoff, so the in-stream filter below is redundant but harmless.
+        // The query already filters by start_time > cutoff; no in-stream filter needed.
         List<SudokuBoard> recentBoards = gameRepository.findActiveUnfinishedGames(cutoff, PageRequest.of(0, 500))
             .stream()
-            .filter(b -> b.getStartTime().isAfter(cutoff))
             .collect(Collectors.toList());
         recentBoards.forEach(board -> {
             String playerId = board.getPlayerId();
@@ -252,13 +254,23 @@ public class AntiCheatScheduler {
             if (user != null) {
                 double suspicionScore = suspicionScores.getOrDefault(playerId, 0.0);
                 int cosmicMoves = (int) board.getMoveHistory().stream()
-                    .filter(m -> board.getCell(m.row(), m.col()).getStrategy() == SudokuCell.Strategy.COSMIC)
+                    .filter(m -> {
+                        // Hint sentinel moves use row=-1, col=-1 — skip out-of-bounds coords
+                        // to avoid ArrayIndexOutOfBoundsException inside getCell().
+                        if (m.row() < 0 || m.row() >= 9 || m.col() < 0 || m.col() >= 9) return false;
+                        return board.getCell(m.row(), m.col()).getStrategy() == SudokuCell.Strategy.COSMIC;
+                    })
                     .count();
                 int totalMoves = board.getMoveHistory().size();
                 double cosmicRatio = totalMoves > 0 ? (double) cosmicMoves / totalMoves : 0.0;
                 LocalDateTime lastCheck = lastBoardCheck.getOrDefault(playerId, cutoff);
-                if (cosmicRatio > 0.5 && totalMoves > 10 && suspicionScore >= SUSPICION_SCORE_THRESHOLD && now().minusMinutes(30).isBefore(lastCheck)) {
-                    flagPlayer(user, "Board pattern anomaly: Cosmic ratio " + cosmicRatio + ", Total Moves: " + totalMoves + 
+                // Bug fix: inverted time check. The condition `now().minusMinutes(30).isBefore(lastCheck)`
+                // is true when lastCheck is RECENT (within the last 30 min), meaning the player was
+                // flagged again immediately after the previous flag — the opposite of rate-limiting.
+                // Correct logic: only flag if it has been MORE than 30 minutes since the last flag,
+                // i.e. lastCheck.isBefore(now().minusMinutes(30)).
+                if (cosmicRatio > 0.5 && totalMoves > 10 && suspicionScore >= SUSPICION_SCORE_THRESHOLD && lastCheck.isBefore(now().minusMinutes(30))) {
+                    flagPlayer(user, "Board pattern anomaly: Cosmic ratio " + cosmicRatio + ", Total Moves: " + totalMoves +
                         ", Suspicion Score: " + suspicionScore);
                     lastBoardCheck.put(playerId, now());
                 } else if (cosmicRatio > 0.5 && totalMoves > 10) {
@@ -326,20 +338,12 @@ public class AntiCheatScheduler {
     }
 
     private void trimMaps() {
-        trimMap(flaggedPlayers);
-        trimMap(lastCosmicDripSpike);
-        trimMap(lastBoardCheck);
-    }
-
-    private <K, V> void trimMap(Map<K, V> map) {
-        if (map.size() > MAX_CACHE_SIZE) {
-            int excess = map.size() - MAX_CACHE_SIZE;
-            Iterator<K> iterator = map.keySet().iterator();
-            for (int i = 0; i < excess && iterator.hasNext(); i++) {
-                iterator.next();
-                iterator.remove();
-            }
-            logger.debug("Trimmed map from {} to {} entries", map.size() + excess, MAX_CACHE_SIZE);
-        }
+        int MAX_SIZE = MAX_CACHE_SIZE;
+        while (flaggedPlayers.size() > MAX_SIZE)
+            flaggedPlayers.remove(flaggedPlayers.keySet().iterator().next());
+        while (lastCosmicDripSpike.size() > MAX_SIZE)
+            lastCosmicDripSpike.remove(lastCosmicDripSpike.keySet().iterator().next());
+        while (lastBoardCheck.size() > MAX_SIZE)
+            lastBoardCheck.remove(lastBoardCheck.keySet().iterator().next());
     }
 }

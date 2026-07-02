@@ -103,11 +103,14 @@ public class WebSocketController extends TextWebSocketHandler {
     @Override
     public void afterConnectionClosed(WebSocketSession session, CloseStatus status) {
         String playerId = playerMap.remove(session);
+        // Bug fix: playerId is null if the session was never registered (e.g. closed before
+        // afterConnectionEstablished completed). Guard to avoid NPE in Map.of() and log.
+        String safePlayerId = playerId != null ? playerId : "unknown_" + session.getId();
         String gameId   = (String) session.getAttributes().get("gameId");
         removeFromGameSessions(gameId, session);
         broadcaster.unregisterClient();
-        logger.info("Disconnected: player={} game={} status={}", playerId, gameId, status);
-        broadcastToGame(gameId, session, buildEnvelope("leave", playerId, Map.of("player", playerId)));
+        logger.info("Disconnected: player={} game={} status={}", safePlayerId, gameId, status);
+        broadcastToGame(gameId, session, buildEnvelope("leave", safePlayerId, Map.of("player", safePlayerId)));
     }
 
     @Override

@@ -12,6 +12,7 @@ import com.xai.sudokupro.websocket.MultiplayerBroadcaster;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.data.redis.core.RedisTemplate;
 import org.springframework.stereotype.Service;
 
@@ -54,7 +55,7 @@ public class GameService {
     @Autowired
     public GameService(AISolverService aiSolverService, GameRepository gameRepository,
                        MultiplayerBroadcaster multiplayerBroadcaster,
-                       RedisTemplate<String, SudokuBoard> redisTemplate,
+                       @Qualifier("gameStateRedisTemplate") RedisTemplate<String, SudokuBoard> redisTemplate,
                        SecureRandomGenerator randomGenerator,
                        AnalyticsService analyticsService,
                        AntiCheatEngine antiCheatEngine,
@@ -331,11 +332,19 @@ public class GameService {
     @PreDestroy
     public void shutdown() {
         activeGames.forEach((id, board) -> {
-            try { gameRepository.save(board); redisTemplate.delete(redisKey(id)); }
-            catch (Exception e) { logger.error("Shutdown save failed for {}: {}", id, e.getMessage()); }
+            try {
+                gameRepository.save(board);
+            } catch (Exception e) {
+                logger.error("Shutdown DB save failed for {}: {}", id, e.getMessage());
+            }
+            try {
+                // Bug D fix: LettuceConnectionFactory may already be stopped during context
+                // shutdown; catch and log WARN rather than propagating.
+                redisTemplate.delete(redisKey(id));
+            } catch (Exception e) {
+                logger.warn("Shutdown Redis delete failed for {} (Redis may be stopped): {}", id, e.getMessage());
+            }
         });
-        activeGames.clear();
-        gameLocks.clear();
         logger.info("GameService shutdown complete");
     }
 
@@ -343,38 +352,72 @@ public class GameService {
     // Private helpers
     // =====================================================================
 
-    /** Returns (and creates if absent) the per-game mutex for {@code gameId}. */
-    private Object lockFor(String gameId) {
-        return gameLocks.computeIfAbsent(gameId, id -> new Object());
+    /**
+     * Bug C fix: SerializationException from Jackson must not propagate out of saveToRedis.
+     * Redis caching is optional — the board is persisted to DB regardless. Any exception
+     * is caught and logged as WARN so game creation / move handling never crashes.
+     */
+    private void saveToRedis(String gameId, SudokuBoard board) {
+        try {
+            redisTemplate.opsForValue().set(redisKey(gameId), board, REDIS_TTL_MINUTES, TimeUnit.MINUTES);
+        } catch (Exception e) {
+            logger.warn("Redis cache write failed for game {} (non-fatal): {}", gameId, e.getMessage());
+        }
     }
 
-    private void validateDifficulty(int d) {
-        if (d < Constants.MIN_DIFFICULTY_TIER || d > Constants.MAX_DIFFICULTY_TIER)
-            throw new IllegalArgumentException(
-                "Difficulty must be " + Constants.MIN_DIFFICULTY_TIER + "-" + Constants.MAX_DIFFICULTY_TIER);
+    private String redisKey(String gameId) {
+        return "game:" + gameId;
     }
-    private void validateGameId(String id)  { if (id==null||id.isBlank()) throw new IllegalArgumentException("gameId blank"); }
-    private void validatePlayerId(String id){ if (id==null||id.isBlank()) throw new IllegalArgumentException("playerId blank"); }
-    private void validateMove(EnhancedMove m) {
-        if (m==null||m.row()<0||m.row()>8||m.col()<0||m.col()>8||m.newVal()<0||m.newVal()>9)
-            throw new IllegalArgumentException("Invalid move: " + m);
+
+    private Object lockFor(String gameId) {
+        return gameLocks.computeIfAbsent(gameId, k -> new Object());
     }
-    private void saveToRedis(String id, SudokuBoard b) {
-        redisTemplate.opsForValue().set(redisKey(id), b, REDIS_TTL_MINUTES, TimeUnit.MINUTES);
-    }
-    private String redisKey(String id) { return "sudoku:game:" + id; }
-    private void triggerChaosSwap(SudokuBoard b) {
-        b.swapRows(randomGenerator.nextInt(9), randomGenerator.nextInt(9));
-    }
+
     private void trimActiveGames() {
-        if (activeGames.size() > MAX_ACTIVE_GAMES) {
-            Iterator<Map.Entry<String,SudokuBoard>> it = activeGames.entrySet().iterator();
-            while (activeGames.size() > MAX_ACTIVE_GAMES && it.hasNext()) {
-                Map.Entry<String,SudokuBoard> e = it.next();
-                gameRepository.save(e.getValue());
-                gameLocks.remove(e.getKey());
-                it.remove();
-            }
+        // Called under creationLock. Remove oldest entries when over limit.
+        while (activeGames.size() > MAX_ACTIVE_GAMES) {
+            String oldest = activeGames.keySet().iterator().next();
+            activeGames.remove(oldest);
+            gameLocks.remove(oldest);
+            logger.warn("Active games limit reached; evicted game {}", oldest);
         }
+    }
+
+    private void triggerChaosSwap(SudokuBoard board) {
+        // Pick two random non-given cells and swap their values.
+        SudokuCell[][] cells = board.getBoard();
+        java.util.List<int[]> editable = new java.util.ArrayList<>();
+        for (int r = 0; r < 9; r++)
+            for (int c = 0; c < 9; c++)
+                if (!cells[r][c].isGiven()) editable.add(new int[]{r, c});
+        if (editable.size() < 2) return;
+        int i1 = randomGenerator.nextInt(editable.size());
+        int i2 = randomGenerator.nextInt(editable.size());
+        if (i1 == i2) return;
+        int[] a = editable.get(i1), b = editable.get(i2);
+        int tmp = cells[a[0]][a[1]].getValue();
+        cells[a[0]][a[1]].setValue(cells[b[0]][b[1]].getValue(), SudokuCell.MoveSource.CHAOS);
+        cells[b[0]][b[1]].setValue(tmp, SudokuCell.MoveSource.CHAOS);
+        logger.debug("Chaos swap ({},{}) <-> ({},{}) in game {}", a[0], a[1], b[0], b[1], board.getGameId());
+    }
+
+    private void validateDifficulty(int difficulty) {
+        if (difficulty < 1 || difficulty > 5)
+            throw new IllegalArgumentException("Difficulty must be 1-5, got: " + difficulty);
+    }
+
+    private void validateGameId(String gameId) {
+        if (gameId == null || gameId.isBlank())
+            throw new IllegalArgumentException("Game ID cannot be null or blank");
+    }
+
+    private void validatePlayerId(String playerId) {
+        if (playerId == null || playerId.isBlank())
+            throw new IllegalArgumentException("Player ID cannot be null or blank");
+    }
+
+    private void validateMove(EnhancedMove move) {
+        if (move == null)
+            throw new IllegalArgumentException("Move cannot be null");
     }
 }

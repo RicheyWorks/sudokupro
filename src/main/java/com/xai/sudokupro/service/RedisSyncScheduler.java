@@ -14,6 +14,7 @@ import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
 import redis.clients.jedis.Jedis;
 import redis.clients.jedis.JedisPool;
+import redis.clients.jedis.exceptions.JedisConnectionException;
 import redis.clients.jedis.exceptions.JedisException;
 
 import jakarta.annotation.PreDestroy;
@@ -64,8 +65,14 @@ public class RedisSyncScheduler {
         logger.info("RedisSyncScheduler initialized");
     }
 
+    // Bug A fix: @Retryable was retrying 3 times with full stack traces every 5 s when
+    // Redis is down, producing log noise every 5 minutes.  The scheduler already has a
+    // try/catch that logs ERROR, so retries add nothing useful for connection failures.
+    // noRetryFor = JedisConnectionException.class suppresses retries for connectivity
+    // errors while still retrying transient JedisException subtypes (e.g. pool exhausted).
     @Scheduled(fixedRate = SYNC_INTERVAL_MS)
-    @Retryable(maxAttempts = RETRY_ATTEMPTS, backoff = @Backoff(delay = 5000))
+    @Retryable(maxAttempts = RETRY_ATTEMPTS, backoff = @Backoff(delay = 5000),
+               noRetryFor = JedisConnectionException.class)
     public void syncRedis() {
 
         if (!isRunning.compareAndSet(false, true)) {
@@ -86,16 +93,22 @@ public class RedisSyncScheduler {
 
             meterRegistry.counter("redis.sync.success", GLOBAL_TAGS).increment();
 
+        } catch (JedisConnectionException e) {
+
+            // Connection failures are not retried — just count and log.
+            meterRegistry.counter("redis.sync.failure", GLOBAL_TAGS).increment();
+            logger.error("Redis sync failed (connection unavailable)", e);
+
         } catch (JedisException e) {
 
             meterRegistry.counter("redis.sync.failure", GLOBAL_TAGS).increment();
             logger.error("Redis sync failed", e);
-            throw e;
+            throw e;   // retryable
 
         } catch (Exception e) {
 
             meterRegistry.counter("redis.sync.failure", GLOBAL_TAGS).increment();
-            throw new RuntimeException(e);
+            throw new RuntimeException(e);   // retryable
 
         } finally {
             isRunning.set(false);
@@ -134,23 +147,23 @@ public class RedisSyncScheduler {
         metrics.put("suspicious", String.valueOf(suspicious));
 
         metrics.put("tier_unranked", String.valueOf(
-            userRepository.countByPointsBetween(TIER_THRESHOLDS[0], TIER_THRESHOLDS[1] - 1)
+            userRepository.countUsersInPointsRange(TIER_THRESHOLDS[0], TIER_THRESHOLDS[1])
         ));
 
         metrics.put("tier_bronze", String.valueOf(
-            userRepository.countByPointsBetween(TIER_THRESHOLDS[1], TIER_THRESHOLDS[2] - 1)
+            userRepository.countUsersInPointsRange(TIER_THRESHOLDS[1], TIER_THRESHOLDS[2])
         ));
 
         metrics.put("tier_silver", String.valueOf(
-            userRepository.countByPointsBetween(TIER_THRESHOLDS[2], TIER_THRESHOLDS[3] - 1)
+            userRepository.countUsersInPointsRange(TIER_THRESHOLDS[2], TIER_THRESHOLDS[3])
         ));
 
         metrics.put("tier_gold", String.valueOf(
-            userRepository.countByPointsBetween(TIER_THRESHOLDS[3], TIER_THRESHOLDS[4] - 1)
+            userRepository.countUsersInPointsRange(TIER_THRESHOLDS[3], TIER_THRESHOLDS[4])
         ));
 
         metrics.put("tier_cosmic", String.valueOf(
-            userRepository.countByPointsGreaterThanEqual(TIER_THRESHOLDS[4])
+            userRepository.countUsersWithMinPoints(TIER_THRESHOLDS[4])
         ));
 
         return metrics;

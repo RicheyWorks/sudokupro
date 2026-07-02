@@ -55,6 +55,11 @@ public class Constants {
     public static int INFINITE_MODE_LIVES = 3;
     public static int COSMIC_MODE_EVENTS = 3;
 
+    // Mode constants — synced from instance fields in validate()
+    public static int CHAOS_MODE_SWAPS     = 5;
+    public static int MIRROR_MODE_SYMMETRY = 1;
+    public static int BLITZ_MODE_SECONDS   = 60;
+
     // Difficulty Presets
     public enum Difficulty {
         EASY(40), MEDIUM(50), HARD(60), EXTREME(70), NIGHTMARE(80);
@@ -146,6 +151,9 @@ public class Constants {
     public static int POINTS_PER_SOLVE_EASY = 10;
     public static int GEMS_PER_DUEL_WIN = 10;
 
+    /** Points-per-hour threshold above which a player is considered a potential solver-bot. */
+    public static int SOLVER_DETECTION_THRESHOLD = 100;
+
     @Autowired
     public Constants(TelemetryService telemetry) {
         int adjust = telemetry != null ? telemetry.getDifficultyAdjustmentFactor() : 0;
@@ -165,10 +173,16 @@ public class Constants {
         POINTS_PER_SOLVE_EASY = pointsPerSolveEasy;
         GEMS_PER_DUEL_WIN = gemsPerDuelWin;
 
-        TIME_ATTACK_SECONDS = timeAttackSeconds;
-        INFINITE_MODE_LIVES = infiniteModeLives;
-        COSMIC_MODE_EVENTS = cosmicModeEvents;
+        TIME_ATTACK_SECONDS    = timeAttackSeconds;
+        INFINITE_MODE_LIVES    = infiniteModeLives;
+        COSMIC_MODE_EVENTS     = cosmicModeEvents;
+        CHAOS_MODE_SWAPS       = chaosModeSwaps;
+        MIRROR_MODE_SYMMETRY   = mirrorModeSymmetry;
+        BLITZ_MODE_SECONDS     = blitzModeSeconds;
     }
+
+    public int getXpPerLevel()      { return xpPerLevel; }
+    public int getXpPerSolveEasy()  { return xpPerSolveEasy; }
 
     private static String i18n(String key, String fallback) {
         if (i18n == null) return fallback;

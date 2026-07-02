@@ -6,6 +6,7 @@ import org.springframework.data.domain.Pageable;
 import org.springframework.data.jpa.repository.EntityGraph;
 import org.springframework.data.jpa.repository.JpaRepository;
 import org.springframework.data.jpa.repository.Query;
+import org.springframework.data.repository.NoRepositoryBean;
 import org.springframework.data.repository.query.Param;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -16,7 +17,12 @@ import java.util.Map;
 /**
  * Cosmic ledger of SudokuPro's economy.
  * Analyzes gem hoards, triple threats, and galactic drip with divine JPA precision.
+ *
+ * <p>Marked {@code @NoRepositoryBean} so Spring Data JPA does not instantiate it as a
+ * standalone bean. It is composed into {@link com.xai.sudokupro.repository.UserRepository}
+ * which provides the single concrete implementation.
  */
+@NoRepositoryBean
 public interface EconomyAnalyticsRepository extends JpaRepository<User, Long> {
 
     @Query("SELECT u FROM User u WHERE u.gems < :threshold ORDER BY u.gems ASC")

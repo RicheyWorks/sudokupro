@@ -6,6 +6,7 @@ import com.xai.sudokupro.util.SecureRandomGenerator;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.context.annotation.Lazy;
 import org.springframework.stereotype.Component;
 
 import java.util.Arrays;
@@ -25,7 +26,7 @@ public class ChaosEngine {
     private final Map<String, String> universeSignatures = new ConcurrentHashMap<>();
 
     @Autowired
-    public ChaosEngine(SecureRandomGenerator rng, GameService gameService) {
+    public ChaosEngine(SecureRandomGenerator rng, @Lazy GameService gameService) {
         this.rng = rng;
         this.gameService = gameService;
     }

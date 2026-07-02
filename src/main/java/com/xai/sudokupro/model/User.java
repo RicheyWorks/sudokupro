@@ -220,7 +220,7 @@ public class User implements Serializable {
     public double getDuelWinRate() {
         int totalDuels = duelWins + duelLosses;
         double winRate = totalDuels > 0 ? (double) duelWins / totalDuels : 0.0;
-        logger.trace("Duel win rate for {}: {:.2f}%", username, winRate * 100);
+        logger.trace("Duel win rate for {}: {}%", username, String.format("%.2f", winRate * 100));
         return winRate;
     }
 

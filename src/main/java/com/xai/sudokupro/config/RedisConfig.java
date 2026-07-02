@@ -5,8 +5,6 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.beans.factory.annotation.Value;
-import org.springframework.boot.actuate.health.Health;
-import org.springframework.boot.actuate.health.HealthIndicator;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.context.annotation.Profile;
@@ -79,26 +77,6 @@ public class RedisConfig {
         return createTemplate(connectionFactory, SudokuBoard.class, prefixedKeySerializer);
     }
 
-    @Bean
-    public HealthIndicator redisHealthIndicator(JedisPool jedisPool) {
-        return () -> {
-            try (var jedis = jedisPool.getResource()) {
-                String pong = jedis.ping();
-
-                return pong.equals("PONG")
-                    ? Health.up()
-                        .withDetail("host", host)
-                        .withDetail("port", port)
-                        .withDetail("timeout", timeout)
-                        .build()
-                    : Health.down().build();
-
-            } catch (Exception e) {
-                return Health.down(e).build();
-            }
-        };
-    }
-
     @Bean("prefixedKeySerializer")
     public StringRedisSerializer prefixedKeySerializer() {
         return new StringRedisSerializer() {
@@ -112,12 +90,19 @@ public class RedisConfig {
     private <T> RedisTemplate<String, T> createTemplate(RedisConnectionFactory connectionFactory,
                                                         Class<T> clazz,
                                                         StringRedisSerializer prefixedKeySerializer) {
+        // Use an ObjectMapper with JavaTimeModule so that LocalDateTime fields
+        // (e.g. SudokuBoard.startTime) serialize without InvalidDefinitionException.
+        com.fasterxml.jackson.databind.ObjectMapper mapper =
+            new com.fasterxml.jackson.databind.ObjectMapper()
+                .registerModule(new com.fasterxml.jackson.datatype.jsr310.JavaTimeModule())
+                .disable(com.fasterxml.jackson.databind.SerializationFeature.WRITE_DATES_AS_TIMESTAMPS);
+        Jackson2JsonRedisSerializer<T> valueSerializer = new Jackson2JsonRedisSerializer<>(mapper, clazz);
         RedisTemplate<String, T> template = new RedisTemplate<>();
         template.setConnectionFactory(connectionFactory);
         template.setKeySerializer(prefixedKeySerializer);
-        template.setValueSerializer(new Jackson2JsonRedisSerializer<>(clazz));
+        template.setValueSerializer(valueSerializer);
         template.setHashKeySerializer(prefixedKeySerializer);
-        template.setHashValueSerializer(new Jackson2JsonRedisSerializer<>(clazz));
+        template.setHashValueSerializer(valueSerializer);
         template.afterPropertiesSet();
         return template;
     }

@@ -18,7 +18,10 @@
 
     <properties>
         <java.version>17</java.version>
-        <javafx.version>21</javafx.version>
+        <!-- Use a point release — base "21" has malformed effective model metadata. -->
+        <javafx.version>21.0.6</javafx.version>
+        <!-- Overridden per-OS by the profiles below. -->
+        <javafx.platform>linux</javafx.platform>
     </properties>
 
     <dependencies>
@@ -116,23 +119,26 @@
             <scope>test</scope>
         </dependency>
 
-        <!-- JavaFX -->
+        <!-- JavaFX — classifier selects the platform-native JAR (set by OS-activated profiles). -->
         <dependency>
             <groupId>org.openjfx</groupId>
             <artifactId>javafx-controls</artifactId>
             <version>${javafx.version}</version>
+            <classifier>${javafx.platform}</classifier>
         </dependency>
 
         <dependency>
             <groupId>org.openjfx</groupId>
             <artifactId>javafx-fxml</artifactId>
             <version>${javafx.version}</version>
+            <classifier>${javafx.platform}</classifier>
         </dependency>
 
         <dependency>
             <groupId>org.openjfx</groupId>
             <artifactId>javafx-media</artifactId>
             <version>${javafx.version}</version>
+            <classifier>${javafx.platform}</classifier>
         </dependency>
 
         <!-- JSON -->
@@ -162,6 +168,50 @@
         </dependency>
 
     </dependencies>
+
+    <!--
+        Platform profiles: Maven activates the matching one automatically based on the OS.
+        Each profile sets javafx.platform, which is used as the <classifier> on every
+        JavaFX dependency so the correct native JAR is resolved from Maven Central.
+    -->
+    <profiles>
+        <profile>
+            <id>javafx-win</id>
+            <activation>
+                <os><family>windows</family></os>
+            </activation>
+            <properties><javafx.platform>win</javafx.platform></properties>
+        </profile>
+        <profile>
+            <!-- Apple Silicon (M1/M2/M3) -->
+            <id>javafx-mac-aarch64</id>
+            <activation>
+                <os>
+                    <family>mac</family>
+                    <arch>aarch64</arch>
+                </os>
+            </activation>
+            <properties><javafx.platform>mac-aarch64</javafx.platform></properties>
+        </profile>
+        <profile>
+            <!-- Intel Mac -->
+            <id>javafx-mac</id>
+            <activation>
+                <os>
+                    <family>mac</family>
+                    <arch>x86_64</arch>
+                </os>
+            </activation>
+            <properties><javafx.platform>mac</javafx.platform></properties>
+        </profile>
+        <profile>
+            <id>javafx-linux</id>
+            <activation>
+                <os><name>Linux</name></os>
+            </activation>
+            <properties><javafx.platform>linux</javafx.platform></properties>
+        </profile>
+    </profiles>
 
     <build>
         <plugins>

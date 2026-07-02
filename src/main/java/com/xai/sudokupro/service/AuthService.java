@@ -24,7 +24,8 @@ public class AuthService {
     /**
      * Returns true only for a fully authenticated, non-anonymous principal.
      * Checks against {@link AnonymousAuthenticationToken} rather than comparing
-     * principal names — Spring Security uses "anonymousUser" by default, not "anonymous".
+     * principal names — Spring Security uses "anonymousUser" by default, not "anonymous",
+     * so a name comparison would always pass the check and treat anonymous users as logged in.
      */
     public boolean isAuthenticated() {
         Authentication auth = SecurityContextHolder.getContext().getAuthentication();

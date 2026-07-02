@@ -9,6 +9,7 @@ import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Component;
 import com.xai.sudokupro.service.AISolverService;
+import com.xai.sudokupro.util.Constants;
 import java.io.IOException;
 import java.util.*;
 import java.util.zip.GZIPInputStream;
@@ -53,7 +54,7 @@ public class SudokuSerializer {
             data.gameId = board.getGameId();
             data.replayHistory = board.getReplayHistory();
             data.hintCount = board.getHintCount();
-            data.usedUndo = board.hasUsedUndo();
+            data.usedUndo = board.isUsedUndo();
             data.solveTimeSeconds = board.getSolveTime().toSeconds();
             data.cosmicSignatures = extractCosmicSignatures(board);
             data.cosmicDripLevel = calculateCosmicDripLevel(board);
@@ -85,21 +86,20 @@ public class SudokuSerializer {
                     if (pencilMarks != null) pencilMarks.forEach(cells[i][j]::addPencilMark);
                     Set<Integer> conflicts = data.conflicts.get(i + "," + j);
                     if (conflicts != null) conflicts.forEach(cells[i][j]::addConflict);
-                    CosmicSignature sig = data.cosmicSignatures.get(i + "," + j);
+                    SudokuGenerator.CosmicSignature sig = data.cosmicSignatures.get(i + "," + j);
                     if (sig != null) {
-                        cells[i][j].setValue(sig.value(), SudokuCell.MoveSource.AUTOSOLVE, sig.style());
+                        cells[i][j].setValue(sig.getValue(), SudokuCell.MoveSource.AUTOSOLVE, sig.getStrategy());
                     }
                 }
             }
 
-            SudokuBoard board = new SudokuBoard(cells, data.chaosMode, data.mirrorMode, data.timeLimitSeconds, data.gameId, solver);
+            SudokuBoard board = new SudokuBoard(cells, data.chaosMode, data.mirrorMode, data.timeLimitSeconds, data.gameId);
             if (data.replayHistory != null) {
                 board.applyBatchMoves(data.replayHistory); // Batch apply for efficiency
             }
-            board.setHintCount(data.hintCount);
-            board.setUsedUndo(data.usedUndo);
-            board.setSolveTimeSeconds(data.solveTimeSeconds);
-            board.setCosmicDripLevel(data.cosmicDripLevel);
+            // hintCount, usedUndo, solveTimeSeconds, and cosmicDripLevel are read-only
+            // computed fields on SudokuBoard — no setters exist; they are re-derived from
+            // the cell state and move history that was just applied above.
 
             logger.debug("Deserialized board {} with version {}", data.gameId, data.version);
             return board;

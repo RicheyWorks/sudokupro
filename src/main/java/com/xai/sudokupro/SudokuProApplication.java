@@ -58,6 +58,14 @@ public class SudokuProApplication {
 
             broadcastCosmicEvent("SudokuPro Online - Grid War Begins!");
 
+            // Register the shutdown hook BEFORE launching JavaFX — launch() blocks until the
+            // window closes, so anything after it runs only after the user exits the UI.
+            Runtime.getRuntime().addShutdownHook(new Thread(SudokuProApplication::shutdown));
+
+            // Share the already-running Spring context with MainStage so that its init()
+            // skips the second SpringApplication.run() that would collide on port 8080.
+            MainStage.setSpringContext(context);
+
             try {
                 javafx.application.Application.launch(MainStage.class, args);
             } catch (Exception e) {
@@ -65,9 +73,10 @@ public class SudokuProApplication {
                 startFallbackTerminalMode();
             }
 
-            Runtime.getRuntime().addShutdownHook(new Thread(SudokuProApplication::shutdown));
-
-            context.getBean(SudokuHealthMonitor.class).runChecks();
+            // Post-UI-close health snapshot — guard against context already closed by stop().
+            if (context != null && context.isActive()) {
+                context.getBean(SudokuHealthMonitor.class).runChecks();
+            }
 
         } catch (Exception e) {
             logger.error("SudokuPro startup failed", e);
@@ -86,7 +95,13 @@ public class SudokuProApplication {
         long activeUsers = userRepo.count();
         logger.info("Guild sync startup check: {} users detected", activeUsers);
 
-        redisSync.syncRedis();
+        // Call syncRedis defensively — if Redis is not running at startup the app should still
+        // launch. The scheduler will retry on its own schedule once Redis comes online.
+        try {
+            redisSync.syncRedis();
+        } catch (Exception e) {
+            logger.warn("Startup Redis sync skipped (Redis may not be running): {}", e.getMessage());
+        }
     }
 
     private static void triggerChaosEvents() {

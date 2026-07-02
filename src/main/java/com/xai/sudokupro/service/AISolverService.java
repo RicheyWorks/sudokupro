@@ -129,62 +129,64 @@ public class AISolverService {
         return new HashMap<>(cosmicHotspots);
     }
 
+    /**
+     * Returns a hint string for a fixed test board — used by SudokuHealthMonitor
+     * to verify the solver is alive without touching a real game.
+     */
+    public String getNextLogicalMoveForTestBoard() {
+        SudokuBoard test = new SudokuBoard(3, false, false, 0L, "health-check");
+        return getNextLogicalMove(test);
+    }
+
+    /**
+     * Returns a compact hash of the predicted final move pattern for a player.
+     * Stubbed: returns a deterministic string based on playerId.
+     */
+    public String predictFinalMovePattern(String playerId) {
+        return "predicted-" + Integer.toHexString(playerId.hashCode());
+    }
+
+    /**
+     * Returns a compact hash representing the current move sequence for a game.
+     * Stubbed: returns a deterministic string based on gameId.
+     */
+    public String getCurrentMoveSignature(String gameId) {
+        return "sig-" + Integer.toHexString(gameId.hashCode());
+    }
+
     // ── Private helpers ────────────────────────────────────────────────────────
 
     private List<Hint> collectAllHints(SudokuBoard board, SudokuCell[][] snapshot) {
         List<Hint> hints = new ArrayList<>();
-        hints.addAll(detectSingle(board, snapshot));
-        hints.addAll(detectCosmic(board, snapshot));
+        int size = snapshot.length;
+        for (int r = 0; r < size; r++) {
+            for (int c = 0; c < size; c++) {
+                if (snapshot[r][c].getValue() == 0) {
+                    List<Integer> candidates = new ArrayList<>();
+                    for (int v = 1; v <= 9; v++) {
+                        if (isValidTempMove(snapshot, r, c, v)) candidates.add(v);
+                    }
+                    if (candidates.size() == 1) {
+                        // Naked single: only one value can go here
+                        hints.add(new Hint(r, c, candidates.get(0), "Naked single", SudokuCell.Strategy.NAKED_SINGLE));
+                    } else if (!candidates.isEmpty()) {
+                        // Add as a candidate hint with the first possible value
+                        hints.add(new Hint(r, c, candidates.get(0), "Candidate", SudokuCell.Strategy.UNKNOWN));
+                    }
+                }
+            }
+        }
         return hints;
     }
 
-    private List<Hint> detectSingle(SudokuBoard board, SudokuCell[][] snapshot) {
-        for (int r = 0; r < 9; r++)
-            for (int c = 0; c < 9; c++) {
-                if (snapshot[r][c].getValue() == 0) {
-                    List<Integer> valid = getValidMoves(board, r, c);
-                    if (valid.size() == 1) {
-                        return List.of(new Hint(r, c, valid.get(0), "Single"));
-                    }
-                }
-            }
-        return List.of();
-    }
-
-    private List<Hint> detectCosmic(SudokuBoard board, SudokuCell[][] snapshot) {
-        for (int r = 0; r < 9; r++)
-            for (int c = 0; c < 9; c++) {
-                if (snapshot[r][c].getValue() == 0 &&
-                    cosmicHotspots.getOrDefault(r + "," + c, 0) >= COSMIC_THRESHOLD) {
-                    List<Integer> valid = getValidMoves(board, r, c);
-                    if (valid.size() == 1) {
-                        return List.of(new Hint(r, c, valid.get(0), "Cosmic"));
-                    }
-                }
-            }
-        return List.of();
-    }
-
-    private List<Integer> getValidMoves(SudokuBoard board, int r, int c) {
-        List<Integer> valid = new ArrayList<>();
-        for (int i = 1; i <= 9; i++) {
-            if (board.isValidMove(r, c, i)) valid.add(i);
-        }
-        return valid;
-    }
-
-    /**
-     * Recursive backtracking solver — operates on the snapshot array,
-     * using {@link SudokuBoard#isValidMove} for constraint checking.
-     */
     private boolean backtrack(SudokuCell[][] snapshot, int row, int col, SudokuBoard board) {
-        if (row == 9) return true;
-        if (col == 9) return backtrack(snapshot, row + 1, 0, board);
+        int size = snapshot.length;
+        if (row == size) return true;
+        if (col == size) return backtrack(snapshot, row + 1, 0, board);
         if (snapshot[row][col].getValue() != 0) return backtrack(snapshot, row, col + 1, board);
-
-        for (int n = 1; n <= 9; n++) {
-            if (board.isValidMove(row, col, n)) {
-                snapshot[row][col].setValue(n, SudokuCell.MoveSource.AUTOSOLVE);
+        for (int v = 1; v <= 9; v++) {
+            if (isValidTempMove(snapshot, row, col, v)) {
+                snapshot[row][col].setValue(v, SudokuCell.MoveSource.AUTOSOLVE);
                 if (backtrack(snapshot, row, col + 1, board)) return true;
                 snapshot[row][col].setValue(0, SudokuCell.MoveSource.AUTOSOLVE);
             }
@@ -192,34 +194,62 @@ public class AISolverService {
         return false;
     }
 
-    /** Writes the completed snapshot back to the live board via makeMove. */
-    private void applySnapshot(SudokuCell[][] snapshot, SudokuBoard board,
-                               SudokuCell.MoveSource source) {
-        for (int i = 0; i < 9; i++)
-            for (int j = 0; j < 9; j++)
-                if (!snapshot[i][j].isGiven())
-                    board.makeMove(i, j, snapshot[i][j].getValue(), source);
+    private void applySnapshot(SudokuCell[][] snapshot, SudokuBoard board, SudokuCell.MoveSource source) {
+        SudokuCell[][] live = board.getBoard();
+        int size = snapshot.length;
+        for (int r = 0; r < size; r++) {
+            for (int c = 0; c < size; c++) {
+                if (!live[r][c].isGiven() && snapshot[r][c].getValue() != live[r][c].getValue()) {
+                    board.makeMove(r, c, snapshot[r][c].getValue(), source);
+                }
+            }
+        }
     }
 
-    private void boostCosmicHotspots() {
-        cosmicHotspots.replaceAll((k, v) -> v + COSMIC_BOOST);
+    private boolean isValidTempMove(SudokuCell[][] b, int row, int col, int value) {
+        int size = b.length;
+        for (int i = 0; i < size; i++) {
+            if (b[row][i].getValue() == value || b[i][col].getValue() == value) return false;
+        }
+        int startRow = row - row % 3, startCol = col - col % 3;
+        for (int i = 0; i < 3; i++)
+            for (int j = 0; j < 3; j++)
+                if (b[startRow + i][startCol + j].getValue() == value) return false;
+        return true;
     }
 
     private int scoreHint(Hint h) {
-        // Base 1 + consecutive-hint streak bonus + hotspot weight for this cell.
-        // Cells that have been identified as cosmic hotspots rank higher,
-        // and scores rise as the player keeps requesting hints in a session.
-        return 1 + hintStreak + cosmicHotspots.getOrDefault(h.row() + "," + h.col(), 0);
+        int base = switch (h.strategy()) {
+            case NAKED_SINGLE -> 100;
+            default           -> 10;
+        };
+        int cosmicBoost = cosmicHotspots.getOrDefault(h.row() + "," + h.col(), 0);
+        boolean recentlyUsed = hintFeedback.getOrDefault(hintKey(h), Boolean.FALSE);
+        return base + cosmicBoost * COSMIC_BOOST - (recentlyUsed ? 20 : 0);
     }
 
     private String hintKey(Hint h) {
-        return h.row() + "," + h.col();
+        return h.row() + "," + h.col() + "=" + h.value();
     }
 
     private String formatHint(Hint h) {
-        if (h.value() instanceof Integer v) {
-            return "Set " + v + " at (" + h.row() + "," + h.col() + ")";
+        return String.format("Try placing %s at row %d, col %d [%s]",
+            h.value(), h.row() + 1, h.col() + 1, h.strategy());
+    }
+
+    private void boostCosmicHotspots() {
+        // Decay all existing hotspot scores slightly after a full solve
+        cosmicHotspots.replaceAll((k, v) -> Math.max(0, v - 1));
+    }
+
+    public synchronized void recordHintFeedback(String key, boolean helpful) {
+        hintFeedback.put(key, helpful);
+        if (hintFeedback.size() > HINT_CACHE_SIZE * 10) {
+            // Trim oldest entries
+            Iterator<String> it = hintFeedback.keySet().iterator();
+            while (hintFeedback.size() > HINT_CACHE_SIZE * 5 && it.hasNext()) {
+                it.next(); it.remove();
+            }
         }
-        return "Hint at (" + h.row() + "," + h.col() + ")";
     }
 }

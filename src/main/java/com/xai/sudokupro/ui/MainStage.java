@@ -32,6 +32,7 @@ import org.springframework.stereotype.Component;
 import java.net.URL;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
+import java.util.Deque;
 import java.util.List;
 
 @Component
@@ -42,6 +43,15 @@ public class MainStage extends Application {
     private static final String BACKGROUND_MUSIC_PATH = "/audio/cosmic-ambience.mp3";
     private static final String VICTORY_SOUND_PATH = "/audio/victory-fanfare.mp3";
     private static ConfigurableApplicationContext springContext;
+
+    /**
+     * Called by {@link com.xai.sudokupro.SudokuProApplication} before
+     * {@code Application.launch()} so that {@link #init()} re-uses the
+     * already-running web context instead of starting a second one on port 8080.
+     */
+    public static void setSpringContext(ConfigurableApplicationContext ctx) {
+        springContext = ctx;
+    }
 
     @Autowired private GameService gameService;
     @Autowired private NotificationService notificationService;
@@ -82,9 +92,13 @@ public class MainStage extends Application {
     @Override
     public void init() {
         if (springContext == null) {
+            // Fallback: if SudokuProApplication didn't pre-set the context
+            // (e.g. MainStage launched standalone), start Spring here.
             springContext = SpringApplication.run(SudokuProApplication.class);
-            springContext.getAutowireCapableBeanFactory().autowireBean(this);
         }
+        // Always wire @Autowired fields from the shared context, whether it was
+        // pre-set by SudokuProApplication or just created above.
+        springContext.getAutowireCapableBeanFactory().autowireBean(this);
     }
 
     @Override
@@ -401,11 +415,11 @@ public class MainStage extends Application {
     private void replayGame(Stage primaryStage) {
         try {
             String playerId = authService.getCurrentPlayerId();
-            // Capture history before reset (getMoveHistory() returns a defensive copy)
-            List<Move> moveHistory = boardView.getBoard().getMoveHistory();
+            // Capture history before reset (getMoveHistory() returns a defensive Deque copy)
+            Deque<SudokuBoard.Move> moveHistory = boardView.getBoard().getMoveHistory();
             resetBoard(primaryStage);
             Thread replayThread = new Thread(() -> {
-                for (Move move : moveHistory) {
+                for (SudokuBoard.Move move : moveHistory) {
                     try {
                         if (!isPaused) {
                             // Bug 6 fix: gameService.applyMove expects EnhancedMove, but

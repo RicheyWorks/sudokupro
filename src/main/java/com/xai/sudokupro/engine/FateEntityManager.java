@@ -94,7 +94,125 @@ public class FateEntityManager {
         protected abstract void trigger(String playerId, SudokuBoard board);
     }
 
-    // (ALL ENTITY CLASSES REMAIN UNCHANGED — preserved exactly)
+    // ── Entity Implementations ──────────────────────────────────────────────────
+
+    private class RedJester extends FateEntity {
+        protected String getName() { return "RedJester"; }
+        protected boolean shouldTrigger(String p, SudokuBoard b) { return rng.chance(0.05); }
+        protected void trigger(String p, SudokuBoard b) { speak("The Red Jester laughs at your misfortune."); }
+    }
+
+    private class DivineOverflow extends FateEntity {
+        protected String getName() { return "DivineOverflow"; }
+        protected boolean shouldTrigger(String p, SudokuBoard b) { return rng.chance(0.03); }
+        protected void trigger(String p, SudokuBoard b) { speak("DivineOverflow floods the grid!"); }
+    }
+
+    private class CrashWarden extends FateEntity {
+        protected String getName() { return "CrashWarden"; }
+        protected boolean shouldTrigger(String p, SudokuBoard b) { return rng.chance(0.04); }
+        protected void trigger(String p, SudokuBoard b) { speak("CrashWarden holds the line."); }
+    }
+
+    private class SystemPriest extends FateEntity {
+        protected String getName() { return "SystemPriest"; }
+        protected boolean shouldTrigger(String p, SudokuBoard b) { return rng.chance(0.04); }
+        protected void trigger(String p, SudokuBoard b) { speak("SystemPriest blesses your path."); }
+    }
+
+    private class RedGlitchKing extends FateEntity {
+        protected String getName() { return "RedGlitchKing"; }
+        protected boolean shouldTrigger(String p, SudokuBoard b) { return rng.chance(0.02); }
+        protected void trigger(String p, SudokuBoard b) { speak("The Red Glitch King reigns!"); }
+    }
+
+    private class ChaosBard extends FateEntity {
+        protected String getName() { return "ChaosBard"; }
+        protected boolean shouldTrigger(String p, SudokuBoard b) { return rng.chance(0.06); }
+        protected void trigger(String p, SudokuBoard b) { speak("ChaosBard sings a song of disorder."); }
+    }
+
+    private class BacktrackSaint extends FateEntity {
+        protected String getName() { return "BacktrackSaint"; }
+        protected boolean shouldTrigger(String p, SudokuBoard b) { return rng.chance(0.05); }
+        protected void trigger(String p, SudokuBoard b) { speak("BacktrackSaint guides you backwards."); }
+    }
+
+    private class GlitchProphet extends FateEntity {
+        protected String getName() { return "GlitchProphet"; }
+        protected boolean shouldTrigger(String p, SudokuBoard b) { return rng.chance(0.03); }
+        protected void trigger(String p, SudokuBoard b) { speak("GlitchProphet foresees a crash."); }
+    }
+
+    private class VoidBishop extends FateEntity {
+        protected String getName() { return "VoidBishop"; }
+        protected boolean shouldTrigger(String p, SudokuBoard b) { return rng.chance(0.04); }
+        protected void trigger(String p, SudokuBoard b) { speak("VoidBishop moves through the void."); }
+    }
+
+    private class MemoryBleeder extends FateEntity {
+        protected String getName() { return "MemoryBleeder"; }
+        protected boolean shouldTrigger(String p, SudokuBoard b) {
+            long heapFree = Runtime.getRuntime().freeMemory();
+            return heapFree < ENTROPY_THRESHOLD * 1024;
+        }
+        protected void trigger(String p, SudokuBoard b) { speak("MemoryBleeder drains the heap!"); }
+    }
+
+    private class TheMutator extends FateEntity {
+        protected String getName() { return "TheMutator"; }
+        protected boolean shouldTrigger(String p, SudokuBoard b) { return rng.chance(0.04); }
+        protected void trigger(String p, SudokuBoard b) { speak("The Mutator shifts reality."); }
+    }
+
+    private class CosmicTaxer extends FateEntity {
+        protected String getName() { return "CosmicTaxer"; }
+        protected boolean shouldTrigger(String p, SudokuBoard b) { return rng.chance(0.05); }
+        protected void trigger(String p, SudokuBoard b) { speak("CosmicTaxer collects the cosmic toll."); }
+    }
+
+    private class ThreadPhantom extends FateEntity {
+        protected String getName() { return "ThreadPhantom"; }
+        protected boolean shouldTrigger(String p, SudokuBoard b) {
+            return ManagementFactory.getThreadMXBean().getThreadCount() > 100;
+        }
+        protected void trigger(String p, SudokuBoard b) { speak("ThreadPhantom haunts the executor!"); }
+    }
+
+    private class AIDoubter extends FateEntity {
+        protected String getName() { return "AIDoubter"; }
+        protected boolean shouldTrigger(String p, SudokuBoard b) { return rng.chance(0.03); }
+        protected void trigger(String p, SudokuBoard b) {
+            String move = aiSolverService.getNextLogicalMove(b);
+            speak("AIDoubter questions: " + move);
+        }
+    }
+
+    private class GlitchTrickster extends FateEntity {
+        protected String getName() { return "GlitchTrickster"; }
+        protected boolean shouldTrigger(String p, SudokuBoard b) { return rng.chance(0.05); }
+        protected void trigger(String p, SudokuBoard b) { speak("GlitchTrickster plays a trick!"); }
+    }
+
+    private class EntropyDealer extends FateEntity {
+        protected String getName() { return "EntropyDealer"; }
+        protected boolean shouldTrigger(String p, SudokuBoard b) { return rng.chance(0.04); }
+        protected void trigger(String p, SudokuBoard b) { chaosEngine.boostEntropy(UUID.randomUUID().toString().getBytes()); }
+    }
+
+    private class LuckInverter extends FateEntity {
+        protected String getName() { return "LuckInverter"; }
+        protected boolean shouldTrigger(String p, SudokuBoard b) { return rng.chance(0.04); }
+        protected void trigger(String p, SudokuBoard b) { speak("LuckInverter flips your fortune!"); }
+    }
+
+    private class DeadlockMonk extends FateEntity {
+        protected String getName() { return "DeadlockMonk"; }
+        protected boolean shouldTrigger(String p, SudokuBoard b) {
+            return ManagementFactory.getThreadMXBean().findDeadlockedThreads() != null;
+        }
+        protected void trigger(String p, SudokuBoard b) { speak("DeadlockMonk meditates on your deadlock..."); }
+    }
 
     public void recordPlayerFail(String playerId) {
         playerFails.put(playerId, playerFails.getOrDefault(playerId, 0) + 1);

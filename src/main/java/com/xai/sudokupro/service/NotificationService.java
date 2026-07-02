@@ -49,7 +49,7 @@ public class NotificationService {
         validatePlayerId(playerId);
         validateMessage(message);
 
-        Notification notification = new Notification(playerId, message, LocalDateTime.now().toString());
+        Notification notification = new Notification(playerId, "NOTIFICATION", message);
 
         try {
             multiplayerBroadcaster.sendToPlayer(playerId, "notification", message);
@@ -73,7 +73,7 @@ public class NotificationService {
         validateType(type);
         validateMessage(message);
 
-        Notification notification = new Notification(playerId, type + ": " + message, LocalDateTime.now().toString());
+        Notification notification = new Notification(playerId, type, message);
 
         try {
             multiplayerBroadcaster.sendToPlayer(playerId, type, message);
@@ -116,10 +116,15 @@ public class NotificationService {
 
         notificationQueue.offer(notification);
 
+        // Bug fix: pushNotificationService.send() was called unconditionally here, bypassing
+        // the shouldSendPush() rate-limit in the callers. When the WebSocket fails, the push
+        // would fire on every exception regardless of the 5-minute cooldown. Guard with the
+        // same rate-limit check and update lastNotificationTimes so the cooldown is respected.
         String playerId = notification.playerId();
-        String message = notification.message();
-
-        pushNotificationService.send(playerId, message, null);
+        if (shouldSendPush(playerId)) {
+            pushNotificationService.send(playerId, notification.message(), null);
+            lastNotificationTimes.put(playerId, LocalDateTime.now());
+        }
     }
 
     private boolean shouldSendPush(String playerId) {
@@ -147,7 +152,7 @@ public class NotificationService {
 
     private void validateType(String type) {
         if (type == null || type.isBlank()) {
-            throw new IllegalArgumentException("Invalid type");
+            throw new IllegalArgumentException("Invalid notification type");
         }
     }
 }

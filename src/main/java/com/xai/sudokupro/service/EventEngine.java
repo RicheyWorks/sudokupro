@@ -13,7 +13,9 @@ import org.springframework.retry.annotation.Backoff;
 import org.springframework.retry.annotation.Retryable;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
+import com.xai.sudokupro.model.GameEvent;
 import com.xai.sudokupro.model.SudokuGenerator;
+import com.xai.sudokupro.websocket.MultiplayerBroadcaster;
 import jakarta.annotation.PreDestroy;
 import java.time.Duration;
 import java.time.LocalDateTime;
@@ -51,16 +53,18 @@ public class EventEngine {
     private final AnalyticsService analyticsService;
     private final SudokuGenerator sudokuGenerator;
     private final GameRepository gameRepository;
+    private final MultiplayerBroadcaster multiplayerBroadcaster;
 
     @Autowired
-    public EventEngine(UserRepository userRepository, AntiCheatEngine antiCheatEngine, 
-                       AnalyticsService analyticsService, SudokuGenerator sudokuGenerator, 
-                       GameRepository gameRepository) {
+    public EventEngine(UserRepository userRepository, AntiCheatEngine antiCheatEngine,
+                       AnalyticsService analyticsService, SudokuGenerator sudokuGenerator,
+                       GameRepository gameRepository, MultiplayerBroadcaster multiplayerBroadcaster) {
         this.userRepository = Objects.requireNonNull(userRepository, "UserRepository cannot be null");
         this.antiCheatEngine = Objects.requireNonNull(antiCheatEngine, "AntiCheatEngine cannot be null");
         this.analyticsService = Objects.requireNonNull(analyticsService, "AnalyticsService cannot be null");
         this.sudokuGenerator = Objects.requireNonNull(sudokuGenerator, "SudokuGenerator cannot be null");
         this.gameRepository = Objects.requireNonNull(gameRepository, "GameRepository cannot be null");
+        this.multiplayerBroadcaster = Objects.requireNonNull(multiplayerBroadcaster, "MultiplayerBroadcaster cannot be null");
         startCosmicEvents();
         logger.info("EventEngine initialized with cosmic swagger");
     }
@@ -86,7 +90,8 @@ public class EventEngine {
         scheduleDripShowdown();
     }
 
-    @Retryable(maxAttempts = 3, backoff = @Backoff(delay = 5000))
+    // Bug fix: @Retryable on a private method is silently ignored by Spring AOP —
+    // the proxy cannot intercept private calls, so retries never fire. Annotation removed.
     private void scheduleDailyChallenge() {
         scheduler.scheduleAtFixedRate(() -> {
             try {
@@ -99,7 +104,7 @@ public class EventEngine {
                 activeEvents.put(eventId, new EventDetails(dailyBoard, LocalDateTime.now().plus(DAILY_CHALLENGE_DURATION)));
                 eventParticipants.put(eventId, Collections.synchronizedSet(new HashSet<>()));
                 gameRepository.save(dailyBoard);
-                MultiplayerBroadcaster.broadcastEvent("daily_challenge", "New Cosmic Daily Challenge", dailyBoard.getGameId());
+                multiplayerBroadcaster.broadcastEvent("daily_challenge", "New Cosmic Daily Challenge", dailyBoard.getGameId());
                 logger.info("Daily challenge {} unleashed—cosmic grid ID: {}", eventId, dailyBoard.getGameId());
                 scheduleEventEnd(eventId, DAILY_CHALLENGE_DURATION);
             } catch (Exception e) {
@@ -109,7 +114,7 @@ public class EventEngine {
         }, 0, DAILY_CHALLENGE_INTERVAL_HOURS, TimeUnit.HOURS);
     }
 
-    @Retryable(maxAttempts = 3, backoff = @Backoff(delay = 5000))
+    // Bug fix: @Retryable on private methods is ignored by Spring AOP. Annotation removed.
     private void scheduleCosmicDuel() {
         scheduler.scheduleAtFixedRate(() -> {
             try {
@@ -127,7 +132,7 @@ public class EventEngine {
                 eligiblePlayers.forEach(u -> {
                     String playerId = u.getId().toString();
                     participants.add(playerId);
-                    MultiplayerBroadcaster.sendToPlayer(playerId, "cosmic_duel", "Cosmic Duel Begins", duelBoard.getGameId());
+                    multiplayerBroadcaster.sendToPlayer(playerId, "cosmic_duel", "Cosmic Duel Begins: " + duelBoard.getGameId());
                     logger.info("Player {} joins cosmic duel {}—drip battle ID: {}", u.getUsername(), eventId, duelBoard.getGameId());
                 });
                 eventParticipants.put(eventId, participants);
@@ -140,7 +145,7 @@ public class EventEngine {
         }, 0, COSMIC_DUEL_INTERVAL_MINUTES, TimeUnit.MINUTES);
     }
 
-    @Retryable(maxAttempts = 3, backoff = @Backoff(delay = 5000))
+    // Bug fix: @Retryable on private methods is ignored by Spring AOP. Annotation removed.
     private void scheduleDripShowdown() {
         scheduler.scheduleAtFixedRate(() -> {
             try {
@@ -153,7 +158,7 @@ public class EventEngine {
                 activeEvents.put(eventId, new EventDetails(showdownBoard, LocalDateTime.now().plus(DRIP_SHOWDOWN_DURATION)));
                 eventParticipants.put(eventId, Collections.synchronizedSet(new HashSet<>()));
                 gameRepository.save(showdownBoard);
-                MultiplayerBroadcaster.broadcastEvent("drip_showdown", "Cosmic Drip Showdown Starts", showdownBoard.getGameId());
+                multiplayerBroadcaster.broadcastEvent("drip_showdown", "Cosmic Drip Showdown Starts", showdownBoard.getGameId());
                 logger.info("Drip showdown {} blasts off—cosmic grid ID: {}", eventId, showdownBoard.getGameId());
                 scheduleEventEnd(eventId, DRIP_SHOWDOWN_DURATION);
             } catch (Exception e) {
@@ -193,7 +198,7 @@ public class EventEngine {
         analyticsService.recordEvent(new GameEvent(GameEvent.EventType.SCORE, playerId, 
             Map.of("eventId", eventId, "score", String.valueOf(score))));
         logger.info("Player {} drips score {} for event {}—cosmic leaderboard updated", user.getUsername(), score, eventId);
-        MultiplayerBroadcaster.sendToPlayer(playerId, "event_score", "Score Submitted: " + score, eventId);
+        multiplayerBroadcaster.sendToPlayer(playerId, "event_score", "Score Submitted: " + score + " (event: " + eventId + ")");
     }
 
     private int calculateEventScore(SudokuBoard board) {
@@ -211,7 +216,7 @@ public class EventEngine {
         EventDetails event = activeEvents.remove(eventId);
         if (event != null) {
             logger.info("Event {} ends—cosmic grid {} retires", eventId, event.getBoard().getGameId());
-            MultiplayerBroadcaster.broadcastEvent("event_end", "Event " + eventId + " Concluded", event.getBoard().getGameId());
+            multiplayerBroadcaster.broadcastEvent("event_end", "Event " + eventId + " Concluded", event.getBoard().getGameId());
             distributeRewards(eventId);
             eventParticipants.remove(eventId);
             trimPlayerEventScores();
@@ -221,10 +226,14 @@ public class EventEngine {
     }
 
     private void distributeRewards(String eventId) {
+        String suffix = "-" + eventId;
         Map<String, Integer> eventScores = playerEventScores.entrySet().stream()
-            .filter(e -> e.getKey().endsWith("-" + eventId))
+            .filter(e -> e.getKey().endsWith(suffix))
             .collect(Collectors.toMap(
-                e -> e.getKey().substring(0, e.getKey().indexOf("-" + eventId)),
+                // Bug fix: indexOf finds the FIRST occurrence of the suffix, which is wrong if
+                // the playerId itself contains the same substring.  Use lastIndexOf so we always
+                // strip only the trailing "-<eventId>" portion.
+                e -> e.getKey().substring(0, e.getKey().lastIndexOf(suffix)),
                 Map.Entry::getValue
             ));
         eventScores.entrySet().stream()
@@ -241,7 +250,7 @@ public class EventEngine {
                     user.addXp(xp);
                     userRepository.save(user);
                     logger.info("Cosmic reward drips: {} earns {} gems, {} XP for event {}", user.getUsername(), gems, xp, eventId);
-                    MultiplayerBroadcaster.sendToPlayer(playerId, "event_reward", "Earned " + gems + " gems, " + xp + " XP", eventId);
+                    multiplayerBroadcaster.sendToPlayer(playerId, "event_reward", "Earned " + gems + " gems, " + xp + " XP (event: " + eventId + ")");
                 }
                 playerEventScores.remove(playerId + "-" + eventId);
             });
@@ -279,7 +288,7 @@ public class EventEngine {
         User user = findUserByPlayerId(playerId);
         if (user != null && participants.add(playerId)) {
             logger.info("Player {} joins event {}—cosmic grid ID: {}", user.getUsername(), eventId, event.getBoard().getGameId());
-            MultiplayerBroadcaster.sendToPlayer(playerId, "event_join", "Joined Event " + eventId, event.getBoard().getGameId());
+            multiplayerBroadcaster.sendToPlayer(playerId, "event_join", "Joined Event " + eventId + ": " + event.getBoard().getGameId());
         }
     }
 
@@ -320,32 +329,22 @@ public class EventEngine {
     }
 
     private void trimPlayerEventScores() {
-        if (playerEventScores.size() > MAX_ACTIVE_EVENTS * MAX_DUEL_PARTICIPANTS) {
-            int excess = playerEventScores.size() - MAX_ACTIVE_EVENTS * MAX_DUEL_PARTICIPANTS;
-            Iterator<String> iterator = playerEventScores.keySet().iterator();
-            for (int i = 0; i < excess && iterator.hasNext(); i++) {
-                iterator.next();
-                iterator.remove();
-            }
-            logger.debug("Trimmed playerEventScores from {} to {}", playerEventScores.size() + excess, MAX_ACTIVE_EVENTS * MAX_DUEL_PARTICIPANTS);
+        int MAX_SCORES = 10000;
+        while (playerEventScores.size() > MAX_SCORES) {
+            playerEventScores.remove(playerEventScores.keySet().iterator().next());
         }
     }
 
     public static class EventDetails {
         private final SudokuBoard board;
-        private final LocalDateTime endTime;
+        private final java.time.LocalDateTime endTime;
 
-        public EventDetails(SudokuBoard board, LocalDateTime endTime) {
-            this.board = board;
-            this.endTime = endTime;
+        public EventDetails(SudokuBoard board, java.time.LocalDateTime endTime) {
+            this.board   = Objects.requireNonNull(board);
+            this.endTime = Objects.requireNonNull(endTime);
         }
 
-        public SudokuBoard getBoard() {
-            return board;
-        }
-
-        public LocalDateTime getEndTime() {
-            return endTime;
-        }
+        public SudokuBoard          getBoard()   { return board; }
+        public java.time.LocalDateTime getEndTime() { return endTime; }
     }
 }

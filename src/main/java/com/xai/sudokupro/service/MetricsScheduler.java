@@ -22,6 +22,8 @@ import java.time.LocalDateTime;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 
@@ -40,6 +42,7 @@ public class MetricsScheduler {
     private static final int[] TIER_THRESHOLDS = {1000, 5000, 10000, 25000}; // Bronze, Silver, Gold, Cosmic
     private static final String[] TIER_NAMES = {"Bronze", "Silver", "Gold", "Cosmic"};
     private static final Tags GLOBAL_TAGS = Tags.of("app", "SudokuPro");
+    private static final double SUSPICION_THRESHOLD = 75.0;
 
     private final MeterRegistry meterRegistry;
     private final UserRepository userRepository;
@@ -157,9 +160,14 @@ public class MetricsScheduler {
             reportSuspicionBuckets(suspiciousCount);
             logger.debug("Reported suspicious players: {}", suspiciousCount);
 
-            // Active Games by Theme
-            Map<String, Long> activeGamesByTheme = calculateActiveGamesByTheme(activeGamesList);
-            activeGamesByTheme.forEach((theme, count) -> themeGameGauges.get(theme).set(count));
+            // Active Games by Theme — no board list available here; gauges updated in reportDailyMetrics.
+            // Bug fix: themeGameGauges.get(theme) returns null for unknown themes, causing NPE.
+            // Guard with a null check so an unexpected theme key doesn't crash the whole metrics run.
+            Map<String, Long> activeGamesByTheme = calculateActiveGamesByTheme(List.of());
+            activeGamesByTheme.forEach((theme, count) -> {
+                AtomicLong gauge = themeGameGauges.get(theme);
+                if (gauge != null) gauge.set(count);
+            });
             logger.debug("Reported active games by theme: {}", activeGamesByTheme);
 
         } catch (Exception e) {

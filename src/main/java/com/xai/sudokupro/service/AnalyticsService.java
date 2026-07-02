@@ -198,7 +198,46 @@ public class AnalyticsService {
         return Collections.unmodifiableMap(solveTimes);
     }
 
+    public Map<String, LocalDateTime> getLastEventTimestamps() {
+        return Collections.unmodifiableMap(lastEventTimestamps);
+    }
+
     public Map<String, Integer> getHintUsage() {
         return Collections.unmodifiableMap(hintUsage);
+    }
+
+    public Map<String, Integer> getStreakRecords() {
+        return Collections.unmodifiableMap(streakRecords);
+    }
+
+    /**
+     * Returns the average cosmic-drip level for players active since {@code since}.
+     * Looks up the cosmicDripHeatmap for each active player and averages the values.
+     */
+    public synchronized double getAverageCosmicDripActiveUsers(LocalDateTime since) {
+        return lastEventTimestamps.entrySet().stream()
+                .filter(e -> e.getValue().isAfter(since))
+                .mapToInt(e -> cosmicDripHeatmap.getOrDefault(e.getKey(), 0))
+                .average()
+                .orElse(0.0);
+    }
+
+    /**
+     * Returns win-rate per player as wins / (wins + losses).
+     * Players with no recorded outcomes are excluded from the map.
+     */
+    public synchronized Map<String, Double> getPlayerWinRates() {
+        Map<String, Double> rates = new HashMap<>();
+        Set<String> allPlayers = new HashSet<>(duelWins.keySet());
+        allPlayers.addAll(duelLosses.keySet());
+        for (String playerId : allPlayers) {
+            int wins   = duelWins.getOrDefault(playerId, 0);
+            int losses = duelLosses.getOrDefault(playerId, 0);
+            int total  = wins + losses;
+            if (total > 0) {
+                rates.put(playerId, (double) wins / total);
+            }
+        }
+        return rates;
     }
 }

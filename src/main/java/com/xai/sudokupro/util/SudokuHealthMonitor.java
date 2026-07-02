@@ -19,10 +19,12 @@ import java.lang.management.ManagementFactory;
 import java.net.InetAddress;
 import java.nio.file.Files;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Comparator;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -39,15 +41,21 @@ public class SudokuHealthMonitor {
     private static final int JVM_COMPILATION_THRESHOLD = 1000;
 
     private final MeterRegistry meterRegistry;
-    private final JedisPool jedisPool;
     private final UserRepository userRepo;
     private final GameRepository gameRepo;
-    private final RedisTemplate<String, Object> redisTemplate;
     private final ChaosEngine chaosEngine;
     private final GameService gameService;
     private final SecureRandomGenerator rng;
     private final AISolverService aiSolverService;
     private final MultiplayerBroadcaster multiplayerBroadcaster;
+
+    // Optional — only present when the "redis" profile is active.
+    @Autowired(required = false)
+    private JedisPool jedisPool;
+
+    @Autowired(required = false)
+    private RedisTemplate<String, Object> redisTemplate;
+
     private final AICore aiCore = new AICore();
     private final MemoryBank memoryBank = new MemoryBank();
     private final Recursionverse recursionverse = new Recursionverse();
@@ -62,15 +70,13 @@ public class SudokuHealthMonitor {
     private final Map<String, Long> systemUptime = new ConcurrentHashMap<>();
 
     @Autowired
-    public SudokuHealthMonitor(MeterRegistry meterRegistry, JedisPool jedisPool, UserRepository userRepo,
-                               GameRepository gameRepo, RedisTemplate<String, Object> redisTemplate,
+    public SudokuHealthMonitor(MeterRegistry meterRegistry, UserRepository userRepo,
+                               GameRepository gameRepo,
                                ChaosEngine chaosEngine, GameService gameService, SecureRandomGenerator rng,
                                AISolverService aiSolverService, MultiplayerBroadcaster multiplayerBroadcaster) {
         this.meterRegistry = meterRegistry;
-        this.jedisPool = jedisPool;
         this.userRepo = userRepo;
         this.gameRepo = gameRepo;
-        this.redisTemplate = redisTemplate;
         this.chaosEngine = chaosEngine;
         this.gameService = gameService;
         this.rng = rng;
@@ -122,7 +128,6 @@ public class SudokuHealthMonitor {
     private void checkRedisHealth() {
         try (var jedis = jedisPool.getResource()) {
             long start = System.currentTimeMillis();
-            jedis.setTimeout(REDIS_TIMEOUT_MS);
             jedis.ping();
             long latency = System.currentTimeMillis() - start;
 
@@ -171,16 +176,14 @@ public class SudokuHealthMonitor {
         try {
             long start = System.currentTimeMillis();
             long userCount = userRepo.count();
-            long gameCount = gameRepo.countActiveGames();
+            long gameCount = gameRepo.count();
             long latency = System.currentTimeMillis() - start;
-            long dbConnections = userRepo.getActiveConnections();
-            long queryRate = userRepo.getQueryRatePerSecond();
-            logger.info("Database health: OK - Users: {}, Active Games: {}, Connections: {}, QueryRate: {}/s, Latency: {}ms",
-                userCount, gameCount, dbConnections, queryRate, latency);
+            long dbConnections = -1; // not exposed via JPA; monitored externally
+            long queryRate     = -1; // not exposed via JPA; monitored externally
+            logger.info("Database health: OK - Users: {}, Active Games: {}, Latency: {}ms",
+                userCount, gameCount, latency);
             meterRegistry.gauge("sudokupro.db.users", userCount);
             meterRegistry.gauge("sudokupro.db.active_games", gameCount);
-            meterRegistry.gauge("sudokupro.db.connections", dbConnections);
-            meterRegistry.gauge("sudokupro.db.query_rate_s", queryRate);
             meterRegistry.gauge("sudokupro.db.latency_ms", latency);
             if (dbConnections > 100) {
                 logger.warn("High DB connections: {} - Triggering chaos", dbConnections);
@@ -220,7 +223,8 @@ public class SudokuHealthMonitor {
     private void checkGameServiceHealth() {
         try {
             int activeGames = gameService.getActiveGamesCount();
-            long redisKeys = redisTemplate.keys("sudoku:game:*").size();
+            Set<?> gameKeys = redisTemplate.keys("sudoku:game:*");
+            long redisKeys = gameKeys != null ? gameKeys.size() : 0;
             long orphanedGames = redisKeys - activeGames;
             logger.info("GameService health: OK - Active Games: {}, Redis Keys: {}, Orphaned: {}", activeGames, redisKeys, orphanedGames);
             meterRegistry.gauge("sudokupro.games.active", activeGames);
@@ -367,8 +371,8 @@ public class SudokuHealthMonitor {
 
     private void checkPlayerActivity() {
         try {
-            long activePlayers = userRepo.countActivePlayers();
-            int avgPing = playerPingTimes.values().stream().mapToInt(Long::intValue).average().orElse(0.0).intValue();
+            long activePlayers = userRepo.countActiveUsersSince(java.time.LocalDateTime.now().minusMinutes(30));
+            int avgPing = (int) playerPingTimes.values().stream().mapToInt(Long::intValue).average().orElse(0.0);
             long maxPing = playerPingTimes.values().stream().mapToLong(Long::longValue).max().orElse(0L);
             logger.info("Player activity: Active Players: {}, Avg Ping: {}ms, Max Ping: {}ms", activePlayers, avgPing, maxPing);
             meterRegistry.gauge("sudokupro.players.active", activePlayers);
@@ -489,7 +493,8 @@ public class SudokuHealthMonitor {
 
     private void checkRedisCacheConsistency() {
         try {
-            long redisKeys = redisTemplate.keys("sudoku:game:*").size();
+            Set<?> cacheKeys = redisTemplate.keys("sudoku:game:*");
+            long redisKeys = cacheKeys != null ? cacheKeys.size() : 0;
             long dbGames = gameRepo.count();
             long inconsistency = Math.abs(redisKeys - dbGames);
             logger.info("Redis cache consistency: RedisKeys: {}, DBGames: {}, Inconsistency: {}", redisKeys, dbGames, inconsistency);
@@ -574,8 +579,7 @@ public class SudokuHealthMonitor {
     private void checkNetworkBandwidth() {
         try {
             long start = System.currentTimeMillis();
-            byte[] data = new byte[1024 * 1024]; // 1MB
-            rng.nextBytes(data);
+            byte[] data = rng.generateRandomBytes(1024 * 1024); // 1MB
             long latency = System.currentTimeMillis() - start;
             double bandwidth = (1024.0 / latency) * 1000; // KB/s
             logger.info("Network bandwidth: Estimated {} KB/s", bandwidth);
@@ -765,7 +769,7 @@ public class SudokuHealthMonitor {
             try {
                 double brainEntropy = ExternalBCI.getRealTimeCognitiveLoad(playerId);
                 logger.info("🧬 BioSignal for {}: BrainEntropy: {}", playerId, brainEntropy);
-                meterRegistry.gauge("sudokupro.biosignal.brain_entropy", playerId, Map.of("player", playerId), brainEntropy);
+                meterRegistry.gauge("sudokupro.biosignal.brain_entropy", brainEntropy);
                 if (brainEntropy > 0.9) {
                     logger.warn("🧠 BCI overload detected for {}", playerId);
                     chaosEngine.onGameEvent("BRAIN_OVERLOAD", playerId);
@@ -821,13 +825,14 @@ public class SudokuHealthMonitor {
         gameService.getActiveGames().forEach((gameId, board) -> {
             String playerId = board.getPlayerId();
             fateEngine.updateFateFromGameState(playerId, board);
-            meterRegistry.gauge("sudokupro.fate.karma_weight", playerId, Map.of("player", playerId), fateEngine.getFate(playerId).karmaWeight);
-            meterRegistry.gauge("sudokupro.fate.echo_count", playerId, Map.of("player", playerId), fateEngine.getFate(playerId).echoCount);
-            meterRegistry.gauge("sudokupro.fate.timeline_rank", playerId, Map.of("player", playerId), fateEngine.getFate(playerId).timelineRank);
-            meterRegistry.gauge("sudokupro.fate.chaos_affinity", playerId, Map.of("player", playerId), fateEngine.getFate(playerId).chaosAffinity);
-            meterRegistry.gauge("sudokupro.fate.luck_curve", playerId, Map.of("player", playerId), fateEngine.getFate(playerId).luckCurve);
-            meterRegistry.gauge("sudokupro.fate.merge_density", playerId, Map.of("player", playerId), fateEngine.getFate(playerId).mergeDensity);
-            meterRegistry.gauge("sudokupro.fate.ascension_score", playerId, Map.of("player", playerId), fateEngine.getFate(playerId).ascensionScore);
+            FateSignature fate = fateEngine.getFate(playerId);
+            meterRegistry.gauge("sudokupro.fate.karma_weight",   fate.karmaWeight);
+            meterRegistry.gauge("sudokupro.fate.echo_count",     fate.echoCount);
+            meterRegistry.gauge("sudokupro.fate.timeline_rank",  fate.timelineRank);
+            meterRegistry.gauge("sudokupro.fate.chaos_affinity", fate.chaosAffinity);
+            meterRegistry.gauge("sudokupro.fate.luck_curve",     fate.luckCurve);
+            meterRegistry.gauge("sudokupro.fate.merge_density",  fate.mergeDensity);
+            meterRegistry.gauge("sudokupro.fate.ascension_score",fate.ascensionScore);
         });
     }
 
@@ -874,8 +879,9 @@ public class SudokuHealthMonitor {
             int emptyCells = estimateEmptyCells(board);
             long solveTime = board.getSolveTime().toSeconds();
             int cosmicPoints = gameService.getPlayerCosmicPoints(board.getPlayerId());
+            long timeRemaining = Math.max(0L, board.getTimeLimitSeconds() - solveTime);
             logger.info("Game {} health - Empty Cells: {}, Lives: {}, TimeRemaining: {}s, SolveTime: {}s, CosmicPoints: {}",
-                gameId, emptyCells, board.getLives(), board.getTimeRemaining(), solveTime, cosmicPoints);
+                gameId, emptyCells, board.getLives(), timeRemaining, solveTime, cosmicPoints);
             meterRegistry.gauge("sudokupro.game.empty_cells", emptyCells);
             meterRegistry.gauge("sudokupro.game.solve_time_s", solveTime);
             meterRegistry.gauge("sudokupro.game.cosmic_points", cosmicPoints);
@@ -890,12 +896,12 @@ public class SudokuHealthMonitor {
 
     public void recordPlayerPing(String playerId, long pingMs) {
         playerPingTimes.put(playerId, pingMs);
-        meterRegistry.gauge("sudokupro.player.ping_ms", playerId, Map.of("player", playerId), pingMs);
+        meterRegistry.gauge("sudokupro.player.ping_ms", pingMs);
     }
 
     public void recordGameDifficulty(String gameId, int difficulty) {
         gameDifficultyStats.put(gameId, difficulty);
-        meterRegistry.gauge("sudokupro.game.difficulty", gameId, Map.of("game", gameId), difficulty);
+        meterRegistry.gauge("sudokupro.game.difficulty", difficulty);
     }
 
     public void printPlayerHistory(String playerId) {
@@ -1174,7 +1180,7 @@ public class SudokuHealthMonitor {
             this.contextTag = contextTag;
             this.luck = chaosEngine.getPlayerLuck(playerId);
             this.lives = 3; // Default lives
-            this.power = rng.nextDouble(0, 1); // Random initial power
+            this.power = rng.nextDoubleRange(0, 1); // Random initial power
             this.bindingEvent = "Created in " + contextTag;
             applyModifiers();
         }
@@ -1280,7 +1286,7 @@ public class SudokuHealthMonitor {
                                double curveDelta, int mergeDelta, int ascensionDelta) {
             FateSignature fate = getFate(playerId);
             fate.update(event, karmaDelta, echoDelta, affinityDelta, curveDelta, mergeDelta, ascensionDelta);
-            broadcastToTribunal(playerId, event);
+            logger.info("[TRIBUNAL] Fate event '{}' recorded for player {}", event, playerId);
             logger.debug("Fate updated for {}: {}", playerId, fate);
             if (fate.mergeDensity >= 2 && fate.timelineRank == 1 && "BIGDAWGS".equals(playerId)) {
                 speak("BIGDAWGS stands as ECHO PRIMUS... one fusion seals your myth.");
@@ -1328,7 +1334,7 @@ public class SudokuHealthMonitor {
                     speak("SilentVortex merges with " + playerId + "... clarity floods your mind.");
                     break;
                 case "RedJester":
-                    chaosEngine.updateLuck(playerId, rng.nextDouble(-0.5, 0.5));
+                    chaosEngine.updateLuck(playerId, rng.nextDoubleRange(-0.5, 0.5));
                     fate.update("RedJesterFusion", 0, -1, 0.777, 0.2, 1, 300);
                     memoryBank.recordEvent(playerId, "Merged with RedJester", 0.0);
                     speak("RedJester joins " + playerId + "... chaos laughs in your veins.");
@@ -1469,13 +1475,58 @@ public class SudokuHealthMonitor {
             }
         }
 
-     public String getFateJson(String playerId) {
-    try {
-        return new com.fasterxml.jackson.databind.ObjectMapper().writeValueAsString(fate);
-    } catch (Exception e) {
-        logger.error("Failed to serialize FATE for {}: {}", playerId, e.getMessage());
-        return "{\"error\": \"FATE serialization failed\"}";
+        public String getFateJson(String playerId) {
+            try {
+                return new com.fasterxml.jackson.databind.ObjectMapper().writeValueAsString(getFate(playerId));
+            } catch (Exception e) {
+                logger.error("Failed to serialize FATE for {}: {}", playerId, e.getMessage());
+                return "{\"error\": \"FATE serialization failed\"}";
+            }
+        }
     }
-}
-} 
+
+    /**
+     * Per-player fate record used by FateEngine and health metrics.
+     * Fields are public for direct gauge access and JSON serialisation.
+     */
+    public static class FateSignature {
+        public final String playerId;
+        public int    karmaWeight   = 0;
+        public int    echoCount     = 0;
+        public int    timelineRank  = 0;
+        public double chaosAffinity = 0.0;
+        public double luckCurve     = 0.5;
+        public int    mergeDensity  = 0;
+        public int    ascensionScore= 0;
+        private final List<String> eventLog = new ArrayList<>();
+
+        public FateSignature(String playerId) {
+            this.playerId = playerId;
+        }
+
+        public void update(String event, int karmaDelta, int echoDelta, double affinityDelta,
+                           double curveDelta, int mergeDelta, int ascensionDelta) {
+            karmaWeight    = Math.max(-1000, Math.min(1000, karmaWeight    + karmaDelta));
+            echoCount      = Math.max(0, echoCount      + echoDelta);
+            timelineRank   = Math.max(0, timelineRank);
+            chaosAffinity  = Math.max(0.0, Math.min(1.0, chaosAffinity  + affinityDelta));
+            luckCurve      = Math.max(0.0, Math.min(1.0, luckCurve      + curveDelta));
+            mergeDensity   = Math.max(0, mergeDensity   + mergeDelta);
+            ascensionScore = Math.max(0, ascensionScore + ascensionDelta);
+            if (eventLog.size() < 100) eventLog.add(event);
+        }
+
+        public void updateFromState(double moveEntropy, int livesUsed, double karma, int timelineCount) {
+            chaosAffinity  = Math.max(0.0, Math.min(1.0, chaosAffinity + moveEntropy * 0.01));
+            luckCurve      = Math.max(0.0, Math.min(1.0, luckCurve     - livesUsed   * 0.05));
+            karmaWeight    = (int) Math.max(-1000, Math.min(1000, karmaWeight + karma * 10));
+            echoCount      = Math.max(echoCount, timelineCount);
+        }
+
+        @Override
+        public String toString() {
+            return "FateSignature{player=" + playerId + ", karma=" + karmaWeight +
+                   ", echoes=" + echoCount + ", ascension=" + ascensionScore + "}";
+        }
+    }
 }

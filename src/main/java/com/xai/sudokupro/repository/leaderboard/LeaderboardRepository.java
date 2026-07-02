@@ -7,6 +7,7 @@ import org.springframework.data.domain.Pageable;
 import org.springframework.data.jpa.repository.EntityGraph;
 import org.springframework.data.jpa.repository.JpaRepository;
 import org.springframework.data.jpa.repository.Query;
+import org.springframework.data.repository.NoRepositoryBean;
 import org.springframework.data.repository.query.Param;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -17,7 +18,12 @@ import java.util.Map;
 /**
  * Cosmic leaderboard oracle of SudokuPro.
  * Ranks grid warriors by points, duels, drip, and hype with galactic-tier JPA precision.
+ *
+ * <p>Marked {@code @NoRepositoryBean} so Spring Data JPA does not instantiate it as a
+ * standalone bean. It is composed into {@link com.xai.sudokupro.repository.UserRepository}
+ * which provides the single concrete implementation.
  */
+@NoRepositoryBean
 public interface LeaderboardRepository extends JpaRepository<User, Long> {
 
     @EntityGraph(attributePaths = {"matchHistory"})
@@ -87,8 +93,13 @@ public interface LeaderboardRepository extends JpaRepository<User, Long> {
     List<User> findActiveStreakCosmonauts(@Param("minStreak") int minStreak, @Param("since") LocalDateTime since, Pageable pageable);
 
     @Transactional(readOnly = true)
-    @Query(value = "SELECT u.username AS username, u.level AS level, u.points AS points, u.duel_wins AS duelWins, " +
-           "u.cosmic_drip AS cosmicDrip, u.hype_meter AS hypeMeter " +
+    @Query(value = "SELECT u.username AS username, u.level AS level, u.points AS points, " +
+           "u.duel_wins AS duelWins, u.cosmic_drip AS cosmicDrip, u.hype_meter AS hypeMeter, " +
+           "u.streak AS streak, u.fan_count AS fanCount, u.xp AS xp, u.last_login AS lastLogin, " +
+           "CASE WHEN (u.duel_wins + u.duel_losses) > 0 " +
+           "     THEN CAST(u.duel_wins AS FLOAT) / (u.duel_wins + u.duel_losses) " +
+           "     ELSE 0.0 END AS winRate, " +
+           "(SELECT COUNT(*) FROM user_achievements ua WHERE ua.user_id = u.id) AS achievementCount " +
            "FROM users u " +
            "ORDER BY (u.points * 0.5 + u.duel_wins * 1.5 + u.cosmic_drip * 0.8 + u.hype_meter * 0.7) DESC",
            nativeQuery = true)

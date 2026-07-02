@@ -1,6 +1,8 @@
 package com.xai.sudokupro.config;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.SerializationFeature;
+import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
 import com.xai.sudokupro.model.SudokuBoard;
 import com.xai.sudokupro.model.User;
 import com.xai.sudokupro.service.LeaderboardService;
@@ -13,12 +15,12 @@ import org.springframework.data.redis.connection.RedisConnectionFactory;
 import org.springframework.data.redis.core.RedisTemplate;
 import org.springframework.data.redis.serializer.Jackson2JsonRedisSerializer;
 import org.springframework.data.redis.serializer.StringRedisSerializer;
+import org.springframework.retry.annotation.EnableRetry;
 import org.springframework.scheduling.annotation.EnableScheduling;
 import org.springframework.scheduling.concurrent.ThreadPoolTaskExecutor;
 import redis.clients.jedis.JedisPool;
 import redis.clients.jedis.JedisPoolConfig;
 
-import java.time.LocalDateTime;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executor;
 
@@ -28,6 +30,7 @@ import java.util.concurrent.Executor;
  */
 @Configuration
 @EnableScheduling
+@EnableRetry
 public class AppConfig {
 
     @Bean
@@ -46,7 +49,15 @@ public class AppConfig {
 
     @Bean
     @ConditionalOnMissingBean(ObjectMapper.class)
-    public ObjectMapper objectMapper() { return new ObjectMapper(); }
+    public ObjectMapper objectMapper() {
+        // AppConfig is component-scanned and runs before Spring Boot's JacksonAutoConfiguration,
+        // so this bean wins the @ConditionalOnMissingBean race. Register JavaTimeModule here so
+        // that LocalDateTime fields (e.g. SudokuBoard.startTime) serialize correctly in both
+        // Jackson2JsonRedisSerializer and the REST layer.
+        return new ObjectMapper()
+            .registerModule(new JavaTimeModule())
+            .disable(SerializationFeature.WRITE_DATES_AS_TIMESTAMPS);
+    }
 
     @Bean
     public ConcurrentHashMap<Long, String> playerStatsCache() { return new ConcurrentHashMap<>(); }
@@ -67,26 +78,18 @@ public class AppConfig {
 
     @Bean("redisTemplate")
     @ConditionalOnMissingBean(name = "redisTemplate")
-    public RedisTemplate<String, User> redisTemplate(RedisConnectionFactory cf) {
-        return buildTemplate(cf, User.class);
+    public RedisTemplate<String, User> redisTemplate(RedisConnectionFactory cf, ObjectMapper objectMapper) {
+        return buildTemplate(cf, User.class, objectMapper);
     }
 
     @Bean("gameStateRedisTemplate")
     @ConditionalOnMissingBean(name = "gameStateRedisTemplate")
-    public RedisTemplate<String, SudokuBoard> gameStateRedisTemplate(RedisConnectionFactory cf) {
-        return buildTemplate(cf, SudokuBoard.class);
+    public RedisTemplate<String, SudokuBoard> gameStateRedisTemplate(RedisConnectionFactory cf, ObjectMapper objectMapper) {
+        return buildTemplate(cf, SudokuBoard.class, objectMapper);
     }
 
-    @Bean("stringRedisTemplate")
-    @ConditionalOnMissingBean(name = "stringRedisTemplate")
-    public RedisTemplate<String, String> stringRedisTemplate(RedisConnectionFactory cf) {
-        RedisTemplate<String, String> t = new RedisTemplate<>();
-        t.setConnectionFactory(cf);
-        t.setKeySerializer(new StringRedisSerializer());
-        t.setValueSerializer(new StringRedisSerializer());
-        t.afterPropertiesSet();
-        return t;
-    }
+    // stringRedisTemplate intentionally omitted — Spring Boot's RedisAutoConfiguration
+    // provides it automatically. Defining it here caused a BeanDefinitionOverrideException.
 
     @Bean
     public Executor gameEventDispatcher() {
@@ -98,12 +101,10 @@ public class AppConfig {
     }
 
     @Bean
-    public Runnable leaderboardRefreshScheduler(LeaderboardService leaderboardService,
-                                                 RedisTemplate<String, User> redisTemplate) {
+    public Runnable leaderboardRefreshScheduler(LeaderboardService leaderboardService) {
         return () -> {
             try {
                 leaderboardService.refreshLeaderboard();
-                redisTemplate.opsForValue().set("leaderboard:lastRefresh", LocalDateTime.now().toString());
             } catch (Exception e) {
                 System.err.println("Leaderboard refresh failed: " + e.getMessage());
             }
@@ -111,13 +112,18 @@ public class AppConfig {
     }
 
     // ---- Private helper ----
-    private <T> RedisTemplate<String, T> buildTemplate(RedisConnectionFactory cf, Class<T> clazz) {
+    // Uses the Spring-managed ObjectMapper (auto-configured with JavaTimeModule by
+    // Spring Boot's JacksonAutoConfiguration) so that LocalDateTime fields in
+    // SudokuBoard can be serialized/deserialized without an InvalidDefinitionException.
+    private <T> RedisTemplate<String, T> buildTemplate(RedisConnectionFactory cf, Class<T> clazz,
+                                                        ObjectMapper objectMapper) {
+        Jackson2JsonRedisSerializer<T> valueSerializer = new Jackson2JsonRedisSerializer<>(objectMapper, clazz);
         RedisTemplate<String, T> t = new RedisTemplate<>();
         t.setConnectionFactory(cf);
         t.setKeySerializer(new StringRedisSerializer());
-        t.setValueSerializer(new Jackson2JsonRedisSerializer<>(clazz));
+        t.setValueSerializer(valueSerializer);
         t.setHashKeySerializer(new StringRedisSerializer());
-        t.setHashValueSerializer(new Jackson2JsonRedisSerializer<>(clazz));
+        t.setHashValueSerializer(valueSerializer);
         t.afterPropertiesSet();
         return t;
     }

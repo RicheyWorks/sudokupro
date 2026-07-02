@@ -18,7 +18,7 @@ import java.util.Objects;
 public class GameEvent {
 
     public enum EventType {
-        MOVE, HINT, SOLVE, JOIN, LEAVE;
+        MOVE, HINT, SOLVE, JOIN, LEAVE, SCORE;
 
         // Custom deserializer could be added if needed
     }

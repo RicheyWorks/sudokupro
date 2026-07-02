@@ -141,8 +141,10 @@ public class AntiCheatEngine {
 
         int cosmicMoves = (int) board.getMoveHistory().stream()
             .filter(m -> {
-                SudokuCell cell = board.getCell(m.row(), m.col());
-                return cell != null && cell.getStrategy() == SudokuCell.Strategy.COSMIC;
+                // Hint sentinel moves use row=-1, col=-1 — skip out-of-bounds coords
+                // to avoid ArrayIndexOutOfBoundsException inside getCell().
+                if (m.row() < 0 || m.row() >= 9 || m.col() < 0 || m.col() >= 9) return false;
+                return board.getCell(m.row(), m.col()).getStrategy() == SudokuCell.Strategy.COSMIC;
             })
             .count();
 
@@ -188,55 +190,94 @@ public class AntiCheatEngine {
         });
     }
 
+    /** Returns a snapshot of per-player move rates (moves counted in current window). */
+    public synchronized Map<String, Integer> getMoveRates() {
+        Map<String, Integer> snapshot = new HashMap<>();
+        moveRates.forEach((k, v) -> snapshot.put(k, v.get()));
+        return snapshot;
+    }
+
+    public synchronized Map<String, Integer> getCosmicStreaks() {
+        return new HashMap<>(cosmicStreaks);
+    }
+
+    public synchronized Map<String, Map<String, Integer>> getIPSolveCounts() {
+        return new HashMap<>(ipSolveCounts);
+    }
+
+    public synchronized Map<String, Map<String, LocalDateTime>> getDeviceSwitches() {
+        return new HashMap<>(deviceSwitches);
+    }
+
     public synchronized void recordMove(String playerId, boolean isCosmic) {
         LocalDateTime now = LocalDateTime.now();
-        LocalDateTime windowStart = moveRateWindowStart.get(playerId);
-
-        // Reset counter if we've entered a new 60-second window
-        if (windowStart == null || now.isAfter(windowStart.plusSeconds(60))) {
-            moveRates.put(playerId, new AtomicInteger(0));
+        LocalDateTime windowStart = moveRateWindowStart.computeIfAbsent(playerId, k -> now);
+        // Reset counter if outside the 60-second window
+        if (now.isAfter(windowStart.plusSeconds(60))) {
+            moveRates.put(playerId, new AtomicInteger(1));
             moveRateWindowStart.put(playerId, now);
+        } else {
+            moveRates.computeIfAbsent(playerId, k -> new AtomicInteger(0)).incrementAndGet();
         }
-
-        moveRates.computeIfAbsent(playerId, k -> new AtomicInteger(0)).incrementAndGet();
-
+        lastMoveTimestamps.put(playerId, now);
         if (isCosmic) {
             cosmicMoveRates.computeIfAbsent(playerId, k -> new AtomicInteger(0)).incrementAndGet();
+            cosmicStreaks.merge(playerId, 1, Integer::sum);
+        } else {
+            cosmicStreaks.put(playerId, 0);
         }
+        trimMaps();
+    }
+
+    public synchronized void clearPlayerSuspicion(String playerId) {
+        suspicionScoreMap.remove(playerId);
+        consecutiveSolves.remove(playerId);
+        lastSolveTimes.remove(playerId);
+        moveRates.remove(playerId);
+        moveRateWindowStart.remove(playerId);
+        lastMoveTimestamps.remove(playerId);
+        cosmicStreaks.remove(playerId);
+        cosmicMoveRates.remove(playerId);
+        logger.info("Cleared suspicion data for player {}", playerId);
     }
 
     private int estimateDifficulty(SudokuBoard board) {
-        return board.getMoveHistory().size() / 10;
+        int filled = 0;
+        SudokuCell[][] cells = board.getBoard();
+        for (int r = 0; r < 9; r++)
+            for (int c = 0; c < 9; c++)
+                if (cells[r][c].isGiven()) filled++;
+        // More givens = easier — map to difficulty 1-5 (inverse of filled count)
+        if (filled >= 50) return 1;
+        if (filled >= 44) return 2;
+        if (filled >= 38) return 3;
+        if (filled >= 32) return 4;
+        return 5;
     }
 
     private void validatePlayerId(String playerId) {
         if (playerId == null || playerId.isBlank()) {
-            throw new IllegalArgumentException("Invalid playerId");
+            throw new IllegalArgumentException("Player ID cannot be null or blank");
         }
     }
 
     private void trimMaps() {
-        trim(lastSolveTimes);
-        trim(consecutiveSolves);
-        trim(moveRates);
-        trim(moveRateWindowStart);
-        trim(lastMoveTimestamps);
-        trim(cosmicConsistency);
-        trim(cosmicMoveRates);
-        trim(ipSolveCounts);
-        trim(cosmicStreaks);
-        trim(movePatterns);
-        trim(deviceSwitches);
-        trim(suspicionScoreMap);
+        trimMap(suspicionScoreMap);
+        trimMap(consecutiveSolves);
+        trimMap(lastSolveTimes);
+        trimMap(moveRates);
+        trimMap(moveRateWindowStart);
+        trimMap(lastMoveTimestamps);
+        trimMap(cosmicStreaks);
+        trimMap(cosmicConsistency);
+        trimMap(ipSolveCounts);
+        trimMap(deviceSwitches);
+        trimMap(movePatterns);
     }
 
-    private <K, V> void trim(Map<K, V> map) {
+    private <K, V> void trimMap(Map<K, V> map) {
         while (map.size() > MAX_CACHE_SIZE) {
-            Iterator<K> it = map.keySet().iterator();
-            if (it.hasNext()) {
-                it.next();
-                it.remove();
-            }
+            map.remove(map.keySet().iterator().next());
         }
     }
 }

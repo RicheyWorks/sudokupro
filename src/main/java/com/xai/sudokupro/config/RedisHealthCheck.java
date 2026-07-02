@@ -4,6 +4,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.boot.actuate.health.Health;
 import org.springframework.boot.actuate.health.HealthIndicator;
+import org.springframework.boot.actuate.health.Status;
 import org.springframework.context.annotation.Profile;
 import org.springframework.data.redis.connection.RedisConnection;
 import org.springframework.data.redis.connection.RedisConnectionFactory;
@@ -67,6 +68,6 @@ public class RedisHealthCheck implements HealthIndicator {
 
     // Legacy method for direct boolean checks if needed
     public boolean isRedisHealthy() {
-        return health().getStatus().equals(Health.Status.UP);
+        return health().getStatus().equals(Status.UP);
     }
 }

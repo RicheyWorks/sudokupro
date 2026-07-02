@@ -30,12 +30,6 @@ public class SudokuGenerator {
         logger.info("SudokuGenerator initialized with SecureRandomGenerator");
     }
 
-    public SudokuGenerator(long seed) {
-        this.rand = new SecureRandomGenerator();
-        rand.setSeed(seed);
-        logger.info("SudokuGenerator initialized with seed: {}", seed);
-    }
-
     public SudokuBoard generate(Constants.Difficulty difficulty, boolean chaosMode, boolean mirrorMode, long seed) {
         return generate(difficulty, chaosMode, mirrorMode, seed, false, false, 0);
     }
@@ -119,7 +113,7 @@ public class SudokuGenerator {
         if (col == size) return solveSudoku(board, row + 1, 0, depth - 1);
         if (board[row][col].getValue() != 0) return solveSudoku(board, row, col + 1, depth - 1);
 
-        List<Integer> numbers = SecureRandomGenerator.getShuffledNumbers(1, 9, rand);
+        List<Integer> numbers = rand.getShuffledNumbers(1, 9);
         for (int num : numbers) {
             if (isValidMove(board, row, col, num)) {
                 board[row][col].setValue(num, SudokuCell.MoveSource.INITIAL);
@@ -193,7 +187,8 @@ public class SudokuGenerator {
 
     private void applyChaosTwist(SudokuCell[][] board) {
         int swaps = Constants.CHAOS_MODE_SWAPS;
-        while (swaps > 0) {
+        int maxAttempts = swaps * size * 2; // hard cap to prevent infinite loop
+        while (swaps > 0 && maxAttempts-- > 0) {
             int row1 = rand.nextInt(size);
             int col1 = rand.nextInt(size);
             int row2 = rand.nextInt(size);
@@ -208,6 +203,9 @@ public class SudokuGenerator {
                 generationLog.add("Chaos swap: (" + row1 + "," + col1 + ") <-> (" + row2 + "," + col2 + ")");
             }
         }
+        if (maxAttempts <= 0 && swaps > 0) {
+            logger.warn("applyChaosTwist: could not complete all {} swaps — no eligible cells found", swaps);
+        }
     }
 
     private void applyMirrorSymmetry(SudokuCell[][] board) {
@@ -216,21 +214,35 @@ public class SudokuGenerator {
             for (int j = 0; j < size; j++) {
                 if (symmetryType == 1) { // Vertical symmetry
                     int mirroredRow = size - 1 - i;
-                    if (board[mirroredRow][j].getValue() != 0 && !isValidMove(board, i, j, board[mirroredRow][j].getValue())) {
+                    int mirrorVal = board[mirroredRow][j].getValue();
+                    // Bug B fix: never call setValue(0) on a cell that is already a given.
+                    // If the mirror source is empty and the target is a given, skip this cell
+                    // entirely rather than blanking out a clue.
+                    if (mirrorVal == 0 && board[i][j].isGiven()) {
+                        logger.warn("Mirror would blank a given at ({},{}); skipping", i, j);
+                        continue;
+                    }
+                    if (mirrorVal != 0 && !isValidMove(board, i, j, mirrorVal)) {
                         logger.warn("Invalid mirror move at ({},{}); skipping", i, j);
                         continue;
                     }
-                    board[i][j].setValue(board[mirroredRow][j].getValue(), SudokuCell.MoveSource.INITIAL);
+                    board[i][j].setValue(mirrorVal, SudokuCell.MoveSource.INITIAL);
                     board[i][j].setGiven(board[mirroredRow][j].isGiven());
                     logger.debug("Mirrored vertically: ({},{}) -> ({},{})", mirroredRow, j, i, j);
                     generationLog.add("Mirrored vertically: (" + mirroredRow + "," + j + ") -> (" + i + "," + j + ")");
                 } else { // Horizontal symmetry
                     int mirroredCol = size - 1 - j;
-                    if (board[i][mirroredCol].getValue() != 0 && !isValidMove(board, i, j, board[i][mirroredCol].getValue())) {
+                    int mirrorVal = board[i][mirroredCol].getValue();
+                    // Bug B fix: same guard as above for horizontal axis.
+                    if (mirrorVal == 0 && board[i][j].isGiven()) {
+                        logger.warn("Mirror would blank a given at ({},{}); skipping", i, j);
+                        continue;
+                    }
+                    if (mirrorVal != 0 && !isValidMove(board, i, j, mirrorVal)) {
                         logger.warn("Invalid mirror move at ({},{}); skipping", i, j);
                         continue;
                     }
-                    board[i][j].setValue(board[i][mirroredCol].getValue(), SudokuCell.MoveSource.INITIAL);
+                    board[i][j].setValue(mirrorVal, SudokuCell.MoveSource.INITIAL);
                     board[i][j].setGiven(board[i][mirroredCol].isGiven());
                     logger.debug("Mirrored horizontally: ({},{}) -> ({},{})", i, mirroredCol, i, j);
                     generationLog.add("Mirrored horizontally: (" + i + "," + mirroredCol + ") -> (" + i + "," + j + ")");
@@ -241,7 +253,8 @@ public class SudokuGenerator {
 
     private void applyCosmicDrip(SudokuCell[][] board, int cosmicDripFactor) {
         int dripCount = Math.min(cosmicDripFactor * 3, size * size / 4); // Cap at 25% of board
-        while (dripCount > 0) {
+        int maxAttempts = dripCount * size * 2; // hard cap to prevent infinite loop
+        while (dripCount > 0 && maxAttempts-- > 0) {
             int row = rand.nextInt(size);
             int col = rand.nextInt(size);
             if (board[row][col].getValue() == 0) {
@@ -251,7 +264,7 @@ public class SudokuGenerator {
                 }
                 if (!possibles.isEmpty()) {
                     int dripValue = possibles.get(rand.nextInt(possibles.size()));
-                    SudokuCell.Strategy dripStyle = rand.nextBoolean() ? SudokuCell.Strategy.COSMIC : SudokuCell.Strategy.STARFORGE;
+                    SudokuCell.Strategy dripStyle = rand.flipCoin() ? SudokuCell.Strategy.COSMIC : SudokuCell.Strategy.STARFORGE;
                     board[row][col].setValue(dripValue, SudokuCell.MoveSource.AUTOSOLVE, dripStyle);
                     cosmicSignatures.put(row + "," + col, new CosmicSignature(dripValue, dripStyle));
                     logger.debug("Cosmic drip at ({},{}): {} ({})", row, col, dripValue, dripStyle);
@@ -259,6 +272,9 @@ public class SudokuGenerator {
                     dripCount--;
                 }
             }
+        }
+        if (maxAttempts <= 0 && dripCount > 0) {
+            logger.warn("applyCosmicDrip: could not place all drip cells — {} remaining after max attempts", dripCount);
         }
     }
 
@@ -327,6 +343,7 @@ public class SudokuGenerator {
             case EASY -> 2;
             case MEDIUM -> 1;
             case HARD -> 0;
+            default -> 0;
         };
         long timeLimit = baseTime * (difficultyFactor + 1);
         logger.debug("Calculated time limit: {}s (chaos: {}, difficulty: {})", timeLimit, chaosMode, difficulty);
@@ -479,7 +496,7 @@ public class SudokuGenerator {
             case "diagonal":
                 for (int i = 0; i < size; i++) {
                     if (board[i][i].getValue() == 0) {
-                        int value = rand.nextInt(1, 10);
+                        int value = rand.nextIntRange(1, 9);
                         if (isValidMove(board, i, i, value)) {
                             board[i][i].setValue(value, SudokuCell.MoveSource.AUTOSOLVE, SudokuCell.Strategy.STARFORGE);
                             cosmicSignatures.put(i + "," + i, new CosmicSignature(value, SudokuCell.Strategy.STARFORGE));
@@ -493,7 +510,7 @@ public class SudokuGenerator {
                 int mid = size / 2;
                 for (int i = 0; i < size; i++) {
                     if (board[i][mid].getValue() == 0) {
-                        int value = rand.nextInt(1, 10);
+                        int value = rand.nextIntRange(1, 9);
                         if (isValidMove(board, i, mid, value)) {
                             board[i][mid].setValue(value, SudokuCell.MoveSource.AUTOSOLVE, SudokuCell.Strategy.COSMIC);
                             cosmicSignatures.put(i + "," + mid, new CosmicSignature(value, SudokuCell.Strategy.COSMIC));
@@ -502,7 +519,7 @@ public class SudokuGenerator {
                         }
                     }
                     if (board[mid][i].getValue() == 0) {
-                        int value = rand.nextInt(1, 10);
+                        int value = rand.nextIntRange(1, 9);
                         if (isValidMove(board, mid, i, value)) {
                             board[mid][i].setValue(value, SudokuCell.MoveSource.AUTOSOLVE, SudokuCell.Strategy.COSMIC);
                             cosmicSignatures.put(mid + "," + i, new CosmicSignature(value, SudokuCell.Strategy.COSMIC));
@@ -513,10 +530,25 @@ public class SudokuGenerator {
                 }
                 break;
             default:
-                logger.warn("Unknown cosmic pattern: {} - skipping", pattern);
-                generationLog.add("Unknown cosmic pattern: " + pattern + " - skipping");
+                logger.warn("Unknown cosmic signature pattern: {}", pattern);
         }
     }
 
-    public record CosmicSignature(int value, SudokuCell.Strategy style) {}
+    public static class CosmicSignature {
+        private final int value;
+        private final SudokuCell.Strategy strategy;
+
+        public CosmicSignature(int value, SudokuCell.Strategy strategy) {
+            this.value    = value;
+            this.strategy = strategy;
+        }
+
+        public int                getValue()   { return value; }
+        public SudokuCell.Strategy getStrategy() { return strategy; }
+
+        @Override
+        public String toString() {
+            return "CosmicSignature{value=" + value + ", strategy=" + strategy + "}";
+        }
+    }
 }

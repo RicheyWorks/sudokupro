@@ -103,11 +103,7 @@ public class BoardView {
                 TextField cell = createCell(row, col, cells[row][col]);
                 cellFields[row][col] = cell;
                 grid.add(cell, col, row);
-                // Box borders
-                String border = "";
-                if (row % 3 == 0) border += "-fx-border-width: 2 0 0 0; -fx-border-color: #FFD700;";
-                if (col % 3 == 0) border += "-fx-border-width: 0 0 0 2; -fx-border-color: #FFD700;";
-                if (!border.isEmpty()) cell.setStyle(cell.getStyle() + border);
+                // Box borders are now applied by updateCellStyle so they survive every refresh.
             }
         }
     }
@@ -285,20 +281,29 @@ public class BoardView {
         String pid = authService.getCurrentPlayerId();
         boolean solving = autoSolveToggle.isSelected();
         autoSolveToggle.setText("Auto-Solve: " + (solving ? "On" : "Off"));
-        if (solving) new Thread(() -> {
-            while (autoSolveToggle.isSelected() && !board.isSolved()) {
-                try {
-                    gameService.solveSudoku(board.getGameId());
-                    Platform.runLater(this::refresh);
-                    Thread.sleep(500);
-                } catch (Exception e) {
-                    logger.error("Auto-solve error: {}", e.getMessage());
-                    break;
+        if (solving) {
+            Thread autoSolveThread = new Thread(() -> {
+                while (autoSolveToggle.isSelected() && !board.isSolved()) {
+                    try {
+                        gameService.solveSudoku(board.getGameId());
+                        Platform.runLater(this::refresh);
+                        Thread.sleep(500);
+                    } catch (Exception e) {
+                        logger.error("Auto-solve error: {}", e.getMessage());
+                        // Reset the toggle so the user can see solving stopped.
+                        Platform.runLater(() -> {
+                            autoSolveToggle.setSelected(false);
+                            autoSolveToggle.setText("Auto-Solve: Off");
+                        });
+                        break;
+                    }
                 }
-            }
-            if (board.isSolved()) Platform.runLater(() ->
-                notificationService.sendTypedNotification(pid, "game", "Puzzle auto-solved!"));
-        }).start();
+                if (board.isSolved()) Platform.runLater(() ->
+                    notificationService.sendTypedNotification(pid, "game", "Puzzle auto-solved!"));
+            });
+            autoSolveThread.setDaemon(true);
+            autoSolveThread.start();
+        }
     }
 
     private void resolveConflicts() {
@@ -339,30 +344,53 @@ public class BoardView {
         String text = sc.getValue() == 0
             ? (sc.getPencilMarks().isEmpty() ? "" : formatPencilMarks(sc.getPencilMarks()))
             : String.valueOf(sc.getValue());
-        // Bug 2 fix: set guard before setText so the text listener ignores the programmatic update
-        if (!cell.getText().equals(text)) {
-            Platform.runLater(() -> {
+        // Both setText and setStyle/setFont must run on the JavaFX Application Thread.
+        // Batch them in a single Platform.runLater so the guard flag is also set on-thread.
+        Platform.runLater(() -> {
+            if (!cell.getText().equals(text)) {
                 updatingCell.set(true);
                 try {
                     cell.setText(text);
                 } finally {
                     updatingCell.set(false);
                 }
-            });
-        }
-        updateCellStyle(cell, row, col);
+            }
+            updateCellStyle(cell, row, col);
+        });
     }
 
     private void updateCellStyle(TextField cell, int row, int col) {
         SudokuCell sc = board.getBoard()[row][col];
         StringBuilder style = new StringBuilder(difficultyStyle(board.getDifficulty()) + "-fx-alignment: center;");
-        if (sc.isConflicted())                            style.append("-fx-background-color: #FF5555;");
-        else if (sc.isGiven())                            style.append("-fx-background-color: #4B4B4B;");
-        else if (!sc.getPencilMarks().isEmpty())          style.append("-fx-background-color: #2F2F5F;");
-        else if (row == highlightedRow || col == highlightedCol) style.append("-fx-background-color: #3A3A6A;");
-        else                                              style.append("-fx-background-color: #1E1E1E;");
-        if (row == highlightedRow && col == highlightedCol)
-            style.append("-fx-border-color: #FF00FF; -fx-border-width: 2;");
+
+        // Background — priority order: conflict > given > pencil > highlight > default
+        if (sc.isConflicted())
+            style.append("-fx-background-color: #FF5555;");
+        else if (sc.isGiven())
+            style.append("-fx-background-color: #4B4B4B;");
+        else if (!sc.getPencilMarks().isEmpty())
+            style.append("-fx-background-color: #2F2F5F;");
+        else if (row == highlightedRow || col == highlightedCol)
+            style.append("-fx-background-color: #3A3A6A;");
+        else
+            style.append("-fx-background-color: #1E1E1E;");
+
+        // 3×3 box borders — re-applied every time so they survive style rebuilds.
+        // Corner cells (both row%3==0 and col%3==0) get combined top+left border.
+        if (row == highlightedRow && col == highlightedCol) {
+            // Selected cell: highlight border overrides box border colour.
+            String topW  = (row % 3 == 0) ? "2" : "0";
+            String leftW = (col % 3 == 0) ? "2" : "0";
+            style.append(String.format(
+                "-fx-border-width: %s 0 0 %s; -fx-border-color: #FF00FF #FFD700 #FFD700 #FF00FF;",
+                topW, leftW));
+        } else {
+            String topW  = (row % 3 == 0) ? "2" : "0";
+            String leftW = (col % 3 == 0) ? "2" : "0";
+            style.append(String.format("-fx-border-width: %s 0 0 %s; -fx-border-color: #FFD700;",
+                topW, leftW));
+        }
+
         cell.setStyle(style.toString());
         cell.setFont(Font.font("Arial", sc.getPencilMarks().isEmpty() ? 18 : 12));
     }
@@ -413,8 +441,10 @@ public class BoardView {
         for (int r = 0; r < GRID_SIZE; r++) for (int c = 0; c < GRID_SIZE; c++)
             if (cells[r][c].getValue() != 0) filled++;
         double p = (double) filled / (GRID_SIZE * GRID_SIZE);
-        Platform.runLater(() -> difficultyProgress.setProgress(p));
-        if (p == 1.0) animateSolvedCells();
+        Platform.runLater(() -> {
+            difficultyProgress.setProgress(p);
+            if (p == 1.0) animateSolvedCells();
+        });
     }
 
     private void animateSolvedCells() {
