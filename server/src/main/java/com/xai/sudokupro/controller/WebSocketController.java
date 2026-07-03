@@ -4,6 +4,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.xai.sudokupro.model.EnhancedMove;
 import com.xai.sudokupro.model.SudokuBoard;
 import com.xai.sudokupro.model.SudokuCell;
+import com.xai.sudokupro.model.api.BoardState;
 import com.xai.sudokupro.service.GameService;
 import com.xai.sudokupro.websocket.GameSessionRegistry;
 import com.xai.sudokupro.websocket.MultiplayerBroadcaster;
@@ -62,10 +63,11 @@ public class WebSocketController extends TextWebSocketHandler {
         playerMap.put(session, playerId);
         broadcaster.registerClient();
 
-        // Join the game named in the handshake (set by an interceptor / query param), or
-        // create a new one. Bug fix: the previous code invented its own UUID as the map key
-        // while createNewGame registered the board under a *different* internal gameId, so
-        // applyMove could never find the game. Always use the board's real gameId.
+        // Join the game named in the handshake (?gameId= query param, copied into the
+        // session attributes by GameIdHandshakeInterceptor), or create a new one. Bug fix:
+        // the previous code invented its own UUID as the map key while createNewGame
+        // registered the board under a *different* internal gameId, so applyMove could
+        // never find the game. Always use the board's real gameId.
         String requestedGameId = (String) session.getAttributes().get("gameId");
         SudokuBoard board;
         if (requestedGameId != null) {
@@ -120,6 +122,23 @@ public class WebSocketController extends TextWebSocketHandler {
                     }
                 }
                 case "join" -> broadcastToGame(gameId, session, buildEnvelope("join", playerId, payload));
+                case "chat" -> {
+                    String text = payload.get("payload") instanceof String s2 ? s2 : "";
+                    if (!text.isBlank()) {
+                        broadcastToGame(gameId, session, buildEnvelope("chat", playerId, text));
+                    }
+                }
+                case "undo" -> {
+                    SudokuBoard updated = gameService.undo(gameId);
+                    broadcastBoard(gameId, updated);
+                }
+                case "redo" -> {
+                    SudokuBoard updated = gameService.redo(gameId);
+                    broadcastBoard(gameId, updated);
+                }
+                // Full-state resync: sent only to the requesting session (e.g. after
+                // reconnect, or after a REST-side mutation like a hint or auto-solve).
+                case "sync" -> send(session, buildEnvelope("board", "server", BoardState.from(board)));
                 default -> {
                     logger.warn("Unknown type from {}: {}", playerId, type);
                     send(session, buildEnvelope("error", playerId,
@@ -164,6 +183,15 @@ public class WebSocketController extends TextWebSocketHandler {
     /** Sends to every session in the same game, excluding the sender. */
     private void broadcastToGame(String gameId, WebSocketSession sender, Map<String,Object> envelope) {
         sessionRegistry.broadcastToGame(gameId, sender, envelope);
+    }
+
+    /**
+     * Sends the authoritative board state to every session in the game,
+     * including the requester — undo/redo change state for all players.
+     */
+    private void broadcastBoard(String gameId, SudokuBoard board) {
+        sessionRegistry.broadcastToGame(gameId, null,
+            buildEnvelope("board", "server", BoardState.from(board)));
     }
 
     private void send(WebSocketSession session, Map<String,Object> envelope) throws IOException {

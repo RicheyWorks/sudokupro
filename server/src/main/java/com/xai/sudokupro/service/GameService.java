@@ -215,7 +215,7 @@ public class GameService {
     }
 
     // =====================================================================
-    // endGame / solveSudoku / rewind / reset / lock
+    // endGame / solveSudoku / undo / redo / rewind / reset / lock
     // =====================================================================
 
     public void endGame(String gameId, String playerId) {
@@ -242,6 +242,33 @@ public class GameService {
             SudokuBoard board = getGame(gameId);
             aiSolverService.solveSudoku(board);
             saveToRedis(gameId, board);
+        }
+    }
+
+    /**
+     * Undoes the last move on the server-authoritative board. Remote clients
+     * hold only a local copy, so undo/redo must round-trip through the server.
+     */
+    public SudokuBoard undo(String gameId) {
+        validateGameId(gameId);
+        try (var lock = gameLocks.lock(gameId)) {
+            SudokuBoard board = getGame(gameId);
+            board.undo();
+            saveToRedis(gameId, board);
+            gameRepository.save(board);
+            return board;
+        }
+    }
+
+    /** Redoes the last undone move on the server-authoritative board. */
+    public SudokuBoard redo(String gameId) {
+        validateGameId(gameId);
+        try (var lock = gameLocks.lock(gameId)) {
+            SudokuBoard board = getGame(gameId);
+            board.redo();
+            saveToRedis(gameId, board);
+            gameRepository.save(board);
+            return board;
         }
     }
 

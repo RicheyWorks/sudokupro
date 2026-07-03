@@ -1,6 +1,7 @@
 package com.xai.sudokupro.controller;
 
 import com.xai.sudokupro.model.SudokuBoard;
+import com.xai.sudokupro.model.api.BoardState;
 import com.xai.sudokupro.service.AuthService;
 import com.xai.sudokupro.service.GameService;
 import io.swagger.v3.oas.annotations.Operation;
@@ -21,6 +22,10 @@ import java.util.Map;
 
 /**
  * REST controller for SudokuPro's game logic.
+ *
+ * <p>Board-returning endpoints serialize {@link BoardState} — a player-visible
+ * projection — never the raw {@link SudokuBoard} entity. Moves flow over the
+ * WebSocket channel ({@code /ws/game}); REST covers game lifecycle and queries.
  */
 @RestController
 @RequestMapping("/api/game")
@@ -52,13 +57,15 @@ public class SudokuGameController {
     })
     @PostMapping("/new")
     public ResponseEntity<Object> createGame(
-            @RequestParam @Min(1) @Max(4) int difficulty) {
+            @RequestParam @Min(1) @Max(4) int difficulty,
+            @RequestParam(defaultValue = "false") boolean chaos,
+            @RequestParam(defaultValue = "false") boolean mirror) {
         try {
             // Use authenticated player ID; falls back to "anonymous" for unauthenticated callers.
             String playerId = authService.getCurrentPlayerId();
-            SudokuBoard board = gameService.createNewGame(difficulty, playerId, false, false);
+            SudokuBoard board = gameService.createNewGame(difficulty, playerId, chaos, mirror);
             logger.info("New game created: difficulty={} player={}", difficulty, playerId);
-            return ResponseEntity.ok(board);
+            return ResponseEntity.ok(BoardState.from(board));
         } catch (Exception e) {
             logger.error("Failed to create new game: {}", e.getMessage());
             return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
@@ -69,6 +76,42 @@ public class SudokuGameController {
                     "An error occurred while generating the game: " + e.getMessage()
                 ));
         }
+    }
+
+    @Operation(summary = "Get the current state of a game")
+    @ApiResponses({
+        @ApiResponse(responseCode = "200", description = "Game state returned"),
+        @ApiResponse(responseCode = "404", description = "Unknown game")
+    })
+    @GetMapping("/{gameId}")
+    public ResponseEntity<Object> getGame(@PathVariable String gameId) {
+        try {
+            return ResponseEntity.ok(BoardState.from(gameService.getGame(gameId)));
+        } catch (IllegalArgumentException e) {
+            return ResponseEntity.status(HttpStatus.NOT_FOUND)
+                .contentType(MediaType.APPLICATION_PROBLEM_JSON)
+                .body(buildProblem(GAME_CREATION_ERROR, "Unknown Game", e.getMessage()));
+        }
+    }
+
+    @Operation(summary = "Auto-solve the board with the AI solver")
+    @PostMapping("/{gameId}/solve")
+    public ResponseEntity<Object> solve(@PathVariable String gameId) {
+        try {
+            gameService.solveSudoku(gameId);
+            return ResponseEntity.ok(BoardState.from(gameService.getGame(gameId)));
+        } catch (IllegalArgumentException e) {
+            return ResponseEntity.status(HttpStatus.NOT_FOUND)
+                .contentType(MediaType.APPLICATION_PROBLEM_JSON)
+                .body(buildProblem(GAME_CREATION_ERROR, "Unknown Game", e.getMessage()));
+        }
+    }
+
+    @Operation(summary = "End (leave) a game; final state is persisted server-side")
+    @PostMapping("/{gameId}/end")
+    public ResponseEntity<Void> end(@PathVariable String gameId) {
+        gameService.endGame(gameId, authService.getCurrentPlayerId());
+        return ResponseEntity.noContent().build();
     }
 
     @Operation(summary = "Get a hint from the AI solver")
@@ -110,8 +153,7 @@ public class SudokuGameController {
         return Map.of("type", type, "title", title, "detail", detail);
     }
 
-    // Save/load/move/validate REST endpoints were removed (AUDIT P1-3): the /save
-    // stub claimed success while persisting nothing. Reintroduce only with a real
-    // implementation; gameplay currently runs over the WebSocket channel.
+    // The old /save stub was removed (AUDIT P1-3): it claimed success while
+    // persisting nothing. Lifecycle is now: POST /new, GET /{id}, POST /{id}/solve,
+    // POST /{id}/end; moves run over the WebSocket channel.
 }
-

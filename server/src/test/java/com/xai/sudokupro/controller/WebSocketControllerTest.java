@@ -18,6 +18,7 @@ import java.util.HashMap;
 import java.util.Map;
 
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.argThat;
 import static org.mockito.ArgumentMatchers.anyBoolean;
 import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.ArgumentMatchers.anyString;
@@ -31,6 +32,7 @@ import static org.mockito.Mockito.when;
 /**
  * Regression tests for AUDIT P0-1: unauthenticated WebSocket connections must be
  * rejected, and game state must live in GameService (not a controller-local map).
+ * Also covers the remote-client protocol types: chat, undo/redo, sync.
  */
 @ExtendWith(MockitoExtension.class)
 class WebSocketControllerTest {
@@ -77,6 +79,66 @@ class WebSocketControllerTest {
         org.junit.jupiter.api.Assertions.assertEquals("real-game-id", attributes.get("gameId"));
         verify(broadcaster).registerClient();
         verify(session, never()).close(any(CloseStatus.class));
+    }
+
+    @Test
+    void undoRoundTripsThroughServerAndBroadcastsBoard() throws Exception {
+        WebSocketSession live = connectedSession("richmond");
+
+        controller.handleTextMessage(live,
+            new org.springframework.web.socket.TextMessage("{\"type\":\"undo\"}"));
+
+        verify(gameService).undo("real-game-id");
+        // The requester (and everyone else in the game) receives the fresh board.
+        verify(live).sendMessage(argThat(msg ->
+            ((org.springframework.web.socket.TextMessage) msg).getPayload().contains("\"type\":\"board\"")));
+    }
+
+    @Test
+    void syncSendsBoardToRequester() throws Exception {
+        WebSocketSession live = connectedSession("richmond");
+
+        controller.handleTextMessage(live,
+            new org.springframework.web.socket.TextMessage("{\"type\":\"sync\"}"));
+
+        verify(live).sendMessage(argThat(msg ->
+            ((org.springframework.web.socket.TextMessage) msg).getPayload().contains("\"type\":\"board\"")));
+    }
+
+    @Test
+    void chatIsRelayedWithoutTouchingGameState() throws Exception {
+        WebSocketSession live = connectedSession("richmond");
+
+        controller.handleTextMessage(live,
+            new org.springframework.web.socket.TextMessage("{\"type\":\"chat\",\"payload\":\"gg\"}"));
+
+        verify(gameService, never()).undo(anyString());
+        verify(gameService, never()).applyMove(anyString(), any(), anyString());
+        // No error envelope back to the sender.
+        verify(live, never()).sendMessage(argThat(msg ->
+            ((org.springframework.web.socket.TextMessage) msg).getPayload().contains("\"type\":\"error\"")));
+    }
+
+    /** Connects an authenticated session bound to a real (serializable) board. */
+    private WebSocketSession connectedSession(String player) throws Exception {
+        WebSocketSession live = mock(WebSocketSession.class);
+        Map<String, Object> attrs = new HashMap<>();
+        lenient().when(live.getAttributes()).thenReturn(attrs);
+        lenient().when(live.getId()).thenReturn("sess-live");
+        lenient().when(live.isOpen()).thenReturn(true);
+        Principal principal = () -> player;
+        lenient().when(live.getPrincipal()).thenReturn(principal);
+
+        SudokuBoard board = new SudokuBoard(1, false, false, 0, "real-game-id");
+        board.setPlayerId(player);
+        lenient().when(gameService.createNewGame(anyInt(), eq(player), anyBoolean(), anyBoolean()))
+            .thenReturn(board);
+        lenient().when(gameService.getGame("real-game-id")).thenReturn(board);
+        lenient().when(gameService.undo("real-game-id")).thenReturn(board);
+        lenient().when(gameService.redo("real-game-id")).thenReturn(board);
+
+        controller.afterConnectionEstablished(live);
+        return live;
     }
 
     @Test
