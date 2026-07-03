@@ -2,14 +2,20 @@
 
 A multiplayer Sudoku platform with real-time duels, daily challenges, leaderboards, and an anti-cheat engine. Spring Boot 3.2 backend, JavaFX desktop client, deployable to Docker or Kubernetes (multi-replica ready).
 
+```
+JavaFX client ──REST /api/** + WebSocket /ws/game──▶ Spring Boot server ──▶ PostgreSQL
+                                                            │
+                                                            └──▶ Redis (cache, locks, cross-replica pub/sub)
+```
+
 ---
 
 ## Modules
 
 ```
 sudokupro/
-├── model/    Shared domain: board, cells, moves, generator, constants.
-│             No web, no JavaFX — JPA/validation annotations only.
+├── model/    Shared domain: board, cells, moves, generator, constants,
+│             and the wire records (model.api). No web, no JavaFX.
 ├── server/   Spring Boot backend. Produces the deployable boot jar
 │             (sudokupro-server-*-exec.jar). All tests live here.
 └── client/   JavaFX desktop app. Owns all JavaFX dependencies and the
@@ -27,7 +33,7 @@ sudokupro/
 - **Leaderboards** — points, cosmic drip, hype meter, duel wins, combined skill score
 - **Anti-cheat** — solve-time, move-rate, complexity, and peer-skill signal scoring with automatic flagging (random flavor mechanics deliberately excluded from enforcement)
 - **Economy** — gems, XP, power-ups, and tier progression (Unranked → Bronze → Silver → Gold → Cosmic)
-- **Themes** — Astral Nebula, Cyber Grid, Manga Mode, Retro Pixel
+- **Themes** — Astral Nebula, Cyber Grid, Manga Mode, Retro Pixel (saved locally per machine)
 - **Observability** — Micrometer metrics and Spring Actuator health (db, Redis, disk, and a game-engine self-test at `/actuator/health`)
 
 ---
@@ -43,7 +49,7 @@ sudokupro/
 | Cache / Pub-Sub / Locks | Redis (Spring Data Redis + Jedis) |
 | Real-time | Raw WebSocket (`/ws/game`) with cross-replica Redis relay |
 | API docs | springdoc-openapi (Swagger UI) |
-| Desktop client | JavaFX 21 |
+| Desktop client | JavaFX 21 + JDK `java.net.http` (REST & WebSocket) |
 | Testing | JUnit 5, Mockito, H2, Testcontainers (Postgres + Redis) |
 | Build / Deploy | Maven multi-module, Docker, docker-compose, Kubernetes, GitHub Actions |
 
@@ -51,7 +57,9 @@ sudokupro/
 
 ## Quick Start
 
-### Option A — Docker Compose (app + Postgres + Redis)
+### 1. Start a server
+
+**Docker Compose** (app + Postgres + Redis):
 
 ```bash
 cp .env.example .env    # set real DB_PASSWORD and ADMIN_PASSWORD
@@ -62,34 +70,34 @@ The app runs with the `prod` profile: startup **fails on missing or well-known
 credentials** (`secret`, `sudoku123`, `CHANGE_ME`, …) by design. Flyway creates
 and migrates the schema automatically.
 
-### Option B — Local development
-
-Prerequisites: Java 17+, Maven 3.9+, PostgreSQL 14+ (Redis 7+ optional — the
-app degrades gracefully without it).
+**Or run it locally** — prerequisites: Java 17+, Maven 3.9+, PostgreSQL 14+
+(Redis 7+ optional; the app degrades gracefully without it):
 
 ```bash
 createdb sudokupro       # or: CREATE DATABASE sudokupro;
-
-# API server (dev profile is the default for bare local runs):
 mvn -pl server -am spring-boot:run
-
-# Desktop app — a pure network client; needs a running server (above or compose):
-mvn -pl client -am javafx:run
 ```
 
-The desktop client connects to `http://localhost:8080` as `admin` by default;
-override with `SUDOKUPRO_SERVER`, `SUDOKUPRO_USER`, and `SUDOKUPRO_PASS`, or
-edit the fields on the welcome screen. All gameplay flows over REST
-(`/api/**`) and the WebSocket channel (`/ws/game`) — the client never loads
-server code.
-
-The `dev` profile ships working local defaults (Hibernate `ddl-auto=update`,
-Flyway off). Production must set `SPRING_PROFILES_ACTIVE=prod` and provide real
-credentials via the environment.
+The `dev` profile is the default for bare local runs and ships working local
+defaults (Hibernate `ddl-auto=update`, Flyway off). Production must set
+`SPRING_PROFILES_ACTIVE=prod` and provide real credentials via the environment.
 
 - API: `http://localhost:8080`
 - Swagger UI: `http://localhost:8080/swagger-ui.html`
 - Health: `http://localhost:8080/actuator/health`
+
+### 2. Start the desktop client
+
+```bash
+mvn -pl client -am javafx:run
+```
+
+The client is a pure network client — it never loads server code. The welcome
+screen prefills `http://localhost:8080` / `admin` (override via
+`SUDOKUPRO_SERVER`, `SUDOKUPRO_USER`, `SUDOKUPRO_PASS`); enter the password and
+connect. All gameplay flows over REST (`/api/**`) and the WebSocket channel
+(`/ws/game`). Undo/redo round-trip through the server, which stays
+authoritative for every board.
 
 ---
 
@@ -98,6 +106,8 @@ credentials via the environment.
 All credentials are injected via environment variables — never hardcoded.
 Outside the `dev`/`test` profiles, `SecretsGuard` refuses to start on missing
 or well-known values.
+
+**Server**
 
 | Variable | Default | Description |
 |---|---|---|
@@ -109,6 +119,14 @@ or well-known values.
 | `DDL_AUTO` | `validate` | Hibernate DDL strategy — Flyway owns the schema |
 | `ADMIN_USERNAME` | `admin` | Default admin account username |
 | `ADMIN_PASSWORD` | *(required outside dev)* | Default admin account password |
+
+**Desktop client**
+
+| Variable | Default | Description |
+|---|---|---|
+| `SUDOKUPRO_SERVER` | `http://localhost:8080` | Server base URL |
+| `SUDOKUPRO_USER` | `admin` | Username (HTTP Basic) |
+| `SUDOKUPRO_PASS` | *(empty)* | Password — also editable on the welcome screen |
 
 See `.env.example` for a full template.
 
@@ -152,14 +170,14 @@ Cross-pod delivery is verified by a two-pod integration test on real Redis in CI
 | Method | Path | Description |
 |---|---|---|
 | `POST` | `/api/game/new?difficulty=1..4&chaos=&mirror=` | Create a new game for the authenticated player |
-| `GET` | `/api/game/{gameId}` | Current board state (player-visible projection, never the solution) |
+| `GET` | `/api/game/{gameId}` | Current board state (player-visible projection — never the solution) |
 | `POST` | `/api/game/{gameId}/solve` | AI auto-solve |
 | `POST` | `/api/game/{gameId}/end` | End/leave a game (state persisted server-side) |
 | `GET` | `/api/game/hint` | AI hint for the player's active game |
 | `GET` | `/api/session` | Auth check + CSRF bootstrap for API clients |
 | `GET` | `/api/leaderboard?limit=` | Public leaderboard |
 | `GET` | `/api/events` | Active live events |
-| `WS` | `/ws/game` | Gameplay channel — moves, joins, broadcasts (authenticated principal required) |
+| `WS` | `/ws/game` | Gameplay channel (authenticated principal required) |
 | `GET` | `/admin/constants` | Game constants (admin) |
 | `POST` | `/admin/constants/reload` | Hot-reload constants (admin) |
 | `GET` | `/actuator/health` | Health: db, Redis, disk, game-engine self-test |
@@ -190,8 +208,10 @@ builds the server Docker image.
 ## Security Notes
 
 - Unauthenticated WebSocket connections are rejected at session establishment
+- The board sent to clients is a projection (`BoardState`) — the solution never leaves the server
 - `SecretsGuard` fails startup on missing or well-known credentials outside dev/test
-- CSRF protection enabled with `CookieCsrfTokenRepository` (WebSocket endpoints exempted)
+- CSRF protection enabled with `CookieCsrfTokenRepository`; API clients bootstrap the
+  double-submit token via `GET /api/session` (WebSocket endpoints exempted)
 - Security headers: CSP, HSTS (1 year), `X-Frame-Options: DENY`, `X-Content-Type-Options: nosniff`, `Referrer-Policy`
 - WebSocket origins restricted via `sudokupro.ws.allowed-origins` (defaults to localhost)
 - All credentials sourced from environment variables — no secrets in source

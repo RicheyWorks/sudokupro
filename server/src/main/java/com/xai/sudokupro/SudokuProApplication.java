@@ -23,7 +23,10 @@ public class SudokuProApplication {
     private static volatile ConfigurableApplicationContext context;
     private static final AtomicBoolean chaosActive = new AtomicBoolean(false);
 
-    /** Headless server entry point. The desktop app starts via the client module's ClientLauncher. */
+    /**
+     * Server entry point. The desktop app is a separate process (client module's
+     * ClientLauncher) that connects over REST + WebSocket — it never boots this class.
+     */
     public static void main(String[] args) {
         try {
             start(args);
@@ -35,9 +38,8 @@ public class SudokuProApplication {
     }
 
     /**
-     * Boots the Spring context and runs the shared startup sequence. Used by both the
-     * headless server main above and the client module's ClientLauncher, which shares
-     * this context with the JavaFX UI (single JVM, no second port-8080 collision).
+     * Boots the Spring context and runs the startup sequence. Kept separate from
+     * main() so integration tests can obtain the running context.
      */
     public static ConfigurableApplicationContext start(String[] args) {
 
@@ -105,7 +107,7 @@ public class SudokuProApplication {
         notifier.broadcastNotification("system", message);
     }
 
-    /** Public so ClientLauncher can trigger an orderly stop when the UI exits. */
+    /** Orderly stop — also registered as the JVM shutdown hook. */
     public static void shutdown() {
         if (context != null && context.isActive()) {
             context.close();
