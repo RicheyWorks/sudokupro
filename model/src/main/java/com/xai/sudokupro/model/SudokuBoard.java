@@ -150,8 +150,12 @@ public class SudokuBoard implements Serializable {
             int col = BOARD_RNG.nextInt(size);
             if (board[row][col].getValue() != 0) {
                 int saved = board[row][col].getValue();
-                board[row][col].setValue(0);
+                // Bug fix (same phantom-removal bug AUDIT Phase 1 fixed in SudokuGenerator):
+                // setValue(0) silently REFUSES to modify a cell while isGiven is true, so
+                // clearing before un-marking counted a "removal" that never happened —
+                // boards shipped with only 4-9 empty cells instead of 28-49. Un-mark first.
                 board[row][col].setGiven(false);
+                board[row][col].setValue(0);
                 if (hasUniqueSolution(copyBoard())) {
                     removed++;
                 } else {
