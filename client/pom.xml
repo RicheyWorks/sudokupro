@@ -21,11 +21,22 @@
     </properties>
 
     <dependencies>
-        <!-- The desktop app embeds the server in-process (single-JVM, as before). -->
+        <!--
+            AUDIT follow-up (client/server network separation): the client depends
+            only on the shared model — no Spring context, no server internals.
+            All gameplay flows over REST (/api/**) and WebSocket (/ws/game) using
+            the JDK's built-in java.net.http client.
+        -->
         <dependency>
             <groupId>com.xai</groupId>
-            <artifactId>sudokupro-server</artifactId>
+            <artifactId>sudokupro-model</artifactId>
             <version>${project.version}</version>
+        </dependency>
+
+        <dependency>
+            <groupId>org.junit.jupiter</groupId>
+            <artifactId>junit-jupiter</artifactId>
+            <scope>test</scope>
         </dependency>
 
         <!-- JavaFX — classifier selects the platform-native JAR (set by OS profiles). -->

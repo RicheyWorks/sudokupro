@@ -1,14 +1,10 @@
 package com.xai.sudokupro.ui;
 
+import com.xai.sudokupro.client.GameClient;
+import com.xai.sudokupro.client.Notifier;
 import com.xai.sudokupro.model.EnhancedMove;
 import com.xai.sudokupro.model.SudokuBoard;
 import com.xai.sudokupro.model.SudokuCell;
-import com.xai.sudokupro.service.AuthService;
-import com.xai.sudokupro.service.GameService;
-import com.xai.sudokupro.service.NotificationService;
-import com.xai.sudokupro.websocket.MultiplayerBroadcaster;
-import io.micrometer.core.instrument.MeterRegistry;
-import io.micrometer.core.instrument.Tags;
 import javafx.animation.FadeTransition;
 import javafx.application.Platform;
 import javafx.beans.value.ChangeListener;
@@ -28,19 +24,19 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.UnaryOperator;
 import java.util.stream.Collectors;
 
+/**
+ * The 9×9 grid view. Networked (AUDIT follow-up: client/server separation):
+ * all game mutations go through {@link GameClient}; the local board instance
+ * is read through the client because server resyncs replace it mid-game.
+ */
 public class BoardView {
     private static final Logger logger = LoggerFactory.getLogger(BoardView.class);
     private static final int    GRID_SIZE   = 9;
     private static final double CELL_SIZE   = 60.0;
-    private static final Tags   GLOBAL_TAGS = Tags.of("app", "SudokuPro");
 
     private final GridPane           grid;
-    private final SudokuBoard        board;
-    private final GameService        gameService;
-    private final NotificationService notificationService;
-    private final MultiplayerBroadcaster multiplayerBroadcaster;
-    private final MeterRegistry      meterRegistry;
-    private final AuthService        authService;
+    private final GameClient         client;
+    private final Notifier           notifier;
     private final TextField[][]      cellFields;
     private final HBox               controlsBox;
     private final ListView<String>   moveHistoryList;
@@ -58,22 +54,11 @@ public class BoardView {
     private int           highlightedCol  = -1;
     private Label         statusLabel;
     private ToggleButton  pencilToggle;
-    private Button        hintButton;
-    private Button        undoButton;
-    private Button        redoButton;
     private ToggleButton  autoSolveToggle;
-    private Button        resolveConflictsButton;
 
-    public BoardView(SudokuBoard board, GameService gameService,
-                     NotificationService notificationService,
-                     MultiplayerBroadcaster multiplayerBroadcaster,
-                     MeterRegistry meterRegistry, AuthService authService) {
-        this.board                = Objects.requireNonNull(board);
-        this.gameService          = Objects.requireNonNull(gameService);
-        this.notificationService  = Objects.requireNonNull(notificationService);
-        this.multiplayerBroadcaster = Objects.requireNonNull(multiplayerBroadcaster);
-        this.meterRegistry        = Objects.requireNonNull(meterRegistry);
-        this.authService          = Objects.requireNonNull(authService);
+    public BoardView(GameClient client, Notifier notifier) {
+        this.client   = Objects.requireNonNull(client);
+        this.notifier = Objects.requireNonNull(notifier);
         this.grid                 = new GridPane();
         this.cellFields           = new TextField[GRID_SIZE][GRID_SIZE];
         this.controlsBox          = new HBox(10);
@@ -86,9 +71,18 @@ public class BoardView {
         initializeGrid();
         initializeControls();
         initializeMoveHistory();
-        subscribeToMultiplayerUpdates();
         updateDifficultyProgress();
-        logger.info("BoardView initialized for game {}", board.getGameId());
+        logger.info("BoardView initialized for game {}", board().getGameId());
+    }
+
+    /**
+     * The local board is read through the client on every access: undo/redo
+     * and server pushes REPLACE the instance with a fresh reconstruction.
+     */
+    private SudokuBoard board() {
+        SudokuBoard board = client.board();
+        if (board == null) throw new IllegalStateException("No active game");
+        return board;
     }
 
     // =====================================================================
@@ -96,7 +90,7 @@ public class BoardView {
     // =====================================================================
 
     private void initializeGrid() {
-        SudokuCell[][] cells = board.getBoard();   // direct access – no copy needed at init
+        SudokuCell[][] cells = board().getBoard();   // direct access – no copy needed at init
         validateCells(cells);
         for (int row = 0; row < GRID_SIZE; row++) {
             for (int col = 0; col < GRID_SIZE; col++) {
@@ -112,7 +106,7 @@ public class BoardView {
         TextField cell = new TextField();
         cell.setPrefSize(CELL_SIZE, CELL_SIZE);
         cell.setFont(Font.font("Arial", 18));
-        cell.setStyle(difficultyStyle(board.getDifficulty()) + "-fx-alignment: center;");
+        cell.setStyle(difficultyStyle(board().getDifficulty()) + "-fx-alignment: center;");
 
         // Digit-only filter
         UnaryOperator<TextFormatter.Change> filter = change -> {
@@ -131,8 +125,8 @@ public class BoardView {
         cell.textProperty().addListener((ChangeListener<String>) (obs, oldVal, newVal) -> {
             // Bug 2 fix: ignore programmatic setText() fired from refreshCell()
             if (updatingCell.get()) return;
-            String playerId = authService.getCurrentPlayerId();
             try {
+                SudokuBoard board = board();
                 if (!board.isCellEditable(row, col)) return;
                 int v = newVal.isEmpty() ? 0 : Integer.parseInt(newVal);
                 if (pencilMode && v != 0) {
@@ -141,15 +135,14 @@ public class BoardView {
                 } else if (v >= 0 && v <= 9) {
                     int oldV = board.getBoard()[row][col].getValue();
                     EnhancedMove move = new EnhancedMove(row, col, oldV, v, SudokuCell.MoveSource.PLAYER);
-                    gameService.applyMove(board.getGameId(), move, playerId);
+                    client.applyMove(move);
                     refreshCell(row, col);
                     updateMoveHistory(move);
                     updateDifficultyProgress();
-                    meterRegistry.counter("sudokupro.ui.moves", GLOBAL_TAGS).increment();
                 }
             } catch (Exception e) {
                 logger.error("Move failed at ({},{}): {}", row, col, e.getMessage());
-                notificationService.sendNotification(playerId, "Invalid move: " + e.getMessage());
+                notifier.notify("error", "Invalid move: " + e.getMessage());
                 Platform.runLater(() -> cell.setText(oldVal));
             }
         });
@@ -178,25 +171,25 @@ public class BoardView {
     // =====================================================================
 
     private void initializeControls() {
-        statusLabel = new Label("Game: " + board.getGameId());
+        statusLabel = new Label("Game: " + board().getGameId());
         statusLabel.setStyle("-fx-text-fill: #FFD700;");
 
         pencilToggle = new ToggleButton("Pencil");
         pencilToggle.setOnAction(e -> togglePencilMode());
 
-        hintButton = new Button("Hint");
+        Button hintButton = new Button("Hint");
         hintButton.setOnAction(e -> requestHint());
 
-        undoButton = new Button("Undo");
+        Button undoButton = new Button("Undo");
         undoButton.setOnAction(e -> undoMove());
 
-        redoButton = new Button("Redo");
+        Button redoButton = new Button("Redo");
         redoButton.setOnAction(e -> redoMove());
 
         autoSolveToggle = new ToggleButton("Auto-Solve: Off");
         autoSolveToggle.setOnAction(e -> toggleAutoSolve());
 
-        resolveConflictsButton = new Button("Fix Conflicts");
+        Button resolveConflictsButton = new Button("Fix Conflicts");
         resolveConflictsButton.setOnAction(e -> resolveConflicts());
 
         historyFilter.getItems().addAll("All", "Player Moves", "Hints");
@@ -227,96 +220,83 @@ public class BoardView {
     private void togglePencilMode() {
         pencilMode = !pencilMode;
         pencilToggle.setText(pencilMode ? "Pencil: ON" : "Pencil: OFF");
-        meterRegistry.counter("sudokupro.ui.pencil.toggles", GLOBAL_TAGS).increment();
     }
 
+    /** Fetches a hint from the server (network call — off the FX thread). */
     public void requestHint() {
-        String pid = authService.getCurrentPlayerId();
-        try {
-            String hint = gameService.getHint(board.getGameId());
-            notificationService.sendTypedNotification(pid, "hint", hint);
-            refresh();
-            updateMoveHistory(new EnhancedMove(-1, -1, 0, SudokuCell.MoveSource.HINT));
-            meterRegistry.counter("sudokupro.ui.hints", GLOBAL_TAGS).increment();
-        } catch (Exception e) {
-            logger.error("Hint failed: {}", e.getMessage());
-            notificationService.sendNotification(pid, "Hint failed: " + e.getMessage());
-        }
+        Thread fetcher = new Thread(() -> {
+            try {
+                String hint = client.hint();
+                notifier.notify("hint", hint);
+                refresh();
+                updateMoveHistory(new EnhancedMove(-1, -1, 0, SudokuCell.MoveSource.HINT));
+            } catch (Exception e) {
+                logger.error("Hint failed: {}", e.getMessage());
+                notifier.notify("error", "Hint failed: " + e.getMessage());
+            }
+        }, "sudokupro-hint");
+        fetcher.setDaemon(true);
+        fetcher.start();
     }
 
     private void undoMove() {
-        String pid = authService.getCurrentPlayerId();
         try {
-            board.undo();
-            refresh();
+            // Server-side undo; the fresh board arrives as a "board" envelope
+            // and triggers a full refresh through MainStage's onBoardChanged.
+            client.undo();
             // Bug 1 fix: remove from allMoveHistory and re-apply filter
             if (!allMoveHistory.isEmpty())
                 allMoveHistory.remove(allMoveHistory.size() - 1);
             Platform.runLater(this::filterMoveHistory);
-            updateDifficultyProgress();
-            notificationService.sendTypedNotification(pid, "ui", "Move undone");
-            meterRegistry.counter("sudokupro.ui.undo", GLOBAL_TAGS).increment();
+            notifier.notify("ui", "Move undone");
         } catch (Exception e) {
             logger.error("Undo failed: {}", e.getMessage());
         }
     }
 
     private void redoMove() {
-        String pid = authService.getCurrentPlayerId();
         try {
-            EnhancedMove redone = board.redo();
-            if (redone != null) {
-                refresh();
-                updateMoveHistory(redone);
-                updateDifficultyProgress();
-                notificationService.sendTypedNotification(pid, "ui", "Move redone");
-                meterRegistry.counter("sudokupro.ui.redo", GLOBAL_TAGS).increment();
-            }
+            client.redo();
+            notifier.notify("ui", "Move redone");
         } catch (Exception e) {
             logger.error("Redo failed: {}", e.getMessage());
         }
     }
 
+    /** One-shot server-side auto-solve (network call — off the FX thread). */
     private void toggleAutoSolve() {
-        String pid = authService.getCurrentPlayerId();
-        boolean solving = autoSolveToggle.isSelected();
-        autoSolveToggle.setText("Auto-Solve: " + (solving ? "On" : "Off"));
-        if (solving) {
-            Thread autoSolveThread = new Thread(() -> {
-                while (autoSolveToggle.isSelected() && !board.isSolved()) {
-                    try {
-                        gameService.solveSudoku(board.getGameId());
-                        Platform.runLater(this::refresh);
-                        Thread.sleep(500);
-                    } catch (Exception e) {
-                        logger.error("Auto-solve error: {}", e.getMessage());
-                        // Reset the toggle so the user can see solving stopped.
-                        Platform.runLater(() -> {
-                            autoSolveToggle.setSelected(false);
-                            autoSolveToggle.setText("Auto-Solve: Off");
-                        });
-                        break;
-                    }
-                }
-                if (board.isSolved()) Platform.runLater(() ->
-                    notificationService.sendTypedNotification(pid, "game", "Puzzle auto-solved!"));
-            });
-            autoSolveThread.setDaemon(true);
-            autoSolveThread.start();
+        if (!autoSolveToggle.isSelected()) {
+            autoSolveToggle.setText("Auto-Solve: Off");
+            return;
         }
+        autoSolveToggle.setText("Auto-Solve: On");
+        Thread solver = new Thread(() -> {
+            try {
+                client.solve();
+                notifier.notify("game", "Puzzle auto-solved!");
+            } catch (Exception e) {
+                logger.error("Auto-solve error: {}", e.getMessage());
+                notifier.notify("error", "Auto-solve failed: " + e.getMessage());
+            } finally {
+                Platform.runLater(() -> {
+                    autoSolveToggle.setSelected(false);
+                    autoSolveToggle.setText("Auto-Solve: Off");
+                });
+            }
+        }, "sudokupro-solve");
+        solver.setDaemon(true);
+        solver.start();
     }
 
     private void resolveConflicts() {
-        // Bug 3 fix: route through gameService so validation, persistence, and
-        // multiplayer broadcast all happen (was calling board.applyMove directly).
-        String pid = authService.getCurrentPlayerId();
         boolean resolved = false;
+        SudokuBoard board = board();
         for (int r = 0; r < GRID_SIZE; r++) for (int c = 0; c < GRID_SIZE; c++) {
             SudokuCell cell = board.getBoard()[r][c];
             if (cell.isConflicted() && !cell.isGiven()) {
                 EnhancedMove clear = new EnhancedMove(r, c, cell.getValue(), 0, SudokuCell.MoveSource.PLAYER);
                 try {
-                    gameService.applyMove(board.getGameId(), clear, pid);
+                    client.applyMove(clear);
                     updateMoveHistory(clear);
                     resolved = true;
                 } catch (Exception e) {
@@ -324,7 +304,7 @@ public class BoardView {
                 }
             }
         }
-        if (resolved) { refresh(); notificationService.sendTypedNotification(pid, "ui", "Conflicts resolved"); }
+        if (resolved) { refresh(); notifier.notify("ui", "Conflicts resolved"); }
     }
 
     // =====================================================================
@@ -332,7 +312,7 @@ public class BoardView {
     // =====================================================================
 
     public void refresh() {
-        validateCells(board.getBoard());
+        validateCells(board().getBoard());
         for (int r = 0; r < GRID_SIZE; r++) for (int c = 0; c < GRID_SIZE; c++) refreshCell(r, c);
         updateStatus();
         updateDifficultyProgress();
@@ -340,7 +320,7 @@ public class BoardView {
 
     private void refreshCell(int row, int col) {
         TextField cell = cellFields[row][col];
-        SudokuCell sc = board.getBoard()[row][col];
+        SudokuCell sc = board().getBoard()[row][col];
         String text = sc.getValue() == 0
             ? (sc.getPencilMarks().isEmpty() ? "" : formatPencilMarks(sc.getPencilMarks()))
             : String.valueOf(sc.getValue());
@@ -360,8 +340,8 @@ public class BoardView {
     }
 
     private void updateCellStyle(TextField cell, int row, int col) {
-        SudokuCell sc = board.getBoard()[row][col];
-        StringBuilder style = new StringBuilder(difficultyStyle(board.getDifficulty()) + "-fx-alignment: center;");
+        SudokuCell sc = board().getBoard()[row][col];
+        StringBuilder style = new StringBuilder(difficultyStyle(board().getDifficulty()) + "-fx-alignment: center;");
 
         // Background — priority order: conflict > given > pencil > highlight > default
         if (sc.isConflicted())
@@ -437,7 +417,7 @@ public class BoardView {
 
     private void updateDifficultyProgress() {
         int filled = 0;
-        SudokuCell[][] cells = board.getBoard();
+        SudokuCell[][] cells = board().getBoard();
         for (int r = 0; r < GRID_SIZE; r++) for (int c = 0; c < GRID_SIZE; c++)
             if (cells[r][c].getValue() != 0) filled++;
         double p = (double) filled / (GRID_SIZE * GRID_SIZE);
@@ -456,12 +436,9 @@ public class BoardView {
     }
 
     private void updateStatus() {
+        SudokuBoard board = board();
         String s = board.isSolved() ? "Solved!" : "In Progress";
         Platform.runLater(() -> statusLabel.setText("Game: " + board.getGameId() + " | " + s));
-    }
-
-    private void subscribeToMultiplayerUpdates() {
-        multiplayerBroadcaster.subscribeToGame(board.getGameId(), () -> Platform.runLater(this::refresh));
     }
 
     private void validateCells(SudokuCell[][] cells) {
@@ -482,5 +459,5 @@ public class BoardView {
         return root;
     }
 
-    public SudokuBoard getBoard() { return board; }
+    public SudokuBoard getBoard() { return board(); }
 }

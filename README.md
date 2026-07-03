@@ -13,7 +13,8 @@ sudokupro/
 ├── server/   Spring Boot backend. Produces the deployable boot jar
 │             (sudokupro-server-*-exec.jar). All tests live here.
 └── client/   JavaFX desktop app. Owns all JavaFX dependencies and the
-              per-OS platform profiles; embeds the server in-process.
+              per-OS platform profiles. Pure network client: depends only
+              on model and talks to the server over REST + WebSocket.
 ```
 
 ---
@@ -69,12 +70,18 @@ app degrades gracefully without it).
 ```bash
 createdb sudokupro       # or: CREATE DATABASE sudokupro;
 
-# Headless API server (dev profile is the default for bare local runs):
+# API server (dev profile is the default for bare local runs):
 mvn -pl server -am spring-boot:run
 
-# Desktop app (JavaFX UI + embedded server):
+# Desktop app — a pure network client; needs a running server (above or compose):
 mvn -pl client -am javafx:run
 ```
+
+The desktop client connects to `http://localhost:8080` as `admin` by default;
+override with `SUDOKUPRO_SERVER`, `SUDOKUPRO_USER`, and `SUDOKUPRO_PASS`, or
+edit the fields on the welcome screen. All gameplay flows over REST
+(`/api/**`) and the WebSocket channel (`/ws/game`) — the client never loads
+server code.
 
 The `dev` profile ships working local defaults (Hibernate `ddl-auto=update`,
 Flyway off). Production must set `SPRING_PROFILES_ACTIVE=prod` and provide real
@@ -144,15 +151,23 @@ Cross-pod delivery is verified by a two-pod integration test on real Redis in CI
 
 | Method | Path | Description |
 |---|---|---|
-| `POST` | `/api/game/new?difficulty=1..4` | Create a new game for the authenticated player |
+| `POST` | `/api/game/new?difficulty=1..4&chaos=&mirror=` | Create a new game for the authenticated player |
+| `GET` | `/api/game/{gameId}` | Current board state (player-visible projection, never the solution) |
+| `POST` | `/api/game/{gameId}/solve` | AI auto-solve |
+| `POST` | `/api/game/{gameId}/end` | End/leave a game (state persisted server-side) |
 | `GET` | `/api/game/hint` | AI hint for the player's active game |
+| `GET` | `/api/session` | Auth check + CSRF bootstrap for API clients |
+| `GET` | `/api/leaderboard?limit=` | Public leaderboard |
+| `GET` | `/api/events` | Active live events |
 | `WS` | `/ws/game` | Gameplay channel — moves, joins, broadcasts (authenticated principal required) |
 | `GET` | `/admin/constants` | Game constants (admin) |
 | `POST` | `/admin/constants/reload` | Hot-reload constants (admin) |
 | `GET` | `/actuator/health` | Health: db, Redis, disk, game-engine self-test |
 
-WebSocket envelope format: `{"type", "from", "payload"}` — types include
-`move`, `join`, `leave`, `event`, `status`, `hint`, `error`.
+WebSocket envelope format: `{"type", "from", "payload"}` — client-to-server
+types: `move`, `join`, `chat`, `undo`, `redo`, `sync`; server-to-client adds
+`board` (full-state resync), `leave`, `event`, `status`, `hint`, `error`.
+Join an existing game by connecting to `/ws/game?gameId=...`.
 
 Full interactive docs at `/swagger-ui.html` when running locally.
 

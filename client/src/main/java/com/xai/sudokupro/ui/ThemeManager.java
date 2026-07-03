@@ -1,11 +1,6 @@
 package com.xai.sudokupro.ui;
 
-import com.xai.sudokupro.model.User;
-import com.xai.sudokupro.repository.UserRepository;
-import com.xai.sudokupro.service.AuthService;
-import com.xai.sudokupro.service.NotificationService;
-import io.micrometer.core.instrument.MeterRegistry;
-import io.micrometer.core.instrument.Tags;
+import com.xai.sudokupro.client.Notifier;
 import javafx.application.Platform;
 import javafx.beans.value.ChangeListener;
 import javafx.geometry.Insets;
@@ -19,19 +14,25 @@ import javafx.stage.Modality;
 import javafx.stage.Stage;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.stereotype.Component;
 
 import java.io.File;
 import java.io.FileWriter;
 import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
 import java.net.URL;
 import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicInteger;
 
-@Component
+/**
+ * Theme management for the desktop client. Fully client-local (AUDIT follow-up:
+ * client/server separation): the theme preference and custom CSS persist in
+ * {@code ~/.sudokupro/theme.properties} instead of the server's user table —
+ * a display preference belongs to the machine showing the display.
+ */
 public class ThemeManager {
     private static final Logger logger = LoggerFactory.getLogger(ThemeManager.class);
     private static final String[] THEMES = {
@@ -47,17 +48,15 @@ public class ThemeManager {
         "Manga Mode"
     };
     private static final Map<String, String> PRESET_THEMES = new HashMap<>();
-    private static final Tags GLOBAL_TAGS = Tags.of("app", "SudokuPro");
     private static final int DEFAULT_THEME_INDEX = 0;
+    private static final String PREF_THEME = "theme";
+    private static final String PREF_CUSTOM_CSS = "custom.css";
 
-    @Autowired private AuthService authService;
-    @Autowired private UserRepository userRepository;
-    @Autowired private NotificationService notificationService;
-    @Autowired private MeterRegistry meterRegistry;
+    private final Notifier notifier;
+    private final Path prefsFile;
+    private final Properties prefs = new Properties();
 
-    // Fix: plain HashMap is not thread-safe — read by the cycling background thread while
-    // written from JavaFX / Spring request threads. Use ConcurrentHashMap throughout.
-    private final Map<String, String> customThemes = new ConcurrentHashMap<>();
+    // In-memory only: themes shared during this session (multi-window / future use).
     private final Map<String, String> sharedThemes = new ConcurrentHashMap<>();
     private final Random random = new Random();
     private volatile boolean isCycling = false;
@@ -77,6 +76,20 @@ public class ThemeManager {
             ".title-fade { -fx-fill: #FF4500; }");
     }
 
+    public ThemeManager(Notifier notifier) {
+        this(notifier, Path.of(System.getProperty("user.home"), ".sudokupro", "theme.properties"));
+    }
+
+    ThemeManager(Notifier notifier, Path prefsFile) {
+        this.notifier = Objects.requireNonNull(notifier);
+        this.prefsFile = prefsFile;
+        loadPrefs();
+    }
+
+    // =====================================================================
+    // Applying themes
+    // =====================================================================
+
     public void applyTheme(Scene scene, int themeIndex) {
         validateScene(scene);
         int normalizedIndex = themeIndex % THEMES.length;
@@ -89,44 +102,37 @@ public class ThemeManager {
             }
             scene.getStylesheets().clear();
             scene.getStylesheets().add(url.toExternalForm());
-            meterRegistry.counter("sudokupro.ui.theme.switches",
-                Tags.concat(GLOBAL_TAGS, Tags.of("theme", THEME_NAMES[normalizedIndex]))).increment();
             logger.debug("Applied theme '{}' (index {}) to scene", THEME_NAMES[normalizedIndex], normalizedIndex);
         } catch (Exception e) {
             logger.error("Failed to apply theme '{}': {}", THEME_NAMES[normalizedIndex], e.getMessage(), e);
-            notificationService.sendNotification(authService.getCurrentPlayerId(),
-                "Theme switch failed: " + e.getMessage());
+            notifier.notify("error", "Theme switch failed: " + e.getMessage());
             applyDefaultTheme(scene);
         }
     }
 
-    public void applyUserPreferredTheme(Scene scene, String playerId) {
+    /** Applies the locally saved preference (custom CSS wins over named themes). */
+    public void applyUserPreferredTheme(Scene scene) {
         validateScene(scene);
-        validatePlayerId(playerId);
         try {
-            User user = findUserByPlayerId(playerId)
-                .orElseThrow(() -> new IllegalStateException("User not found: " + playerId));
-            String preferredTheme = user.getThemePreference().toLowerCase();
-            if (customThemes.containsKey(playerId)) {
+            String customCss = prefs.getProperty(PREF_CUSTOM_CSS);
+            String preferredTheme = prefs.getProperty(PREF_THEME, "").toLowerCase();
+            if (customCss != null && !customCss.isBlank()) {
                 scene.getStylesheets().clear();
-                scene.getStylesheets().add(customThemes.get(playerId));
-                logger.debug("Applied custom theme for player '{}'", playerId);
+                scene.getStylesheets().add(customCss);
+                logger.debug("Applied locally saved custom theme");
             } else if (sharedThemes.containsKey(preferredTheme)) {
                 scene.getStylesheets().clear();
                 scene.getStylesheets().add(sharedThemes.get(preferredTheme));
-                logger.debug("Applied shared theme '{}' for player '{}'", preferredTheme, playerId);
             } else if (PRESET_THEMES.containsKey(preferredTheme)) {
                 scene.getStylesheets().clear();
                 scene.getStylesheets().add(PRESET_THEMES.get(preferredTheme));
-                logger.debug("Applied preset theme '{}' for player '{}'", preferredTheme, playerId);
             } else {
                 int themeIndex = getThemeIndexFromName(preferredTheme);
                 applyTheme(scene, themeIndex != -1 ? themeIndex : DEFAULT_THEME_INDEX);
-                logger.debug("Applied user '{}' preferred theme: '{}'", playerId, preferredTheme);
             }
         } catch (Exception e) {
-            logger.error("Failed to apply preferred theme for player {}: {}", playerId, e.getMessage(), e);
-            notificationService.sendNotification(playerId, "Failed to load preferred theme: " + e.getMessage());
+            logger.error("Failed to apply preferred theme: {}", e.getMessage(), e);
+            notifier.notify("error", "Failed to load preferred theme: " + e.getMessage());
             applyDefaultTheme(scene);
         }
     }
@@ -134,7 +140,7 @@ public class ThemeManager {
     public ComboBox<String> createThemeSelector(Scene scene) {
         ComboBox<String> themeSelector = new ComboBox<>();
         List<String> options = new ArrayList<>(Arrays.asList(THEME_NAMES));
-        if (customThemes.containsKey(authService.getCurrentPlayerId())) {
+        if (prefs.getProperty(PREF_CUSTOM_CSS) != null) {
             options.add("Custom Theme");
         }
         options.addAll(sharedThemes.keySet());
@@ -148,7 +154,7 @@ public class ThemeManager {
             String selectedTheme = themeSelector.getValue();
             if (selectedIndex >= THEMES.length) {
                 if ("Custom Theme".equals(selectedTheme)) {
-                    applyCustomTheme(scene, authService.getCurrentPlayerId());
+                    applyCustomTheme(scene);
                 } else if (sharedThemes.containsKey(selectedTheme)) {
                     applySharedTheme(scene, selectedTheme);
                 } else if (PRESET_THEMES.containsKey(selectedTheme)) {
@@ -157,15 +163,13 @@ public class ThemeManager {
             } else {
                 applyTheme(scene, selectedIndex);
                 updateUserPreference(selectedIndex);
-                notificationService.sendTypedNotification(authService.getCurrentPlayerId(),
-                    "ui", "Theme switched to: " + THEME_NAMES[selectedIndex]);
+                notifier.notify("ui", "Theme switched to: " + THEME_NAMES[selectedIndex]);
             }
         });
 
         themeSelector.setOnShowing(e ->
             previewTheme(scene, themeSelector.getSelectionModel().getSelectedIndex(), themeSelector.getValue()));
-        themeSelector.setOnHidden(e ->
-            applyUserPreferredTheme(scene, authService.getCurrentPlayerId()));
+        themeSelector.setOnHidden(e -> applyUserPreferredTheme(scene));
 
         logger.debug("Theme selector created with {} options", options.size());
         return themeSelector;
@@ -174,7 +178,7 @@ public class ThemeManager {
     private void previewTheme(Scene scene, int themeIndex, String themeName) {
         if (themeIndex >= THEMES.length) {
             if ("Custom Theme".equals(themeName)) {
-                applyCustomTheme(scene, authService.getCurrentPlayerId());
+                applyCustomTheme(scene);
             } else if (sharedThemes.containsKey(themeName)) {
                 applySharedTheme(scene, themeName);
             } else if (PRESET_THEMES.containsKey(themeName)) {
@@ -185,10 +189,10 @@ public class ThemeManager {
         }
     }
 
-    private void applyCustomTheme(Scene scene, String playerId) {
+    private void applyCustomTheme(Scene scene) {
         scene.getStylesheets().clear();
-        scene.getStylesheets().add(customThemes.getOrDefault(playerId, THEMES[DEFAULT_THEME_INDEX]));
-        logger.debug("Applied custom theme for player '{}'", playerId);
+        scene.getStylesheets().add(prefs.getProperty(PREF_CUSTOM_CSS, THEMES[DEFAULT_THEME_INDEX]));
+        logger.debug("Applied custom theme");
     }
 
     private void applySharedTheme(Scene scene, String themeName) {
@@ -204,18 +208,11 @@ public class ThemeManager {
     }
 
     private void updateUserPreference(int themeIndex) {
-        String playerId = authService.getCurrentPlayerId();
-        try {
-            User user = findUserByPlayerId(playerId)
-                .orElseThrow(() -> new IllegalStateException("User not found: " + playerId));
-            String newTheme = THEME_NAMES[themeIndex].toLowerCase().replace(" ", "-");
-            user.setThemePreference(newTheme);
-            userRepository.save(user);
-            logger.debug("Updated theme preference for player {} to '{}'", playerId, newTheme);
-        } catch (Exception e) {
-            logger.error("Failed to update theme preference for player {}: {}", playerId, e.getMessage(), e);
-            notificationService.sendNotification(playerId, "Failed to save theme preference: " + e.getMessage());
-        }
+        String newTheme = THEME_NAMES[themeIndex].toLowerCase().replace(" ", "-");
+        prefs.setProperty(PREF_THEME, newTheme);
+        prefs.remove(PREF_CUSTOM_CSS);
+        savePrefs();
+        logger.debug("Updated local theme preference to '{}'", newTheme);
     }
 
     private void applyDefaultTheme(Scene scene) {
@@ -233,6 +230,10 @@ public class ThemeManager {
         }
         return -1;
     }
+
+    // =====================================================================
+    // Customizer
+    // =====================================================================
 
     public void showThemeCustomizer(Scene currentScene) {
         Stage customizerStage = new Stage();
@@ -268,8 +269,8 @@ public class ThemeManager {
                 bgColorPicker.getValue().toString(), textColorPicker.getValue().toString(),
                 accentColorPicker.getValue().toString(), glowEffect.isSelected(),
                 brightnessSlider.getValue(), gradientAccent.isSelected());
-            saveCustomTheme(authService.getCurrentPlayerId(), customCSS);
-            applyCustomTheme(currentScene, authService.getCurrentPlayerId());
+            saveCustomTheme(customCSS);
+            applyCustomTheme(currentScene);
             customizerStage.close();
         });
 
@@ -330,7 +331,7 @@ public class ThemeManager {
         customizerStage.setScene(customizerScene);
         customizerStage.show();
 
-        logger.info("Theme customizer opened for player {}", authService.getCurrentPlayerId());
+        logger.info("Theme customizer opened");
     }
 
     private String generateCustomCSS(String bgColor, String textColor, String accentColor,
@@ -376,24 +377,19 @@ public class ThemeManager {
         return String.format("#%02X%02X%02X", (int) r, (int) g, (int) b);
     }
 
-    private void saveCustomTheme(String playerId, String customCSS) {
-        customThemes.put(playerId, "data:text/css," + customCSS);
-        notificationService.sendTypedNotification(playerId, "ui", "Custom theme saved!");
-        logger.debug("Saved custom theme for player '{}'", playerId);
+    private void saveCustomTheme(String customCSS) {
+        prefs.setProperty(PREF_CUSTOM_CSS, "data:text/css," + customCSS);
+        savePrefs();
+        notifier.notify("ui", "Custom theme saved!");
     }
 
     private String getCurrentThemeName() {
-        String playerId = authService.getCurrentPlayerId();
-        if (customThemes.containsKey(playerId)) return "Custom Theme";
-        User user = findUserByPlayerId(playerId).orElse(null);
-        if (user != null) {
-            String pref = user.getThemePreference();
-            if (sharedThemes.containsKey(pref)) return pref;
-            if (PRESET_THEMES.containsKey(pref)) return pref;
-            int index = getThemeIndexFromName(pref);
-            return index != -1 ? THEME_NAMES[index] : THEME_NAMES[DEFAULT_THEME_INDEX];
-        }
-        return THEME_NAMES[DEFAULT_THEME_INDEX];
+        if (prefs.getProperty(PREF_CUSTOM_CSS) != null) return "Custom Theme";
+        String pref = prefs.getProperty(PREF_THEME, "");
+        if (sharedThemes.containsKey(pref)) return pref;
+        if (PRESET_THEMES.containsKey(pref)) return pref;
+        int index = getThemeIndexFromName(pref);
+        return index != -1 ? THEME_NAMES[index] : THEME_NAMES[DEFAULT_THEME_INDEX];
     }
 
     private void randomizeTheme(ColorPicker bgColorPicker, ColorPicker textColorPicker,
@@ -413,23 +409,18 @@ public class ThemeManager {
             brightnessSlider.setValue(brightness);
             gradientAccent.setSelected(gradient);
         });
-        meterRegistry.counter("sudokupro.ui.theme.randomizations", GLOBAL_TAGS).increment();
     }
 
     public void resetTheme(Scene scene) {
-        String playerId = authService.getCurrentPlayerId();
         try {
-            customThemes.remove(playerId);
-            User user = findUserByPlayerId(playerId)
-                .orElseThrow(() -> new IllegalStateException("User not found: " + playerId));
-            user.setThemePreference("default");
-            userRepository.save(user);
+            prefs.remove(PREF_CUSTOM_CSS);
+            prefs.setProperty(PREF_THEME, "default");
+            savePrefs();
             applyTheme(scene, DEFAULT_THEME_INDEX);
-            notificationService.sendTypedNotification(playerId, "ui", "Theme reset to default");
-            meterRegistry.counter("sudokupro.ui.theme.resets", GLOBAL_TAGS).increment();
+            notifier.notify("ui", "Theme reset to default");
         } catch (Exception e) {
-            logger.error("Failed to reset theme for player {}: {}", playerId, e.getMessage(), e);
-            notificationService.sendNotification(playerId, "Theme reset failed: " + e.getMessage());
+            logger.error("Failed to reset theme: {}", e.getMessage(), e);
+            notifier.notify("error", "Theme reset failed: " + e.getMessage());
         }
     }
 
@@ -442,34 +433,30 @@ public class ThemeManager {
             default      -> DEFAULT_THEME_INDEX;
         };
         applyTheme(scene, themeIndex);
-        notificationService.sendTypedNotification(authService.getCurrentPlayerId(),
-            "ui", "Event theme applied: " + THEME_NAMES[themeIndex]);
+        notifier.notify("ui", "Event theme applied: " + THEME_NAMES[themeIndex]);
     }
 
     private void shareTheme(String themeName, String css) {
-        String playerId = authService.getCurrentPlayerId();
         if (themeName == null || themeName.trim().isEmpty()) {
-            notificationService.sendNotification(playerId, "Please enter a theme name to share.");
+            notifier.notify("error", "Please enter a theme name to share.");
             return;
         }
         if (sharedThemes.containsKey(themeName)) {
-            notificationService.sendNotification(playerId, "Theme name '" + themeName + "' already exists.");
+            notifier.notify("error", "Theme name '" + themeName + "' already exists.");
             return;
         }
         sharedThemes.put(themeName, "data:text/css," + css);
-        notificationService.sendTypedNotification(playerId, "ui",
-            "Theme '" + themeName + "' shared with the galaxy!");
-        meterRegistry.counter("sudokupro.ui.theme.shares", GLOBAL_TAGS).increment();
+        notifier.notify("ui", "Theme '" + themeName + "' shared with the galaxy!");
     }
 
     private void toggleThemeCycling(Scene scene) {
-        String playerId = authService.getCurrentPlayerId();
         isCycling = !isCycling;
         if (isCycling) {
             Thread cycler = new Thread(() -> {
                 int index = 0;
                 List<String> allThemes = new ArrayList<>(Arrays.asList(THEMES));
-                allThemes.addAll(customThemes.values());
+                String customCss = prefs.getProperty(PREF_CUSTOM_CSS);
+                if (customCss != null) allThemes.add(customCss);
                 allThemes.addAll(sharedThemes.values());
                 allThemes.addAll(PRESET_THEMES.values());
                 while (isCycling) {
@@ -490,14 +477,12 @@ public class ThemeManager {
             // Fix: mark daemon so this thread cannot prevent JVM shutdown.
             cycler.setDaemon(true);
             cycler.start();
-            meterRegistry.counter("sudokupro.ui.theme.cycles", GLOBAL_TAGS).increment();
         } else {
-            applyUserPreferredTheme(scene, playerId);
+            applyUserPreferredTheme(scene);
         }
     }
 
     private void exportTheme(Scene currentScene) {
-        String playerId = authService.getCurrentPlayerId();
         try {
             FileChooser fileChooser = new FileChooser();
             fileChooser.setTitle("Export Theme");
@@ -506,23 +491,20 @@ public class ThemeManager {
             fileChooser.setInitialFileName("sudokupro_theme.css");
             File file = fileChooser.showSaveDialog(currentScene.getWindow());
             if (file != null) {
-                String css = customThemes.getOrDefault(playerId, THEMES[DEFAULT_THEME_INDEX])
+                String css = prefs.getProperty(PREF_CUSTOM_CSS, THEMES[DEFAULT_THEME_INDEX])
                     .replace("data:text/css,", "");
                 try (FileWriter writer = new FileWriter(file)) {
                     writer.write(css);
                 }
-                notificationService.sendTypedNotification(playerId, "ui",
-                    "Theme exported to " + file.getAbsolutePath());
-                meterRegistry.counter("sudokupro.ui.theme.exports", GLOBAL_TAGS).increment();
+                notifier.notify("ui", "Theme exported to " + file.getAbsolutePath());
             }
         } catch (IOException e) {
-            logger.error("Failed to export theme for player {}: {}", playerId, e.getMessage(), e);
-            notificationService.sendNotification(playerId, "Export failed: " + e.getMessage());
+            logger.error("Failed to export theme: {}", e.getMessage(), e);
+            notifier.notify("error", "Export failed: " + e.getMessage());
         }
     }
 
     private void importTheme(Scene currentScene) {
-        String playerId = authService.getCurrentPlayerId();
         try {
             FileChooser fileChooser = new FileChooser();
             fileChooser.setTitle("Import Theme");
@@ -531,36 +513,42 @@ public class ThemeManager {
             File file = fileChooser.showOpenDialog(currentScene.getWindow());
             if (file != null) {
                 String css = new String(Files.readAllBytes(file.toPath()));
-                customThemes.put(playerId, "data:text/css," + css);
-                applyCustomTheme(currentScene, playerId);
-                notificationService.sendTypedNotification(playerId, "ui",
-                    "Theme imported from " + file.getAbsolutePath());
-                meterRegistry.counter("sudokupro.ui.theme.imports", GLOBAL_TAGS).increment();
+                prefs.setProperty(PREF_CUSTOM_CSS, "data:text/css," + css);
+                savePrefs();
+                applyCustomTheme(currentScene);
+                notifier.notify("ui", "Theme imported from " + file.getAbsolutePath());
             }
         } catch (IOException e) {
-            logger.error("Failed to import theme for player {}: {}", playerId, e.getMessage(), e);
-            notificationService.sendNotification(playerId, "Import failed: " + e.getMessage());
+            logger.error("Failed to import theme: {}", e.getMessage(), e);
+            notifier.notify("error", "Import failed: " + e.getMessage());
+        }
+    }
+
+    // =====================================================================
+    // Local persistence
+    // =====================================================================
+
+    private void loadPrefs() {
+        if (!Files.exists(prefsFile)) return;
+        try (InputStream in = Files.newInputStream(prefsFile)) {
+            prefs.load(in);
+        } catch (IOException e) {
+            logger.warn("Could not read theme preferences from {}: {}", prefsFile, e.getMessage());
+        }
+    }
+
+    private void savePrefs() {
+        try {
+            Files.createDirectories(prefsFile.getParent());
+            try (OutputStream out = Files.newOutputStream(prefsFile)) {
+                prefs.store(out, "SudokuPro client theme preferences");
+            }
+        } catch (IOException e) {
+            logger.warn("Could not save theme preferences to {}: {}", prefsFile, e.getMessage());
         }
     }
 
     private void validateScene(Scene scene) {
         if (scene == null) throw new IllegalArgumentException("Scene cannot be null");
-    }
-
-    private void validatePlayerId(String playerId) {
-        if (playerId == null || playerId.trim().isEmpty())
-            throw new IllegalArgumentException("Player ID cannot be null or empty");
-    }
-
-    private Optional<User> findUserByPlayerId(String playerId) {
-        if (playerId == null || playerId.isBlank() || "anonymous".equals(playerId)) {
-            return Optional.empty();
-        }
-        try {
-            return userRepository.findById(Long.parseLong(playerId));
-        } catch (NumberFormatException e) {
-            logger.debug("Skipping non-numeric playerId '{}' in theme manager", playerId);
-            return Optional.empty();
-        }
     }
 }
