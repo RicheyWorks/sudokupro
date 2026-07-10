@@ -17,10 +17,13 @@ sudokupro/
 ├── model/    Shared domain: board, cells, moves, generator, constants,
 │             and the wire records (model.api). No web, no JavaFX.
 ├── server/   Spring Boot backend. Produces the deployable boot jar
-│             (sudokupro-server-*-exec.jar). All tests live here.
+│             (sudokupro-server-*-exec.jar). Most tests live here.
 └── client/   JavaFX desktop app. Owns all JavaFX dependencies and the
               per-OS platform profiles. Pure network client: depends only
               on model and talks to the server over REST + WebSocket.
+              client/net (ServerApi, GameSocket, ...) has its own JUnit
+              coverage — no Spring/Mockito, just the JDK's HttpClient
+              against a loopback test server.
 ```
 
 ---
@@ -214,6 +217,12 @@ builds the server Docker image.
   double-submit token via `GET /api/session` (WebSocket endpoints exempted)
 - Security headers: CSP, HSTS (1 year), `X-Frame-Options: DENY`, `X-Content-Type-Options: nosniff`, `Referrer-Policy`
 - WebSocket origins restricted via `sudokupro.ws.allowed-origins` (defaults to localhost)
+- HTTP Basic login attempts are rate-limited per remote address (`LoginAttemptLimiter` +
+  `LoginAttemptFilter`): 5 failures within 60s locks out further attempts with a 429
+  (`sudokupro.security.login.max-attempts` / `.lockout-seconds`). Redis-backed so the
+  lockout holds across replicas; degrades to a local in-memory counter if Redis is down.
 - All credentials sourced from environment variables — no secrets in source
+- The Kubernetes deployment runs as the same non-root user as the container image
+  (`securityContext`: `runAsNonRoot`, `readOnlyRootFilesystem`, all capabilities dropped)
 
 See `AUDIT.md` for the full code-health audit and its resolution history.

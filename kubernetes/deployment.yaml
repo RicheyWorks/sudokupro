@@ -31,11 +31,30 @@ spec:
       labels:
         app: sudokupro
     spec:
+      # Pod-level hardening: matches the Dockerfile's non-root runtime user
+      # (uid 1001, "sudokupro") and drops everything a game server doesn't need.
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1001
+        runAsGroup: 1001
+        fsGroup: 1001
+        seccompProfile:
+          type: RuntimeDefault
       containers:
         - name: sudokupro
           image: REGISTRY/sudokupro:latest  # ← set to your registry/tag
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
           ports:
             - containerPort: 8080
+          volumeMounts:
+            # Spring Boot/Tomcat need a writable temp dir; everything else about
+            # the image is read-only at runtime.
+            - name: tmp
+              mountPath: /tmp
           env:
             - name: DB_URL
               value: jdbc:postgresql://postgres:5432/sudokupro
@@ -76,4 +95,8 @@ spec:
               cpu: 250m
               memory: 512Mi
             limits:
+              cpu: "1"
               memory: 1Gi
+      volumes:
+        - name: tmp
+          emptyDir: {}

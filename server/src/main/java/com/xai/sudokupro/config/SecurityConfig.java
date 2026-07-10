@@ -2,6 +2,8 @@ package com.xai.sudokupro.config;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import com.xai.sudokupro.service.LoginAttemptLimiter;
+import org.springframework.boot.web.servlet.FilterRegistrationBean;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.context.annotation.Profile;
@@ -11,6 +13,7 @@ import org.springframework.security.config.annotation.web.configuration.EnableWe
 import org.springframework.security.config.http.SessionCreationPolicy;
 import org.springframework.security.web.SecurityFilterChain;
 import org.springframework.security.web.authentication.logout.LogoutSuccessHandler;
+import org.springframework.security.web.authentication.www.BasicAuthenticationFilter;
 import org.springframework.security.web.csrf.CookieCsrfTokenRepository;
 
 /**
@@ -25,8 +28,12 @@ public class SecurityConfig {
     private static final Logger logger = LoggerFactory.getLogger(SecurityConfig.class);
 
     @Bean
-    public SecurityFilterChain securityFilterChain(HttpSecurity http) throws Exception {
+    public SecurityFilterChain securityFilterChain(HttpSecurity http, LoginAttemptFilter loginAttemptFilter)
+            throws Exception {
         http
+            // Brute-force lockout (LoginAttemptLimiter): must run before Spring Security
+            // even attempts to authenticate the Basic credentials.
+            .addFilterBefore(loginAttemptFilter, BasicAuthenticationFilter.class)
             .authorizeHttpRequests(auth -> auth
                 .requestMatchers("/admin/**").hasRole("ADMIN") // Broaden to all admin endpoints
                 .requestMatchers("/actuator/health", "/actuator/info").permitAll() // Allow health checks
@@ -95,6 +102,24 @@ public class SecurityConfig {
 
         logger.info("Security filter chain configured with basic auth; OAuth2 upgrade pending.");
         return http.build();
+    }
+
+    @Bean
+    public LoginAttemptFilter loginAttemptFilter(LoginAttemptLimiter limiter) {
+        return new LoginAttemptFilter(limiter);
+    }
+
+    /**
+     * Boot auto-registers every {@code Filter} bean as a global servlet filter mapped to
+     * {@code /*}. {@link LoginAttemptFilter} is meant to run only where
+     * {@code securityFilterChain} places it via {@code addFilterBefore} — disable the
+     * automatic registration so it isn't invoked twice per request.
+     */
+    @Bean
+    public FilterRegistrationBean<LoginAttemptFilter> loginAttemptFilterRegistration(LoginAttemptFilter filter) {
+        FilterRegistrationBean<LoginAttemptFilter> registration = new FilterRegistrationBean<>(filter);
+        registration.setEnabled(false);
+        return registration;
     }
 
     @Bean

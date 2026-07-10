@@ -1,6 +1,11 @@
 target/
 */target/
-client/
+# The Dockerfile needs client/pom.xml (so the Maven reactor can resolve the
+# module) but never client/src — the client's JavaFX sources/natives must
+# never enter the server image. "client/*" + the negation is required: Docker
+# can't selectively un-ignore a file whose parent directory is excluded wholesale.
+client/*
+!client/pom.xml
 .git/
 .github/
 kubernetes/
