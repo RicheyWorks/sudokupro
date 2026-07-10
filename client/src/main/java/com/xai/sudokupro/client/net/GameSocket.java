@@ -31,7 +31,7 @@ public final class GameSocket implements WebSocket.Listener, AutoCloseable {
     private final StringBuilder partial = new StringBuilder();
     private volatile WebSocket webSocket;
 
-    private GameSocket(ObjectMapper mapper, Consumer<Envelope> onEnvelope, Runnable onClose) {
+    GameSocket(ObjectMapper mapper, Consumer<Envelope> onEnvelope, Runnable onClose) {
         this.mapper = mapper;
         this.onEnvelope = onEnvelope;
         this.onClose = onClose;

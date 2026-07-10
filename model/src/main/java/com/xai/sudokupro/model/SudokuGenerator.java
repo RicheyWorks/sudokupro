@@ -50,6 +50,7 @@ public class SudokuGenerator {
             try {
                 SudokuCell[][] board = initializeBoard();
                 createFullSolution(board);
+                markAllGiven(board);
                 removeNumbers(board, difficulty.cellsRemoved, enforceSymmetry, maximizeConflicts);
                 if (chaosMode) applyChaosTwist(board);
                 if (mirrorMode) applyMirrorSymmetry(board);
@@ -101,6 +102,19 @@ public class SudokuGenerator {
         }
         logger.debug("Full solution created");
         generationLog.add("Full solution created");
+    }
+
+    /**
+     * Flags every filled cell as given right after the solution is built. removeNumbers()
+     * then unmarks exactly the cells it actually removes (setGiven(false) before setValue(0)),
+     * so every retained clue ends the run correctly flagged isGiven=true.
+     */
+    private void markAllGiven(SudokuCell[][] board) {
+        for (int i = 0; i < size; i++) {
+            for (int j = 0; j < size; j++) {
+                board[i][j].setGiven(true);
+            }
+        }
     }
 
     private boolean solveSudoku(SudokuCell[][] board, int row, int col, int depth) {

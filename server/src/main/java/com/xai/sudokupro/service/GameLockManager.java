@@ -22,9 +22,16 @@ import java.util.concurrent.locks.ReentrantLock;
  *  - a Redis lock (SET NX PX + token-checked release) so pods don't mutate the
  *    same game concurrently.
  *
- * If the Redis lock can't be acquired within the wait budget — or Redis is down —
- * we proceed under the local lock only and log; blocking gameplay on a Redis
- * hiccup would be worse than the (single-replica-equivalent) risk.
+ * These two failure modes are handled differently, since only one of them still
+ * leaves the game protected by *something*:
+ *  - Redis is unreachable: we proceed under the local lock only and log once.
+ *    Fine for a single replica (the local lock is real exclusion there); blocking
+ *    gameplay on a Redis hiccup would be worse than that single-replica-equivalent
+ *    risk.
+ *  - Redis is reachable but another replica genuinely holds the lock past the wait
+ *    budget: proceeding under the local lock would NOT prevent the other replica
+ *    from mutating the same game concurrently, so {@link #lock} throws instead of
+ *    silently continuing unprotected.
  */
 @Component
 public class GameLockManager {
@@ -48,12 +55,25 @@ public class GameLockManager {
         this.redis = redis;
     }
 
-    /** Acquires the game lock; release with try-with-resources. */
+    /**
+     * Acquires the game lock; release with try-with-resources.
+     *
+     * @throws IllegalStateException if Redis is reachable but another replica holds
+     *         the lock past the wait budget — proceeding would silently defeat
+     *         cross-replica exclusion, so this is a hard failure rather than a
+     *         degrade. Callers should surface it as "busy, try again" rather than
+     *         retry-loop internally.
+     */
     public LockHandle lock(String gameId) {
         ReentrantLock local = localLocks.computeIfAbsent(gameId, k -> new ReentrantLock());
         local.lock();
-        String token = acquireRedis(gameId);
-        return new LockHandle(gameId, local, token);
+        try {
+            String token = acquireRedis(gameId);
+            return new LockHandle(gameId, local, token);
+        } catch (RuntimeException e) {
+            local.unlock();
+            throw e;
+        }
     }
 
     /** Drops the local lock entry when a game ends (Redis keys expire via TTL). */
@@ -72,17 +92,21 @@ public class GameLockManager {
                 }
                 Thread.sleep(RETRY_SLEEP_MS);
             }
-            logger.warn("Game {} redis lock not acquired within {}ms — proceeding under local lock",
-                gameId, WAIT_BUDGET_MS);
         } catch (InterruptedException ie) {
             Thread.currentThread().interrupt();
+            return null;
         } catch (Exception e) {
             if (degradedLogged.compareAndSet(false, true)) {
                 logger.warn("GameLockManager: Redis unavailable — local locking only. "
                     + "Fine for a single replica; NOT safe with multiple replicas. Cause: {}", e.getMessage());
             }
+            return null;
         }
-        return null;
+        // Loop exhausted the wait budget without ever throwing, i.e. Redis is reachable
+        // and another replica genuinely holds the lock — not a Redis outage. Proceeding
+        // under the local lock only would silently defeat cross-replica exclusion.
+        logger.warn("Game {} redis lock held by another replica past {}ms wait budget", gameId, WAIT_BUDGET_MS);
+        throw new IllegalStateException("Game " + gameId + " is busy on another server instance — try again");
     }
 
     private void releaseRedis(String gameId, String token) {

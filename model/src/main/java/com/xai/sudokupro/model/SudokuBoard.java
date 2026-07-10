@@ -231,7 +231,8 @@ public class SudokuBoard implements Serializable {
     }
 
     public synchronized void applyExternalMove(EnhancedMove move) {
-        if (move == null || !isValidMove(move.row(), move.col(), move.newVal())) return;
+        if (move == null || !isCellEditable(move.row(), move.col())
+                || !isValidMove(move.row(), move.col(), move.newVal())) return;
         int oldVal = board[move.row()][move.col()].getValue();
         board[move.row()][move.col()].setValue(move.newVal(), move.source());
         moveHistory.push(new Move(move.row(), move.col(), oldVal, move.newVal(), move.source()));
@@ -250,7 +251,7 @@ public class SudokuBoard implements Serializable {
     public synchronized void applyBatchMoves(List<EnhancedMove> moves) {
         if (moves == null || moves.isEmpty()) return;
         for (EnhancedMove m : moves) {
-            if (isValidMove(m.row(), m.col(), m.newVal())) {
+            if (isCellEditable(m.row(), m.col()) && isValidMove(m.row(), m.col(), m.newVal())) {
                 int oldVal = board[m.row()][m.col()].getValue();
                 board[m.row()][m.col()].setValue(m.newVal(), m.source());
                 moveHistory.push(new Move(m.row(), m.col(), oldVal, m.newVal(), m.source()));
