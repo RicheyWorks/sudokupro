@@ -41,6 +41,13 @@ public class User implements Serializable {
     @Min(value = 0, message = "Streak cannot be negative")
     private int streak;
 
+    /**
+     * BCrypt hash for self-registered players; null for legacy/auto-provisioned
+     * wallet rows (claimable by the first registration). Never serialized.
+     */
+    @com.fasterxml.jackson.annotation.JsonIgnore
+    private String passwordHash;
+
     /** ELO-style duel rating; everyone starts at 1000. */
     @Min(value = 0, message = "Rating cannot be negative")
     private int duelRating = 1000;
@@ -147,6 +154,10 @@ public class User implements Serializable {
     public void setPoints(int points) { this.points = Math.max(0, points); }
     public int getStreak() { return streak; }
     public void setStreak(int streak) { this.streak = Math.max(0, streak); }
+    @com.fasterxml.jackson.annotation.JsonIgnore
+    public String getPasswordHash() { return passwordHash; }
+    public void setPasswordHash(String passwordHash) { this.passwordHash = passwordHash; }
+
     public int getDuelRating() { return duelRating; }
     public void setDuelRating(int duelRating) { this.duelRating = Math.max(0, duelRating); }
     public int getDuelWins() { return duelWins; }

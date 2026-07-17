@@ -160,7 +160,37 @@ public class MainStage extends Application {
             connector.start();
         });
 
-        VBox welcome = new VBox(20, welcomeTitle, serverField, userField, passField, startButton, statusLabel);
+        Button registerButton = new Button("Register New Account");
+        registerButton.setStyle("-fx-background-color: #2E2E5E; -fx-text-fill: #FFFFFF;");
+        registerButton.setOnAction(e -> {
+            registerButton.setDisable(true);
+            statusLabel.setStyle("-fx-text-fill: #00FFFF;");
+            statusLabel.setText("Registering " + userField.getText().trim() + "…");
+            String server = serverField.getText().trim();
+            String user = userField.getText().trim();
+            String pass = passField.getText();
+            Thread registrar = new Thread(() -> {
+                try {
+                    ServerApi.register(server, user, pass);
+                    Platform.runLater(() -> {
+                        statusLabel.setStyle("-fx-text-fill: #55FF55;");
+                        statusLabel.setText("Account created — now hit Connect!");
+                        registerButton.setDisable(false);
+                    });
+                } catch (ApiException ex) {
+                    logger.warn("Registration failed: {}", ex.getMessage());
+                    Platform.runLater(() -> {
+                        statusLabel.setStyle("-fx-text-fill: #FF5555;");
+                        statusLabel.setText(ex.getMessage());
+                        registerButton.setDisable(false);
+                    });
+                }
+            }, "sudokupro-register");
+            registrar.setDaemon(true);
+            registrar.start();
+        });
+
+        VBox welcome = new VBox(20, welcomeTitle, serverField, userField, passField, startButton, registerButton, statusLabel);
         welcome.setAlignment(Pos.CENTER);
         welcome.setStyle("-fx-background-color: #000000;");
         return welcome;

@@ -34,6 +34,7 @@ sudokupro/
 - **Real-time multiplayer** — raw-WebSocket duels, drip showdowns, and daily challenges; broadcasts fan out across server replicas via Redis pub/sub
 - **Daily puzzle & streaks** — one shared puzzle per UTC day (identical on every replica), per-player copies played through the normal game flow, consecutive-day streaks, and a fastest-solve daily leaderboard
 - **Head-to-head duels** — challenge any player, both race on identical copies of one puzzle, first correct solve wins; ELO ratings, a duel ladder, and one-tap rematches
+- **Player accounts** — self-service registration (`POST /api/auth/register`), BCrypt-hashed credentials on the same rows that hold wallets and ratings, password change, and a reserved env-provided admin
 - **Smart difficulty** — an adaptive model recommends each player's level: three fast clean solves promote it, three slow/abandoned games demote it; the old DifficultyTuner hook now reports real aggregate skill data
 - **Weekly tournament** — five puzzles per ISO week with ramping difficulty; only players who finish all five are ranked, by cumulative solve time
 - **Seasons** — quarterly duel seasons with lazy exactly-once rollover: the ladder podium earns a SeasonChampion badge and ratings soft-reset toward 1000
@@ -203,6 +204,8 @@ Cross-pod delivery is verified by a two-pod integration test on real Redis in CI
 | `GET` | `/api/duel/leaderboard?limit=` | Duel ladder by ELO rating |
 | `GET` | `/api/daily/archive?limit=` | Dates with playable archived dailies |
 | `POST` | `/api/daily/archive/{date}/join` | Play a past daily (no streak credit) |
+| `POST` | `/api/auth/register` | Create a player account (no auth required) |
+| `POST` | `/api/auth/password` | Change the caller's password |
 | `GET` | `/api/game/recommended-difficulty` | The adaptive model's difficulty for the caller |
 | `GET` | `/api/game/{id}/share` | Share code for a puzzle (grid only, never the solution) |
 | `POST` | `/api/game/import` | Import a shared puzzle as your own game |

@@ -79,6 +79,39 @@ public class ServerApi {
         return config;
     }
 
+    /**
+     * Registers a new player account. Static and unauthenticated: it runs
+     * before any credentials exist, so no Authorization header may be sent
+     * (Basic credentials for an unknown user would 401 even on permitAll).
+     */
+    public static void register(String baseUrl, String username, String password) {
+        try {
+            String body = new ObjectMapper().writeValueAsString(
+                java.util.Map.of("username", username, "password", password));
+            HttpResponse<String> response = HttpClient.newHttpClient().send(
+                HttpRequest.newBuilder(URI.create(baseUrl.replaceAll("/+$", "") + "/api/auth/register"))
+                    .timeout(TIMEOUT)
+                    .header("Content-Type", "application/json")
+                    .POST(HttpRequest.BodyPublishers.ofString(body))
+                    .build(),
+                HttpResponse.BodyHandlers.ofString());
+            int status = response.statusCode();
+            if (status == 201) return;
+            String detail;
+            try {
+                detail = new ObjectMapper().readTree(response.body()).path("detail").asText("HTTP " + status);
+            } catch (IOException e) {
+                detail = "HTTP " + status;
+            }
+            throw new ApiException(status, detail);
+        } catch (IOException e) {
+            throw new ApiException("Cannot reach server at " + baseUrl + ": " + e.getMessage(), e);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new ApiException("Registration interrupted", e);
+        }
+    }
+
     // ---- game lifecycle (REST) --------------------------------------------
 
     public BoardState newGame(int difficulty, boolean chaos, boolean mirror) {

@@ -28,8 +28,33 @@ public class SecurityConfig {
     private static final Logger logger = LoggerFactory.getLogger(SecurityConfig.class);
 
     @Bean
-    public SecurityFilterChain securityFilterChain(HttpSecurity http, LoginAttemptFilter loginAttemptFilter)
+    public SecurityFilterChain securityFilterChain(HttpSecurity http, LoginAttemptFilter loginAttemptFilter,
+            com.xai.sudokupro.service.auth.AccountService accountService,
+            @org.springframework.beans.factory.annotation.Value("${spring.security.user.name:admin}") String adminUser,
+            @org.springframework.beans.factory.annotation.Value("${spring.security.user.password:}") String adminPassword)
             throws Exception {
+        // Two authentication providers (real player accounts, AUDIT follow-up):
+        //  1. DB-backed players (users.password_hash, BCrypt, ROLE_PLAYER)
+        //  2. the env-provided admin (ROLE_ADMIN) — must be registered manually
+        //     because defining our own UserDetailsService bean disables Boot's
+        //     spring.security.user auto-configuration.
+        var playerProvider = new org.springframework.security.authentication.dao.DaoAuthenticationProvider();
+        playerProvider.setUserDetailsService(accountService);
+        playerProvider.setPasswordEncoder(accountService.encoder());
+        http.authenticationProvider(playerProvider);
+
+        if (adminPassword != null && !adminPassword.isBlank()) {
+            var adminDetails = new org.springframework.security.provisioning.InMemoryUserDetailsManager(
+                org.springframework.security.core.userdetails.User.withUsername(adminUser)
+                    .password(accountService.encoder().encode(adminPassword))
+                    .roles("ADMIN")
+                    .build());
+            var adminProvider = new org.springframework.security.authentication.dao.DaoAuthenticationProvider();
+            adminProvider.setUserDetailsService(adminDetails);
+            adminProvider.setPasswordEncoder(accountService.encoder());
+            http.authenticationProvider(adminProvider);
+        }
+
         http
             // Brute-force lockout (LoginAttemptLimiter): must run before Spring Security
             // even attempts to authenticate the Basic credentials.
@@ -38,6 +63,8 @@ public class SecurityConfig {
                 .requestMatchers("/admin/**").hasRole("ADMIN") // Broaden to all admin endpoints
                 .requestMatchers("/actuator/health", "/actuator/info").permitAll() // Allow health checks
                 .requestMatchers("/ws/**").permitAll() // WebSocket endpoint for multiplayer
+                .requestMatchers(org.springframework.http.HttpMethod.POST, "/api/auth/register")
+                    .permitAll() // account creation precedes credentials by definition
                 .anyRequest().authenticated() // Tighten default access
             )
             .httpBasic(httpBasic -> httpBasic
@@ -53,7 +80,9 @@ public class SecurityConfig {
             // exempted; the WebSocket handshake itself is protected by same-origin policy.
             .csrf(csrf -> csrf
                 .csrfTokenRepository(CookieCsrfTokenRepository.withHttpOnlyFalse())
-                .ignoringRequestMatchers("/ws/**")
+                // Registration is exempt alongside /ws/**: it happens before any
+                // session/credentials exist, so there is no session to ride.
+                .ignoringRequestMatchers("/ws/**", "/api/auth/register")
             )
             .logout(logout -> logout
                 .logoutUrl("/logout")

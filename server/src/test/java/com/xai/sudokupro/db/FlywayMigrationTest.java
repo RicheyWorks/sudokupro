@@ -63,6 +63,8 @@ class FlywayMigrationTest {
             assertTrue(migrationApplied(c, "1"), "V1 must be recorded");
             assertTrue(migrationApplied(c, "2"), "V2 must be recorded (idempotent no-op here)");
             assertTrue(migrationApplied(c, "3"), "V3 (cells_json) must be recorded");
+            assertEquals("integer", columnType(c, "users", "duel_rating"), "V5 adds duel_rating");
+            assertEquals("character varying", columnType(c, "users", "password_hash"), "V6 adds password_hash");
             assertTrue(migrationApplied(c, "4"), "V4 (users.id identity) must be recorded");
             // users.id is generated: inserting without an id must work
             try (Statement st = c.createStatement()) {
@@ -114,6 +116,8 @@ class FlywayMigrationTest {
                 "V3 must add cells_json to upgraded legacy databases");
             assertTrue(migrationApplied(c, "4"),
                 "V4 must apply on legacy databases even without a users table (IF EXISTS)");
+            assertTrue(migrationApplied(c, "5"), "V5 (duel_rating) must apply on legacy databases");
+            assertTrue(migrationApplied(c, "6"), "V6 (password_hash) must apply on legacy databases");
             // The BIGINT column is now a real timestamp, data converted not lost
             assertEquals("timestamp without time zone", columnType(c, "sudoku_boards", "start_time"));
             try (Statement st = c.createStatement();
