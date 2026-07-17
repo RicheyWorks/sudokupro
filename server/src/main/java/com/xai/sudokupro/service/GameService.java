@@ -108,7 +108,7 @@ public class GameService {
             trimActiveGames();
         }
         saveToRedis(gameId, board);
-        gameRepository.save(board);
+        persistBoard(board);
         chaosEngine.onGameEvent("RESET", pid);
         multiplayerBroadcaster.broadcastGameStart(gameId, pid);
         logger.info("Game created id={} player={} difficulty={}", gameId, pid, difficulty);
@@ -194,7 +194,7 @@ public class GameService {
 
             chaosEngine.onGameEvent("MOVE", playerId);
             saveToRedis(gameId, board);
-            gameRepository.save(board);
+            persistBoard(board);
 
             if (board.isSolved()) {
                 // Check for suspiciously fast solve only after the board is actually solved.
@@ -225,7 +225,7 @@ public class GameService {
             if (board != null) {
                 gameLocks.releaseGame(gameId);   // drop the per-game local lock entry
                 redisTemplate.delete(redisKey(gameId));
-                gameRepository.save(board);
+                persistBoard(board);
                 GameEvent.EventType type = board.isSolved()
                     ? GameEvent.EventType.SOLVE : GameEvent.EventType.LEAVE;
                 analyticsService.recordEvent(new GameEvent(type, playerId,
@@ -234,6 +234,78 @@ public class GameService {
                 logger.info("Game {} ended for player {}", gameId, playerId);
             }
         }
+    }
+
+    // =====================================================================
+    // Save / load (explicit persistence)
+    // =====================================================================
+
+    /**
+     * Explicitly persists the current state of a game (grid included, via the
+     * entity's cells_json snapshot) so the player can resume it later — even
+     * after a server restart or Redis cache expiry.
+     *
+     * @throws IllegalArgumentException if the game does not exist
+     * @throws SecurityException        if the caller does not own the game
+     */
+    public SudokuBoard saveGame(String gameId, String playerId) {
+        validateGameId(gameId);
+        validatePlayerId(playerId);
+        try (var lock = gameLocks.lock(gameId)) {
+            SudokuBoard board = getGame(gameId);
+            requireOwner(board, playerId);
+            saveToRedis(gameId, board);
+            persistBoard(board);
+            logger.info("Game {} explicitly saved by player {}", gameId, playerId);
+            return board;
+        }
+    }
+
+    /** Unfinished, resumable games for a player, newest first (limit capped at 50). */
+    public List<SudokuBoard> listSavedGames(String playerId, int limit) {
+        validatePlayerId(playerId);
+        int capped = Math.max(1, Math.min(limit, 50));
+        return gameRepository.findResumableByPlayerId(playerId,
+            org.springframework.data.domain.PageRequest.of(0, capped));
+    }
+
+    /**
+     * Loads a saved game back into the active set (read-through: memory, then
+     * Redis, then the database) and hands it back for play.
+     *
+     * @throws IllegalArgumentException if the game does not exist
+     * @throws SecurityException        if the caller does not own the game
+     * @throws IllegalStateException    if the game is already solved
+     */
+    public SudokuBoard resumeGame(String gameId, String playerId) {
+        validateGameId(gameId);
+        validatePlayerId(playerId);
+        try (var lock = gameLocks.lock(gameId)) {
+            SudokuBoard board = getGame(gameId); // re-registers in activeGames + Redis
+            requireOwner(board, playerId);
+            if (board.isSolved()) {
+                throw new IllegalStateException("Game already solved: " + gameId);
+            }
+            logger.info("Game {} resumed by player {}", gameId, playerId);
+            return board;
+        }
+    }
+
+    private void requireOwner(SudokuBoard board, String playerId) {
+        if (!playerId.equals(board.getPlayerId())) {
+            throw new SecurityException("Game " + board.getGameId() + " does not belong to player " + playerId);
+        }
+    }
+
+    /**
+     * Single choke point for database writes of game boards. syncCellsJson()
+     * must run first: saves of already-persisted boards go through JPA merge,
+     * where only persistent fields reach the row — the transient grid does not
+     * (see SudokuBoard#syncCellsJson for why a @PreUpdate callback can't do this).
+     */
+    private void persistBoard(SudokuBoard board) {
+        board.syncCellsJson();
+        gameRepository.save(board);
     }
 
     public void solveSudoku(String gameId) {
@@ -255,7 +327,7 @@ public class GameService {
             SudokuBoard board = getGame(gameId);
             board.undo();
             saveToRedis(gameId, board);
-            gameRepository.save(board);
+            persistBoard(board);
             return board;
         }
     }
@@ -267,7 +339,7 @@ public class GameService {
             SudokuBoard board = getGame(gameId);
             board.redo();
             saveToRedis(gameId, board);
-            gameRepository.save(board);
+            persistBoard(board);
             return board;
         }
     }
@@ -354,7 +426,7 @@ public class GameService {
     public void shutdown() {
         activeGames.forEach((id, board) -> {
             try {
-                gameRepository.save(board);
+                persistBoard(board);
             } catch (Exception e) {
                 logger.error("Shutdown DB save failed for {}: {}", id, e.getMessage());
             }

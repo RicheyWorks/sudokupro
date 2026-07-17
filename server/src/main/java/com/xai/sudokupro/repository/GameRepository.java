@@ -38,6 +38,15 @@ public interface GameRepository extends JpaRepository<SudokuBoard, Long> {
     @Query("SELECT b FROM SudokuBoard b WHERE b.playerId = :playerId ORDER BY b.startTime DESC")
     List<SudokuBoard> findByPlayerId(@Param("playerId") String playerId, Pageable pageable);
 
+    /**
+     * Unfinished games a player can resume, newest first. Only rows with a
+     * persisted cell snapshot qualify — rows written before the V3 migration
+     * have no grid to restore. Deliberately NOT @Cacheable: the saved-games
+     * list must reflect the latest saves immediately.
+     */
+    @Query("SELECT b FROM SudokuBoard b WHERE b.playerId = :playerId AND b.solved = false AND b.cellsJson IS NOT NULL ORDER BY b.startTime DESC")
+    List<SudokuBoard> findResumableByPlayerId(@Param("playerId") String playerId, Pageable pageable);
+
     @Query("SELECT b FROM SudokuBoard b WHERE b.cosmicDripLevel >= :minDrip ORDER BY b.cosmicDripLevel DESC, b.solveTimeSeconds ASC")
     @Cacheable(value = "cosmicDripGames", key = "#minDrip + '-' + #pageable.pageNumber")
     List<SudokuBoard> findCosmicDripGames(@Param("minDrip") int minDrip, Pageable pageable);

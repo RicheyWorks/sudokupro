@@ -114,6 +114,59 @@ public class SudokuGameController {
         return ResponseEntity.noContent().build();
     }
 
+    @Operation(summary = "Explicitly save a game so it can be resumed later")
+    @ApiResponses({
+        @ApiResponse(responseCode = "200", description = "Game persisted"),
+        @ApiResponse(responseCode = "403", description = "Game belongs to another player",
+                content = @io.swagger.v3.oas.annotations.media.Content(mediaType = "application/problem+json")),
+        @ApiResponse(responseCode = "404", description = "Unknown game",
+                content = @io.swagger.v3.oas.annotations.media.Content(mediaType = "application/problem+json"))
+    })
+    @PostMapping("/{gameId}/save")
+    public ResponseEntity<Object> save(@PathVariable String gameId) {
+        try {
+            SudokuBoard board = gameService.saveGame(gameId, authService.getCurrentPlayerId());
+            return ResponseEntity.ok(Map.of("status", "saved", "gameId", board.getGameId()));
+        } catch (SecurityException e) {
+            return problemResponse(HttpStatus.FORBIDDEN, "Not Your Game", e.getMessage());
+        } catch (IllegalArgumentException e) {
+            return problemResponse(HttpStatus.NOT_FOUND, "Unknown Game", e.getMessage());
+        }
+    }
+
+    @Operation(summary = "List the caller's saved (unfinished, resumable) games, newest first")
+    @GetMapping("/saved")
+    public ResponseEntity<Object> savedGames(@RequestParam(defaultValue = "10") @Min(1) @Max(50) int limit) {
+        String playerId = authService.getCurrentPlayerId();
+        return ResponseEntity.ok(gameService.listSavedGames(playerId, limit).stream()
+            .map(BoardState::from)
+            .toList());
+    }
+
+    @Operation(summary = "Resume a previously saved game")
+    @ApiResponses({
+        @ApiResponse(responseCode = "200", description = "Game state returned, game re-activated"),
+        @ApiResponse(responseCode = "403", description = "Game belongs to another player",
+                content = @io.swagger.v3.oas.annotations.media.Content(mediaType = "application/problem+json")),
+        @ApiResponse(responseCode = "404", description = "Unknown game",
+                content = @io.swagger.v3.oas.annotations.media.Content(mediaType = "application/problem+json")),
+        @ApiResponse(responseCode = "409", description = "Game already finished",
+                content = @io.swagger.v3.oas.annotations.media.Content(mediaType = "application/problem+json"))
+    })
+    @PostMapping("/{gameId}/resume")
+    public ResponseEntity<Object> resume(@PathVariable String gameId) {
+        try {
+            SudokuBoard board = gameService.resumeGame(gameId, authService.getCurrentPlayerId());
+            return ResponseEntity.ok(BoardState.from(board));
+        } catch (SecurityException e) {
+            return problemResponse(HttpStatus.FORBIDDEN, "Not Your Game", e.getMessage());
+        } catch (IllegalStateException e) {
+            return problemResponse(HttpStatus.CONFLICT, "Game Already Finished", e.getMessage());
+        } catch (IllegalArgumentException e) {
+            return problemResponse(HttpStatus.NOT_FOUND, "Unknown Game", e.getMessage());
+        }
+    }
+
     @Operation(summary = "Get a hint from the AI solver")
     @ApiResponses({
         @ApiResponse(responseCode = "200", description = "Hint returned"),
@@ -153,7 +206,14 @@ public class SudokuGameController {
         return Map.of("type", type, "title", title, "detail", detail);
     }
 
+    private ResponseEntity<Object> problemResponse(HttpStatus status, String title, String detail) {
+        return ResponseEntity.status(status)
+            .contentType(MediaType.APPLICATION_PROBLEM_JSON)
+            .body(buildProblem(GAME_CREATION_ERROR, title, detail));
+    }
+
     // The old /save stub was removed (AUDIT P1-3): it claimed success while
-    // persisting nothing. Lifecycle is now: POST /new, GET /{id}, POST /{id}/solve,
-    // POST /{id}/end; moves run over the WebSocket channel.
+    // persisting nothing. POST /{id}/save above is the real implementation —
+    // it persists the full grid (cells_json) and is paired with GET /saved and
+    // POST /{id}/resume. Moves still run over the WebSocket channel.
 }

@@ -155,6 +155,66 @@ class ServerApiTest {
     }
 
     @Test
+    void saveGamePostsToTheSaveEndpointWithCsrf() throws IOException {
+        server = startServer();
+        server.createContext("/api/session", ex ->
+            respond(ex, 200, "{\"playerId\":\"richmond\",\"csrfHeaderName\":\"X-XSRF-TOKEN\",\"csrfToken\":\"tok-123\"}"));
+
+        AtomicReference<String> seenMethod = new AtomicReference<>();
+        AtomicReference<String> seenCsrf = new AtomicReference<>();
+        server.createContext("/api/game/g1/save", ex -> {
+            seenMethod.set(ex.getRequestMethod());
+            seenCsrf.set(ex.getRequestHeaders().getFirst("X-XSRF-TOKEN"));
+            respond(ex, 200, "{\"status\":\"saved\",\"gameId\":\"g1\"}");
+        });
+        server.start();
+
+        ServerApi api = new ServerApi(configFor(server));
+        api.connect();
+        api.saveGame("g1");
+
+        assertEquals("POST", seenMethod.get());
+        assertEquals("tok-123", seenCsrf.get(), "mutating save must echo the CSRF token");
+    }
+
+    @Test
+    void savedGamesDeserializesTheBoardStateList() throws IOException {
+        server = startServer();
+        server.createContext("/api/session", ex ->
+            respond(ex, 200, "{\"playerId\":\"richmond\",\"csrfHeaderName\":\"X-XSRF-TOKEN\",\"csrfToken\":\"tok-123\"}"));
+        server.createContext("/api/game/saved", ex -> respond(ex, 200,
+            "[{\"gameId\":\"g1\",\"playerId\":\"richmond\",\"difficulty\":2,"
+            + "\"chaosMode\":false,\"mirrorMode\":false,\"solved\":false,\"lives\":3,\"score\":40,"
+            + "\"hintCount\":1,\"moveCount\":12,\"cells\":[]}]"));
+        server.start();
+
+        ServerApi api = new ServerApi(configFor(server));
+        api.connect();
+        List<com.xai.sudokupro.model.api.BoardState> saved = api.savedGames(10);
+
+        assertEquals(1, saved.size());
+        assertEquals("g1", saved.get(0).gameId());
+        assertEquals(12, saved.get(0).moveCount());
+    }
+
+    @Test
+    void resumeGameReturnsTheResumedBoardState() throws IOException {
+        server = startServer();
+        server.createContext("/api/session", ex ->
+            respond(ex, 200, "{\"playerId\":\"richmond\",\"csrfHeaderName\":\"X-XSRF-TOKEN\",\"csrfToken\":\"tok-123\"}"));
+        server.createContext("/api/game/g1/resume", ex ->
+            respond(ex, 200, "{\"gameId\":\"g1\",\"playerId\":\"richmond\",\"difficulty\":2,"
+            + "\"chaosMode\":false,\"mirrorMode\":false,\"solved\":false,\"lives\":2,\"score\":40,"
+            + "\"hintCount\":1,\"moveCount\":12,\"cells\":[]}"));
+        server.start();
+
+        ServerApi api = new ServerApi(configFor(server));
+        api.connect();
+
+        assertEquals("g1", api.resumeGame("g1").gameId());
+    }
+
+    @Test
     void unreachableServerWrapsTheIOExceptionInApiException() {
         // Nothing listening on this port — connection refused.
         ServerConfig config = new ServerConfig("http://localhost:1", "admin", "secret");

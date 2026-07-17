@@ -21,9 +21,10 @@ import static org.junit.jupiter.api.Assertions.*;
  * Skipped automatically where Docker is unavailable; CI runs it.
  *
  * Covers both deployment scenarios:
- *  1. Fresh database — V1 (baseline schema) + V2 apply cleanly.
- *  2. Legacy pre-Flyway database — baseline-on-migrate skips V1 and V2
- *     converts the old BIGINT start_time column to TIMESTAMP.
+ *  1. Fresh database — V1 (baseline schema) + V2 + V3 apply cleanly.
+ *  2. Legacy pre-Flyway database — baseline-on-migrate skips V1; V2
+ *     converts the old BIGINT start_time column to TIMESTAMP and V3
+ *     adds the cells_json grid-snapshot column.
  */
 @Testcontainers(disabledWithoutDocker = true)
 @TestMethodOrder(MethodOrderer.OrderAnnotation.class)
@@ -56,9 +57,12 @@ class FlywayMigrationTest {
             }
             // start_time is TIMESTAMP from day one on fresh installs
             assertEquals("timestamp without time zone", columnType(c, "sudoku_boards", "start_time"));
-            // Both migrations recorded
+            // cells_json (save/load grid snapshot) exists on fresh installs
+            assertEquals("text", columnType(c, "sudoku_boards", "cells_json"));
+            // All migrations recorded
             assertTrue(migrationApplied(c, "1"), "V1 must be recorded");
             assertTrue(migrationApplied(c, "2"), "V2 must be recorded (idempotent no-op here)");
+            assertTrue(migrationApplied(c, "3"), "V3 (cells_json) must be recorded");
         }
     }
 
@@ -93,6 +97,9 @@ class FlywayMigrationTest {
             // Baselined past V1 (schema pre-exists), V2 applied
             assertFalse(migrationApplied(c, "1"), "V1 must be skipped on a baselined legacy database");
             assertTrue(migrationApplied(c, "2"), "V2 must run on a legacy database");
+            assertTrue(migrationApplied(c, "3"), "V3 must run on a legacy database");
+            assertEquals("text", columnType(c, "sudoku_boards", "cells_json"),
+                "V3 must add cells_json to upgraded legacy databases");
             // The BIGINT column is now a real timestamp, data converted not lost
             assertEquals("timestamp without time zone", columnType(c, "sudoku_boards", "start_time"));
             try (Statement st = c.createStatement();

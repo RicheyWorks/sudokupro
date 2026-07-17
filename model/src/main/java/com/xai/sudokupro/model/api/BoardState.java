@@ -39,10 +39,13 @@ public record BoardState(
             for (SudokuCell cell : row) viewRow.add(new SudokuCellView(cell));
             cells.add(viewRow);
         }
+        // moveCount uses the persisted counter, not getMoveHistory().size(): the
+        // history deque is transient, so a board restored from the database (or the
+        // Redis cache) has an empty deque while the counter reflects the real total.
         return new BoardState(board.getGameId(), board.getPlayerId(), board.getDifficulty(),
             board.isChaosMode(), board.isMirrorMode(), board.isSolved(),
             board.getLives(), board.getScore(), board.getHintCount(),
-            board.getMoveHistory().size(), cells);
+            board.getMoveCount(), cells);
     }
 
     /**

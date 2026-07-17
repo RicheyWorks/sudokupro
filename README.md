@@ -176,6 +176,9 @@ Cross-pod delivery is verified by a two-pod integration test on real Redis in CI
 | `GET` | `/api/game/{gameId}` | Current board state (player-visible projection — never the solution) |
 | `POST` | `/api/game/{gameId}/solve` | AI auto-solve |
 | `POST` | `/api/game/{gameId}/end` | End/leave a game (state persisted server-side) |
+| `POST` | `/api/game/{gameId}/save` | Explicitly save a game (full grid persisted to Postgres) |
+| `GET` | `/api/game/saved?limit=` | The caller's unfinished, resumable games, newest first |
+| `POST` | `/api/game/{gameId}/resume` | Resume a saved game (survives restarts and cache expiry) |
 | `GET` | `/api/game/hint` | AI hint for the player's active game |
 | `GET` | `/api/session` | Auth check + CSRF bootstrap for API clients |
 | `GET` | `/api/leaderboard?limit=` | Public leaderboard |

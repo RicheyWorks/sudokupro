@@ -16,6 +16,8 @@ import org.mockito.junit.jupiter.MockitoExtension;
 import org.springframework.data.redis.core.RedisTemplate;
 import org.springframework.data.redis.core.ValueOperations;
 
+import java.util.List;
+
 import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
@@ -37,14 +39,16 @@ class GameServiceTest {
 
     @BeforeEach
     void setUp() {
+        // Shared wiring stubs, lenient() because not every test creates a game
+        // (e.g. the save/load tests drive boards in via the repository mock).
         // Wire up the Redis mock so saveToRedis doesn't NPE.
-        when(redisTemplate.opsForValue()).thenReturn(valueOps);
-        doNothing().when(valueOps).set(anyString(), any(), anyLong(), any());
+        lenient().when(redisTemplate.opsForValue()).thenReturn(valueOps);
+        lenient().doNothing().when(valueOps).set(anyString(), any(), anyLong(), any());
 
         // Stub side-effects called during createNewGame.
-        doNothing().when(chaosEngine).onGameEvent(anyString(), anyString());
-        doNothing().when(multiplayerBroadcaster).broadcastGameStart(anyString(), anyString());
-        when(gameRepository.save(any())).thenAnswer(inv -> inv.getArgument(0));
+        lenient().doNothing().when(chaosEngine).onGameEvent(anyString(), anyString());
+        lenient().doNothing().when(multiplayerBroadcaster).broadcastGameStart(anyString(), anyString());
+        lenient().when(gameRepository.save(any())).thenAnswer(inv -> inv.getArgument(0));
 
         // AISolverService needs a real SecureRandomGenerator for hint calls.
         SecureRandomGenerator rng = new SecureRandomGenerator(new SimpleMeterRegistry());
@@ -127,5 +131,76 @@ class GameServiceTest {
         assertThrows(IllegalArgumentException.class,
             () -> gameService.getGame("no-such-game"),
             "getGame must throw for unknown ids (WebSocketController relies on this)");
+    }
+
+    // ---- save / load ----
+
+    @Test
+    void saveGamePersistsForOwner() {
+        SudokuBoard board = gameService.createNewGame(1, "p-save", false, false);
+        clearInvocations(gameRepository);
+
+        SudokuBoard saved = gameService.saveGame(board.getGameId(), "p-save");
+
+        assertSame(board, saved);
+        verify(gameRepository).save(board);
+    }
+
+    @Test
+    void saveGameRejectsNonOwner() {
+        SudokuBoard board = gameService.createNewGame(1, "p-owner", false, false);
+        clearInvocations(gameRepository);
+
+        assertThrows(SecurityException.class,
+            () -> gameService.saveGame(board.getGameId(), "p-intruder"));
+        verify(gameRepository, never()).save(any());
+    }
+
+    @Test
+    void resumeGameFallsBackToDatabaseAndRestoresTheGrid() {
+        // Simulate a game that survives only in Postgres: not in activeGames, Redis
+        // read returns null, and the repository hands back an entity whose grid was
+        // rebuilt from cells_json (mimicked here via a snapshot round-trip, exactly
+        // what @PostLoad does).
+        SudokuBoard original = new SudokuBoard(1, false, false, 0, "g-db-only");
+        original.setPlayerId("p-resume");
+        SudokuBoard fromDb = new SudokuBoard(1, false, false, 0, "g-db-only");
+        fromDb.setPlayerId("p-resume");
+        fromDb.restoreCells(original.snapshotCells());
+
+        when(valueOps.get(anyString())).thenReturn(null);
+        when(gameRepository.findByGameId("g-db-only")).thenReturn(fromDb);
+
+        SudokuBoard resumed = gameService.resumeGame("g-db-only", "p-resume");
+
+        assertSame(fromDb, resumed);
+        for (int r = 0; r < 9; r++)
+            for (int c = 0; c < 9; c++)
+                assertEquals(original.getBoard()[r][c].getValue(),
+                    resumed.getBoard()[r][c].getValue(), "restored value at (" + r + "," + c + ")");
+        // And it is active again — a follow-up getGame must not hit the repository twice.
+        clearInvocations(gameRepository);
+        assertSame(resumed, gameService.getGame("g-db-only"));
+        verify(gameRepository, never()).findByGameId(anyString());
+    }
+
+    @Test
+    void resumeGameRejectsNonOwner() {
+        SudokuBoard board = gameService.createNewGame(1, "p-mine", false, false);
+        assertThrows(SecurityException.class,
+            () -> gameService.resumeGame(board.getGameId(), "p-thief"));
+    }
+
+    @Test
+    void listSavedGamesQueriesResumableGamesWithCappedLimit() {
+        when(gameRepository.findResumableByPlayerId(eq("p-list"), any()))
+            .thenReturn(List.of());
+
+        gameService.listSavedGames("p-list", 500);
+
+        var pageCaptor = org.mockito.ArgumentCaptor.forClass(
+            org.springframework.data.domain.PageRequest.class);
+        verify(gameRepository).findResumableByPlayerId(eq("p-list"), pageCaptor.capture());
+        assertEquals(50, pageCaptor.getValue().getPageSize(), "limit must be capped at 50");
     }
 }

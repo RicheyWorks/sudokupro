@@ -98,6 +98,23 @@ public class ServerApi {
         post("/api/game/" + gameId + "/end", Void.class);
     }
 
+    // ---- save / load --------------------------------------------------------
+
+    /** Explicitly persists the game server-side so it can be resumed later. */
+    public void saveGame(String gameId) {
+        post("/api/game/" + gameId + "/save", Void.class);
+    }
+
+    /** The caller's unfinished, resumable games, newest first. */
+    public List<BoardState> savedGames(int limit) {
+        return get("/api/game/saved?limit=" + limit, new TypeReference<List<BoardState>>() {});
+    }
+
+    /** Resumes a previously saved game and returns its current state. */
+    public BoardState resumeGame(String gameId) {
+        return post("/api/game/" + gameId + "/resume", BoardState.class);
+    }
+
     public String hint(String gameId) {
         JsonNode node = get("/api/game/hint?gameId=" + gameId, JsonNode.class);
         return node.path("hint").asText("No hint available.");

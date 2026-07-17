@@ -72,4 +72,62 @@ class SudokuGameControllerTest {
         assertEquals(HttpStatus.NO_CONTENT, controller.end("g-1").getStatusCode());
         verify(gameService).endGame("g-1", "richmond");
     }
+
+    // ---- save / load ----
+
+    @Test
+    void saveReturnsSavedStatusForOwner() {
+        when(authService.getCurrentPlayerId()).thenReturn("richmond");
+        when(gameService.saveGame("g-1", "richmond")).thenReturn(board);
+
+        ResponseEntity<Object> response = controller.save("g-1");
+
+        assertEquals(HttpStatus.OK, response.getStatusCode());
+        assertEquals(java.util.Map.of("status", "saved", "gameId", "g-1"), response.getBody());
+    }
+
+    @Test
+    void saveMapsSecurityExceptionTo403() {
+        when(authService.getCurrentPlayerId()).thenReturn("intruder");
+        when(gameService.saveGame("g-1", "intruder")).thenThrow(new SecurityException("not yours"));
+
+        assertEquals(HttpStatus.FORBIDDEN, controller.save("g-1").getStatusCode());
+    }
+
+    @Test
+    void resumeReturnsBoardStateProjection() {
+        when(authService.getCurrentPlayerId()).thenReturn("richmond");
+        when(gameService.resumeGame("g-1", "richmond")).thenReturn(board);
+
+        ResponseEntity<Object> response = controller.resume("g-1");
+
+        assertEquals(HttpStatus.OK, response.getStatusCode());
+        assertInstanceOf(BoardState.class, response.getBody(),
+            "resume must serialize the BoardState projection, never the raw entity");
+    }
+
+    @Test
+    void resumeMapsUnknownGameTo404AndFinishedGameTo409() {
+        when(authService.getCurrentPlayerId()).thenReturn("richmond");
+        when(gameService.resumeGame("gone", "richmond"))
+            .thenThrow(new IllegalArgumentException("Game not found: gone"));
+        when(gameService.resumeGame("done", "richmond"))
+            .thenThrow(new IllegalStateException("Game already solved: done"));
+
+        assertEquals(HttpStatus.NOT_FOUND, controller.resume("gone").getStatusCode());
+        assertEquals(HttpStatus.CONFLICT, controller.resume("done").getStatusCode());
+    }
+
+    @Test
+    void savedGamesListsCallersBoardsAsProjections() {
+        when(authService.getCurrentPlayerId()).thenReturn("richmond");
+        when(gameService.listSavedGames("richmond", 10)).thenReturn(java.util.List.of(board));
+
+        ResponseEntity<Object> response = controller.savedGames(10);
+
+        assertEquals(HttpStatus.OK, response.getStatusCode());
+        var list = (java.util.List<?>) response.getBody();
+        assertEquals(1, list.size());
+        assertInstanceOf(BoardState.class, list.get(0));
+    }
 }

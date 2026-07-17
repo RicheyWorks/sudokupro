@@ -1,7 +1,13 @@
 package com.xai.sudokupro.model;
 
+import com.fasterxml.jackson.annotation.JsonIgnore;
+import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
+import com.fasterxml.jackson.annotation.JsonProperty;
 import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ArrayNode;
+import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.xai.sudokupro.util.Constants;
 import jakarta.persistence.*;
 import jakarta.validation.constraints.NotNull;
@@ -23,6 +29,10 @@ import java.util.stream.Collectors;
 
 @Entity
 @Table(name = "sudoku_boards")
+// Older serialized copies (Redis cache entries written before the save/load work)
+// carry properties this class no longer exposes (e.g. the raw "board" grid); ignore
+// them instead of failing deserialization.
+@JsonIgnoreProperties(ignoreUnknown = true)
 public class SudokuBoard implements Serializable {
     private static final long serialVersionUID = 1L;
     private static final Logger logger = LoggerFactory.getLogger(SudokuBoard.class);
@@ -36,6 +46,14 @@ public class SudokuBoard implements Serializable {
     @Transient @NotNull private SudokuCell[][] board;
     private final int size = Constants.BOARD_SIZE;
 
+    // Persisted snapshot of the live (transient) grid. Kept in sync by the JPA
+    // lifecycle callbacks below so a board loaded back from the database — or from
+    // the Redis cache via the Jackson property of the same name — comes back with
+    // its real cells instead of the blank grid the no-arg constructor builds.
+    // (Save/load feature; also fixes the DB/Redis read-through grid loss.)
+    @Column(name = "cells_json", columnDefinition = "text")
+    private String cellsJson;
+
     // Core state
     private int difficulty;
     private String playerId;
@@ -43,17 +61,20 @@ public class SudokuBoard implements Serializable {
     private volatile boolean mirrorMode;
     private long timeLimitSeconds;
     private String gameId;
-    private LocalDateTime startTime;
+    // @JsonProperty on the fields below lets Jackson (the Redis cache serializer)
+    // restore them on read — they have getters but deliberately no public setters,
+    // so without the annotation a cache round-trip silently reset them.
+    @JsonProperty private LocalDateTime startTime;
 
     // Persisted derived state (computed fields are @Transient and can't be queried)
-    private boolean solved = false;
-    private long solveTimeSeconds = 0L;
-    private int moveCount = 0;
+    @JsonProperty private boolean solved = false;
+    @JsonProperty private long solveTimeSeconds = 0L;
+    @JsonProperty private int moveCount = 0;
 
     // Lives / scoring
     private int lives      = 3;
     private int maxLives   = 3;
-    private int revives    = 0;
+    @JsonProperty private int revives = 0;
     private int score      = 0;
 
     // Modes
@@ -61,8 +82,8 @@ public class SudokuBoard implements Serializable {
     private int     cosmicEvents;
     private boolean timeAttack;
     private boolean infiniteMode;
-    private boolean tensRule;
-    private boolean diagonalRules;
+    @JsonProperty private boolean tensRule;
+    @JsonProperty private boolean diagonalRules;
 
     // Move history
     @Transient private final Deque<Move>        moveHistory    = new ArrayDeque<>();
@@ -72,10 +93,10 @@ public class SudokuBoard implements Serializable {
 
     // Analytics
     @Transient private final Map<String, Integer> heatmapMistakeCounter = new HashMap<>();
-    private int      hintCount;
-    private boolean  usedUndo;
+    @JsonProperty private int      hintCount;
+    @JsonProperty private boolean  usedUndo;
     @Transient private Duration solveTime = Duration.ZERO;
-    private int      cosmicDripLevel;
+    @JsonProperty private int      cosmicDripLevel;
 
     // =====================================================================
     // Constructors
@@ -123,6 +144,135 @@ public class SudokuBoard implements Serializable {
         this.cosmicDripLevel = calculateCosmicDripLevel();
         if (!isValidBoardState()) throw new IllegalArgumentException("Invalid board state on creation");
         logger.info("SudokuBoard initialized for gameId: {}", this.gameId);
+    }
+
+    // =====================================================================
+    // Grid persistence (save/load)
+    // =====================================================================
+
+    /**
+     * Serializes the live grid to a compact JSON snapshot: a 9x9 array of
+     * {@code {"v":value,"g":given,"ms":moveSource,"pm":[...],"cf":[...]}}.
+     * This is the format persisted in the {@code cells_json} column and carried
+     * through the Redis cache; {@link #restoreCells(String)} is its inverse.
+     */
+    public synchronized String snapshotCells() {
+        ArrayNode rows = MAPPER.createArrayNode();
+        for (int i = 0; i < size; i++) {
+            ArrayNode row = MAPPER.createArrayNode();
+            for (int j = 0; j < size; j++) {
+                SudokuCell cell = board[i][j];
+                ObjectNode n = MAPPER.createObjectNode();
+                n.put("v", cell.getValue());
+                n.put("g", cell.isGiven());
+                SudokuCell.MoveSource ms = cell.getMoveSource();
+                n.put("ms", (ms != null ? ms : SudokuCell.MoveSource.UNKNOWN).name());
+                Set<Integer> pm = cell.getPencilMarks();
+                if (!pm.isEmpty()) {
+                    ArrayNode a = n.putArray("pm");
+                    pm.stream().sorted().forEach(a::add);
+                }
+                Set<Integer> cf = cell.getConflicts();
+                if (!cf.isEmpty()) {
+                    ArrayNode a = n.putArray("cf");
+                    cf.stream().sorted().forEach(a::add);
+                }
+                row.add(n);
+            }
+            rows.add(row);
+        }
+        return rows.toString();
+    }
+
+    /**
+     * Rebuilds the live grid from a snapshot produced by {@link #snapshotCells()}.
+     * Builds the full replacement grid before swapping it in, so a malformed
+     * snapshot leaves the current board untouched.
+     *
+     * @throws IllegalArgumentException if the snapshot is malformed
+     */
+    public synchronized void restoreCells(String json) {
+        if (json == null || json.isBlank()) return;
+        try {
+            JsonNode rows = MAPPER.readTree(json);
+            if (!rows.isArray() || rows.size() != size) {
+                throw new IllegalArgumentException("Cell snapshot must contain " + size + " rows");
+            }
+            SudokuCell[][] restored = new SudokuCell[size][size];
+            for (int i = 0; i < size; i++) {
+                JsonNode row = rows.get(i);
+                if (row == null || !row.isArray() || row.size() != size) {
+                    throw new IllegalArgumentException("Cell snapshot row " + i + " must contain " + size + " cells");
+                }
+                for (int j = 0; j < size; j++) {
+                    JsonNode n = row.get(j);
+                    SudokuCell cell = new SudokuCell();
+                    int v = n.path("v").asInt(0);
+                    if (v != 0) {
+                        SudokuCell.MoveSource ms;
+                        try {
+                            ms = SudokuCell.MoveSource.valueOf(
+                                n.path("ms").asText(SudokuCell.MoveSource.UNKNOWN.name()));
+                        } catch (IllegalArgumentException e) {
+                            ms = SudokuCell.MoveSource.UNKNOWN;
+                        }
+                        cell.setValue(v, ms); // must precede setGiven — given cells refuse value changes
+                    }
+                    cell.setGiven(n.path("g").asBoolean(false));
+                    for (JsonNode m : n.path("pm")) cell.addPencilMark(m.asInt());
+                    for (JsonNode c : n.path("cf")) cell.addConflict(c.asInt());
+                    restored[i][j] = cell;
+                }
+            }
+            this.board = restored;
+        } catch (IllegalArgumentException e) {
+            throw e;
+        } catch (Exception e) {
+            throw new IllegalArgumentException("Malformed cell snapshot", e);
+        }
+    }
+
+    /**
+     * Copies the live grid into the persisted {@code cellsJson} column. Callers
+     * MUST invoke this immediately before {@code gameRepository.save(board)} on an
+     * already-persisted board: saves of detached entities go through JPA merge,
+     * which copies only persistent fields onto the managed copy — a
+     * {@code @PreUpdate} callback would run on that managed copy (whose transient
+     * grid was rebuilt from the OLD snapshot in {@code @PostLoad}) and clobber the
+     * fresh state, which is why no such callback exists.
+     */
+    public synchronized void syncCellsJson() {
+        this.cellsJson = snapshotCells();
+    }
+
+    // JPA lifecycle: @PrePersist covers brand-new entities (the instance being
+    // persisted is the live one, so its grid is authoritative). Updates rely on
+    // the explicit syncCellsJson() contract above.
+    @PrePersist
+    private void syncCellsJsonForInsert() {
+        this.cellsJson = snapshotCells();
+    }
+
+    @PostLoad
+    private void restoreGridAfterLoad() {
+        if (cellsJson != null && !cellsJson.isBlank()) {
+            restoreCells(cellsJson);
+        }
+    }
+
+    // Jackson (Redis cache path): the same snapshot rides along the cached JSON
+    // value, so a board read through Redis on another pod gets its real grid back.
+    @JsonProperty("cellsJson")
+    public synchronized String getCellsJson() {
+        return snapshotCells();
+    }
+
+    @JsonProperty("cellsJson")
+    public synchronized void setCellsJson(String json) {
+        this.cellsJson = json;
+        if (json != null && !json.isBlank()) {
+            restoreCells(json);
+        }
     }
 
     // =====================================================================
@@ -687,7 +837,8 @@ public class SudokuBoard implements Serializable {
     public Long getId()                  { return id; }
     public void setId(Long id)           { this.id = id; }
 
-    public SudokuCell[][] getBoard()     { return board; }
+    @JsonIgnore public SudokuCell[][] getBoard() { return board; }
+    @JsonIgnore
     public SudokuCell[][] getBoardCopy() {
         SudokuCell[][] c = new SudokuCell[size][size];
         for (int i=0;i<size;i++) for (int j=0;j<size;j++) c[i][j]=board[i][j].clone();
