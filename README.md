@@ -34,6 +34,8 @@ sudokupro/
 - **Real-time multiplayer** — raw-WebSocket duels, drip showdowns, and daily challenges; broadcasts fan out across server replicas via Redis pub/sub
 - **Daily puzzle & streaks** — one shared puzzle per UTC day (identical on every replica), per-player copies played through the normal game flow, consecutive-day streaks, and a fastest-solve daily leaderboard
 - **Head-to-head duels** — challenge any player, both race on identical copies of one puzzle, first correct solve wins; ELO ratings, a duel ladder, and one-tap rematches
+- **Friends & presence** — request/accept friendships, live online flags from the gameplay channel; spectate any game read-only (the server rejects spectator mutations)
+- **Puzzle sharing** — export any board as a compact share code (never the solution); friends import it as their own game
 - **Achievements & archive** — unlocks fire on real play (clean solves, speed, streaks, duel wins); past dailies stay playable from the archive (gems yes, streak credit no)
 - **Hint economy** — hints cost gems, solving earns them (difficulty-scaled, clean-solve bonus); wallets auto-provision with a starting balance
 - **AI solver & hints** — logical move hints with cosmic hotspot ranking; full backtracking auto-solve
@@ -197,6 +199,13 @@ Cross-pod delivery is verified by a two-pod integration test on real Redis in CI
 | `GET` | `/api/duel/leaderboard?limit=` | Duel ladder by ELO rating |
 | `GET` | `/api/daily/archive?limit=` | Dates with playable archived dailies |
 | `POST` | `/api/daily/archive/{date}/join` | Play a past daily (no streak credit) |
+| `GET` | `/api/game/{id}/share` | Share code for a puzzle (grid only, never the solution) |
+| `POST` | `/api/game/import` | Import a shared puzzle as your own game |
+| `GET` | `/api/friends` | Friends with online flags |
+| `GET` | `/api/friends/pending` | Incoming friend requests |
+| `POST` | `/api/friends/request/{name}` | Send a friend request |
+| `POST` | `/api/friends/accept/{name}` | Accept a request (mutual friendship) |
+| `DELETE` | `/api/friends/{name}` | Remove a friend |
 | `GET` | `/api/economy/wallet` | Gems, XP, level, duel record + rating, hint price |
 | `GET` | `/api/economy/achievements` | The caller's achievements |
 | `POST` | `/api/notifications/device-token` | Register the caller's FCM device token for push notifications |

@@ -90,6 +90,12 @@ public class GameSessionRegistry {
      * Sends to a single player's session. Returns true when delivered locally; when the
      * player is on another replica the message is relayed and delivery happens there.
      */
+    /** Presence: true while the player holds an open gameplay WebSocket on this pod. */
+    public boolean isOnline(String playerId) {
+        WebSocketSession s = playerSessions.get(playerId);
+        return s != null && s.isOpen();
+    }
+
     public boolean sendToPlayer(String playerId, Map<String, Object> envelope) {
         if (deliverToPlayerLocal(playerId, envelope)) return true;
         RemotePublisher rp = remotePublisher;

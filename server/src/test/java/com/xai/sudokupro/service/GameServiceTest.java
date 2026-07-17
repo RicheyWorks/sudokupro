@@ -133,6 +133,37 @@ class GameServiceTest {
             "getGame must throw for unknown ids (WebSocketController relies on this)");
     }
 
+    // ---- puzzle sharing ----
+
+    @Test
+    void shareCodeRoundTripsThePuzzleWithoutTheSolution() {
+        SudokuBoard original = gameService.createNewGame(2, "p-share", false, false);
+        String code = gameService.exportShareCode(original.getGameId());
+
+        SudokuBoard imported = gameService.importShareCode(code, "p-friend");
+
+        assertNotEquals(original.getGameId(), imported.getGameId());
+        assertEquals("p-friend", imported.getPlayerId());
+        assertTrue(imported.getGameId().startsWith("shared-"));
+        int empty = 0;
+        for (int r = 0; r < 9; r++)
+            for (int c = 0; c < 9; c++) {
+                assertEquals(original.getBoard()[r][c].getValue(), imported.getBoard()[r][c].getValue());
+                assertEquals(original.getBoard()[r][c].isGiven(), imported.getBoard()[r][c].isGiven());
+                if (imported.getBoard()[r][c].getValue() == 0) empty++;
+            }
+        assertTrue(empty >= 28, "the shared code carries the puzzle, not a solved grid");
+    }
+
+    @Test
+    void garbageShareCodesAreRejected() {
+        assertThrows(IllegalArgumentException.class,
+            () -> gameService.importShareCode("not-base64!!!", "p-x"));
+        assertThrows(IllegalArgumentException.class,
+            () -> gameService.importShareCode(
+                java.util.Base64.getUrlEncoder().encodeToString("plain junk".getBytes()), "p-x"));
+    }
+
     // ---- hint economy wiring ----
 
     @Test

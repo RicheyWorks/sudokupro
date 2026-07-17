@@ -158,6 +158,21 @@ public class GameClient implements AutoCloseable {
         return api.dailyLeaderboard(limit);
     }
 
+    /**
+     * Spectates another player's game: loads its current state read-only and
+     * joins the gameplay channel to watch live broadcasts. The server rejects
+     * any mutation a spectator tries to send.
+     */
+    public synchronized SudokuBoard spectate(String gameId) {
+        closeSocket();
+        BoardState state = api.getGame(gameId);
+        board = state.toBoard();
+        socket = api.openSocket(gameId, this::handleEnvelope,
+            () -> notifier.notify("ui", "Spectator connection lost"));
+        logger.info("Spectating game {}", gameId);
+        return board;
+    }
+
     // ---- duels -----------------------------------------------------------------
 
     /** Challenges another player; returns the duel id. */

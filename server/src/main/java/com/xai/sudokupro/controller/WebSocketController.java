@@ -110,6 +110,7 @@ public class WebSocketController extends TextWebSocketHandler {
 
             switch (type) {
                 case "move" -> {
+                    if (rejectSpectator(session, board, playerId)) return;
                     EnhancedMove raw = objectMapper.convertValue(payload.get("payload"), EnhancedMove.class);
                     EnhancedMove move = new EnhancedMove(raw.row(), raw.col(),
                         raw.oldVal(), raw.newVal(), SudokuCell.MoveSource.PLAYER);
@@ -129,10 +130,12 @@ public class WebSocketController extends TextWebSocketHandler {
                     }
                 }
                 case "undo" -> {
+                    if (rejectSpectator(session, board, playerId)) return;
                     SudokuBoard updated = gameService.undo(gameId);
                     broadcastBoard(gameId, updated);
                 }
                 case "redo" -> {
+                    if (rejectSpectator(session, board, playerId)) return;
                     SudokuBoard updated = gameService.redo(gameId);
                     broadcastBoard(gameId, updated);
                 }
@@ -196,6 +199,19 @@ public class WebSocketController extends TextWebSocketHandler {
 
     private void send(WebSocketSession session, Map<String,Object> envelope) throws IOException {
         session.sendMessage(new TextMessage(objectMapper.writeValueAsString(envelope)));
+    }
+
+    /**
+     * Spectator mode: anyone may join a game's channel and watch broadcasts,
+     * but only the board's owner may mutate it (move/undo/redo). Returns true
+     * when the sender was rejected.
+     */
+    private boolean rejectSpectator(WebSocketSession session, SudokuBoard board, String playerId)
+            throws IOException {
+        if (playerId.equals(board.getPlayerId())) return false;
+        send(session, buildEnvelope("error", playerId,
+            Map.of("detail", "Spectators cannot modify this board — it belongs to " + board.getPlayerId())));
+        return true;
     }
 
     private Map<String,Object> buildEnvelope(String type, String from, Object payload) {

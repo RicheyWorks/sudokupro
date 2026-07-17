@@ -203,3 +203,15 @@ Suite: 130 tests, green (4 Docker-gated skips).
 **Rematch + ELO ladder.** `users.duel_rating` (V5, default 1000, IF EXISTS/IF NOT EXISTS for legacy shapes). `recordResult` now moves both ratings by K=32 against the expected score; `POST /api/duel/{id}/rematch` re-challenges the other party of a FINISHED duel at the same difficulty (403 outsider / 409 unfinished); `GET /api/duel/leaderboard` ranks players with duel history by rating.
 
 **Tests (9 new).** Achievement unlock-once/notify-once, streak and duel-wins gates, pseudo-player exclusion; ELO ±16 on equal ratings; rematch guards (state + membership) and difficulty carry-over; archive playability without streak credit, future/missing-date refusal, archive listing. Suite: 174 tests, green.
+
+---
+
+## Features batch B: friends & presence, puzzle sharing, spectator mode — 2026-07-16
+
+**Friends & presence.** `FriendService` wires the dormant `User.friends` id set to a request → accept flow (pending requests in Redis, 14-day TTL, local degrade; 400 on self-friendship, 404 on phantom accepts). `GET /api/friends` returns online flags from a new `GameSessionRegistry.isOnline` (open gameplay WebSocket = online). FRIEND-typed notifications on request/accept.
+
+**Puzzle sharing.** `GET /api/game/{id}/share` exports the gzipped cell snapshot as URL-safe Base64 — grid, givens, and pencil marks only; the solution never leaves the solver. `POST /api/game/import` rebuilds it as a fresh `shared-*` game owned by the caller via restoreCells (which rejects malformed payloads) + adoptGame.
+
+**Spectator mode (also a hardening fix).** Anyone could already join another game's WebSocket channel — and, it turns out, MOVE on it: `applyMove`/`undo`/`redo` never checked ownership. Now `rejectSpectator` guards all three mutating envelope types (error envelope back; `sync` and chat stay open), which simultaneously makes read-only spectating a feature and closes the anyone-can-vandalize-your-board hole. Client: `GameClient.spectate(gameId)` loads state and joins the channel.
+
+**Tests (7 new).** Friendship lifecycle with presence flags and mutual removal, self/phantom rejections; share-code round-trip preserving puzzle-not-solution + garbage rejection; spectator matrix (move/undo rejected with error envelopes, sync still served). Suite: 183 tests, green.

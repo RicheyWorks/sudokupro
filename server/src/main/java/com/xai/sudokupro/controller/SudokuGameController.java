@@ -167,6 +167,30 @@ public class SudokuGameController {
         }
     }
 
+    @Operation(summary = "Share code for a puzzle (gzipped grid, never the solution)")
+    @GetMapping("/{gameId}/share")
+    public ResponseEntity<Object> share(@PathVariable String gameId) {
+        try {
+            return ResponseEntity.ok(Map.of("code", gameService.exportShareCode(gameId)));
+        } catch (IllegalArgumentException e) {
+            return problemResponse(HttpStatus.NOT_FOUND, "Unknown Game", e.getMessage());
+        }
+    }
+
+    public record ImportRequest(@jakarta.validation.constraints.NotBlank
+                                @jakarta.validation.constraints.Size(max = 16384) String code) {}
+
+    @Operation(summary = "Import a shared puzzle as a fresh game of your own")
+    @PostMapping("/import")
+    public ResponseEntity<Object> importShared(@RequestBody @Validated ImportRequest request) {
+        try {
+            SudokuBoard board = gameService.importShareCode(request.code(), authService.getCurrentPlayerId());
+            return ResponseEntity.ok(BoardState.from(board));
+        } catch (IllegalArgumentException e) {
+            return problemResponse(HttpStatus.BAD_REQUEST, "Bad Share Code", e.getMessage());
+        }
+    }
+
     @Operation(summary = "Get a hint from the AI solver")
     @ApiResponses({
         @ApiResponse(responseCode = "200", description = "Hint returned"),

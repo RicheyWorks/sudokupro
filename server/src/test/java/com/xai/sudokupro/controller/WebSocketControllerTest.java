@@ -26,6 +26,7 @@ import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.lenient;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
@@ -120,6 +121,30 @@ class WebSocketControllerTest {
     }
 
     /** Connects an authenticated session bound to a real (serializable) board. */
+    @Test
+    void spectatorsCanWatchButNotMutate() throws Exception {
+        WebSocketSession watcher = connectedSession("watcher");
+        // The channel's board actually belongs to someone else.
+        SudokuBoard richmonds = new SudokuBoard(1, false, false, 0, "real-game-id");
+        richmonds.setPlayerId("richmond");
+        when(gameService.getGame("real-game-id")).thenReturn(richmonds);
+
+        controller.handleTextMessage(watcher, new org.springframework.web.socket.TextMessage(
+            "{\"type\":\"move\",\"payload\":{\"row\":0,\"col\":0,\"oldVal\":0,\"newVal\":5}}"));
+        controller.handleTextMessage(watcher,
+            new org.springframework.web.socket.TextMessage("{\"type\":\"undo\"}"));
+        controller.handleTextMessage(watcher,
+            new org.springframework.web.socket.TextMessage("{\"type\":\"sync\"}"));
+
+        verify(gameService, never()).applyMove(anyString(), any(), anyString());
+        verify(gameService, never()).undo(anyString());
+        // Mutations are answered with error envelopes; the read-only sync still works.
+        verify(watcher, times(2)).sendMessage(argThat(msg ->
+            ((org.springframework.web.socket.TextMessage) msg).getPayload().contains("\"type\":\"error\"")));
+        verify(watcher).sendMessage(argThat(msg ->
+            ((org.springframework.web.socket.TextMessage) msg).getPayload().contains("\"type\":\"board\"")));
+    }
+
     private WebSocketSession connectedSession(String player) throws Exception {
         WebSocketSession live = mock(WebSocketSession.class);
         Map<String, Object> attrs = new HashMap<>();

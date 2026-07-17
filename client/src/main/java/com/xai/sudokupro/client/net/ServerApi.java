@@ -162,6 +162,36 @@ public class ServerApi {
         return get("/api/duel", new TypeReference<List<com.xai.sudokupro.model.api.DuelInfo>>() {});
     }
 
+    // ---- sharing / social -------------------------------------------------------
+
+    /** Share code for a game (gzipped grid, never the solution). */
+    public String shareCode(String gameId) {
+        return get("/api/game/" + gameId + "/share", JsonNode.class).path("code").asText();
+    }
+
+    /** Imports a shared puzzle as a fresh game of your own. */
+    public BoardState importShared(String code) {
+        try {
+            return postJson("/api/game/import",
+                mapper.writeValueAsString(java.util.Map.of("code", code)), BoardState.class);
+        } catch (IOException e) {
+            throw new ApiException("Malformed import request", e);
+        }
+    }
+
+    /** The caller's friends with online flags (raw JSON rows: playerId, online). */
+    public JsonNode friends() {
+        return get("/api/friends", JsonNode.class);
+    }
+
+    public void requestFriend(String playerId) {
+        post("/api/friends/request/" + playerId, Void.class);
+    }
+
+    public void acceptFriend(String playerId) {
+        post("/api/friends/accept/" + playerId, Void.class);
+    }
+
     // ---- economy ---------------------------------------------------------------
 
     /** The caller's wallet (gems, xp, level, duel record, hint price). */

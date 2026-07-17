@@ -345,6 +345,50 @@ public class GameService {
         }
     }
 
+    // =====================================================================
+    // Puzzle sharing
+    // =====================================================================
+
+    /**
+     * Share code for a game: the gzipped cell snapshot, URL-safe Base64. Carries
+     * only what the player can already see (values, givens, pencil marks) —
+     * never the solution, which exists only in the solver.
+     */
+    public String exportShareCode(String gameId) {
+        SudokuBoard board = getGame(gameId);
+        try {
+            var bytes = new java.io.ByteArrayOutputStream();
+            try (var gzip = new java.util.zip.GZIPOutputStream(bytes)) {
+                gzip.write(board.snapshotCells().getBytes(java.nio.charset.StandardCharsets.UTF_8));
+            }
+            return java.util.Base64.getUrlEncoder().withoutPadding().encodeToString(bytes.toByteArray());
+        } catch (java.io.IOException e) {
+            throw new IllegalStateException("Share encoding failed", e);
+        }
+    }
+
+    /** Imports a shared puzzle as a fresh game owned by the caller. */
+    public SudokuBoard importShareCode(String code, String playerId) {
+        validatePlayerId(playerId);
+        String cellsJson;
+        try {
+            byte[] compressed = java.util.Base64.getUrlDecoder().decode(code.trim());
+            try (var gzip = new java.util.zip.GZIPInputStream(new java.io.ByteArrayInputStream(compressed))) {
+                cellsJson = new String(gzip.readAllBytes(), java.nio.charset.StandardCharsets.UTF_8);
+            }
+        } catch (Exception e) {
+            throw new IllegalArgumentException("Malformed share code", e);
+        }
+        SudokuCell[][] blank = new SudokuCell[9][9];
+        for (int r = 0; r < 9; r++) for (int c = 0; c < 9; c++) blank[r][c] = new SudokuCell();
+        SudokuBoard board = new SudokuBoard(blank, false, false, 0,
+            "shared-" + UUID.randomUUID().toString().substring(0, 8));
+        board.restoreCells(cellsJson); // validates shape; throws on garbage
+        board.setPlayerId(playerId);
+        board.setDifficulty(2);
+        return adoptGame(board);
+    }
+
     private void requireOwner(SudokuBoard board, String playerId) {
         if (!playerId.equals(board.getPlayerId())) {
             throw new SecurityException("Game " + board.getGameId() + " does not belong to player " + playerId);
