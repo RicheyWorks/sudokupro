@@ -95,6 +95,9 @@ public class PowerUpService {
                 var move = solver.getNextLogicalMoveAsEnhancedMove(board);
                 if (move == null) throw new IllegalStateException("No empty cell to reveal");
                 board.applyExternalMove(move);
+                // A reveal is assistance stronger than a hint: it must forfeit
+                // the clean-solve bonus the same way hints do.
+                board.incrementHintCount();
             }
             case "FREEZE" -> {
                 if (target == null || target.isBlank() || target.equals(playerId)) {

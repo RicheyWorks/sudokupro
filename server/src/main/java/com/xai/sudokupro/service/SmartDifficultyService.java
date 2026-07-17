@@ -55,6 +55,7 @@ public class SmartDifficultyService implements GameEndListener {
     @Override
     public void onGameEnded(SudokuBoard board, String playerId) {
         if (board == null || playerId == null || playerId.startsWith("__")) return;
+        if (!playerId.equals(board.getPlayerId())) return; // skill signal belongs to the owner
 
         int[] s = read(playerId);
         int level = s[0], fast = s[1], slow = s[2];

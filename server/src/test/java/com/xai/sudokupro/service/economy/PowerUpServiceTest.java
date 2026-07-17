@@ -92,6 +92,8 @@ class PowerUpServiceTest {
         service.use("richmond", "REVEAL_CELL", "g-solve", null);
 
         assertEquals(emptyBefore - 1, countEmpty(mine), "exactly one cell must be filled");
+        assertEquals(1, mine.getHintCount(),
+            "a reveal is assistance — it must forfeit the clean-solve bonus like a hint");
     }
 
     @Test

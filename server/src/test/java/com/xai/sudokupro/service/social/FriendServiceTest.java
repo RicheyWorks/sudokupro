@@ -88,6 +88,14 @@ class FriendServiceTest {
     }
 
     @Test
+    void decliningWithoutAnyLocalStateDoesNotCrash() {
+        // Regression: the local fallback used Set.of().remove(), whose
+        // UnsupportedOperationException fired whenever Redis was down and the
+        // player had no pending entry.
+        assertDoesNotThrow(() -> service.decline("ada", "stranger"));
+    }
+
+    @Test
     void removeSeversBothDirections() {
         service.request("richmond", "ada");
         service.accept("ada", "richmond");

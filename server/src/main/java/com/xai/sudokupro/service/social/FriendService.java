@@ -119,7 +119,10 @@ public class FriendService {
         } catch (Exception e) {
             degraded(e);
         }
-        localPending.getOrDefault(me, Set.of()).remove(requester);
+        // NOT getOrDefault(me, Set.of()).remove(...): Set.of() is immutable and
+        // its remove() throws UnsupportedOperationException unconditionally.
+        Set<String> pending = localPending.get(me);
+        if (pending != null) pending.remove(requester);
     }
 
     private void notify(String playerId, String message) {

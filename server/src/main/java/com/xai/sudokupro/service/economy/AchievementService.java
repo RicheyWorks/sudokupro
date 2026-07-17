@@ -50,6 +50,7 @@ public class AchievementService implements GameEndListener {
     public void onGameEnded(SudokuBoard board, String playerId) {
         if (board == null || playerId == null || !board.isSolved()) return;
         if (playerId.startsWith("__")) return; // template pseudo-players
+        if (!playerId.equals(board.getPlayerId())) return; // owner only
 
         try {
             User user = economyService.walletFor(playerId);

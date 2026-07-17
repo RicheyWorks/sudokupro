@@ -77,6 +77,7 @@ class SmartDifficultyServiceTest {
 
     private SudokuBoard fastClean(int difficulty) {
         SudokuBoard real = new SudokuBoard(1, false, false, 0, "g-" + System.nanoTime());
+        real.setPlayerId("richmond");
         new AISolverService(new SecureRandomGenerator(new SimpleMeterRegistry())).solveSudoku(real);
         real.setDifficulty(difficulty);
         SudokuBoard board = spy(real);
@@ -85,6 +86,8 @@ class SmartDifficultyServiceTest {
     }
 
     private SudokuBoard abandoned() {
-        return new SudokuBoard(1, false, false, 0, "g-quit-" + System.nanoTime());
+        SudokuBoard b = new SudokuBoard(1, false, false, 0, "g-quit-" + System.nanoTime());
+        b.setPlayerId("richmond");
+        return b;
     }
 }

@@ -14,6 +14,7 @@ import org.springframework.http.ResponseEntity;
 
 import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.ArgumentMatchers.*;
+import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
@@ -69,9 +70,19 @@ class SudokuGameControllerTest {
     @Test
     void endReturnsNoContentAndUsesAuthenticatedPlayer() {
         when(authService.getCurrentPlayerId()).thenReturn("richmond");
+        when(gameService.getGame("g-1")).thenReturn(board);
 
         assertEquals(HttpStatus.NO_CONTENT, controller.end("g-1").getStatusCode());
         verify(gameService).endGame("g-1", "richmond");
+    }
+
+    @Test
+    void spectatorsCannotEndSomeoneElsesGame() {
+        when(authService.getCurrentPlayerId()).thenReturn("intruder");
+        when(gameService.getGame("g-1")).thenReturn(board); // owned by richmond
+
+        assertEquals(HttpStatus.FORBIDDEN, controller.end("g-1").getStatusCode());
+        verify(gameService, never()).endGame(anyString(), anyString());
     }
 
     // ---- save / load ----

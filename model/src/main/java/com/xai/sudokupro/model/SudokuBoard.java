@@ -913,6 +913,15 @@ public class SudokuBoard implements Serializable {
     /** For rebuilding non-authoritative client boards from a BoardState snapshot. */
     public void setMoveCount(int n)     { this.moveCount = Math.max(0, n); }
 
+    /** True if any cell was filled by the auto-solver — such boards are not
+     *  legitimate player solves and must not earn rewards. */
+    public synchronized boolean hasAutosolvedCells() {
+        for (int i = 0; i < size; i++)
+            for (int j = 0; j < size; j++)
+                if (board[i][j].getMoveSource() == SudokuCell.MoveSource.AUTOSOLVE) return true;
+        return false;
+    }
+
     /** True if any cell holds a value — false only for a blank 9x9 shell
      *  (e.g. a pre-V3 database row that has no cells_json snapshot to restore). */
     public synchronized boolean hasAnyCellValues() {

@@ -243,3 +243,19 @@ Tests (5): start-at-2, promotion with cap, demotion with floor, neutral-solve se
 ## Client UI for batches A-D — 2026-07-16
 
 MainStage gains Weekly (tournament hub: per-puzzle join with completion ticks, standings view), Friends (online-flagged list, watch an online friend via the new `GET /api/game/active-of/{player}` + read-only spectate, add-friend and pending-request flows), and Shop (catalog with prices and held counts, buy, use-on-current-game, FREEZE with a target prompt) buttons; entering the game screen asks the adaptive model for a recommended difficulty and surfaces it as a suggestion. All network work runs off the FX thread through a shared `runOffFx` worker with uniform error reporting; board swaps go through a shared `swapInBoard`. ServerApi/GameClient gained the corresponding typed passthroughs. Server: one new endpoint (`active-of`, per-pod lookup for spectating). Suite unchanged in count: 201 green (UI itself is not unit-testable headlessly; the API layer it calls is covered).
+
+---
+
+## Audit pass — 2026-07-16 (post feature batches A-D)
+
+Independent review of the six feature commits. Four confirmed findings, all fixed with regression tests:
+
+**A-4 (fixed): the auto-solve reward exploit.** `POST /api/game/{id}/solve` then `/end` handed the solved board to every reward listener: an AI solve won duels, advanced daily streaks, minted gems, and unlocked achievements. `notifyGameEndListeners` now suppresses listeners for solved boards containing AUTOSOLVE-sourced cells (`SudokuBoard.hasAutosolvedCells`); abandoned games still flow through since the smart-difficulty model wants those signals. REVEAL_CELL is unaffected (its move source is HINT).
+
+**A-5 (fixed): anyone could end — and profit from — someone else's game.** `POST /{id}/end` had no ownership check: a spectator could kick any game out of the active set, and because reward listeners trusted the caller identity, `EconomyService` would pay gems to WHOEVER ended a solved board. `/end` now returns 403 for non-owners (204 idempotent when already gone), and economy/achievement/smart-difficulty listeners all verify `playerId == board.getPlayerId()`.
+
+**A-6 (fixed): `FriendService.decline` crashed when Redis was down.** The local fallback called `Set.of().remove(...)` — immutable collections throw `UnsupportedOperationException` from remove() unconditionally, so any decline (or accept's pending-cleanup) with no local entry blew up in degraded mode.
+
+**A-7 (fixed): REVEAL_CELL kept the clean-solve bonus.** A revealed cell is stronger assistance than a hint but didn't touch hintCount, so a reveal-assisted solve still collected the no-hint bonus. Reveals now increment hintCount.
+
+Noted, not fixed: `WeeklyTournamentService.allTimes` uses Redis KEYS (fine at this scale, an O(N) scan on big instances — switch to a per-week participant set if it ever matters); `SmartDifficultyService`'s global aggregate is per-pod since boot (documented as an approximation); `endGame` only fires listeners for boards in the local active cache (moves always land there, so the solving pod is the ending pod in practice). Suite: 205 tests, green.

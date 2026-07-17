@@ -83,6 +83,8 @@ public class EconomyService implements GameEndListener {
         if (board == null || playerId == null || !board.isSolved()) return;
         // The daily/duel template pseudo-player never earns.
         if (playerId.startsWith("__")) return;
+        // Rewards go to the board's OWNER only — never whoever happened to end it.
+        if (!playerId.equals(board.getPlayerId())) return;
         try {
             int earned = Math.max(1, board.getDifficulty()) * 10
                 + (board.getHintCount() == 0 ? cleanSolveBonus : 0);

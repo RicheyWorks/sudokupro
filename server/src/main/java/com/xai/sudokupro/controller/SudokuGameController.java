@@ -112,8 +112,19 @@ public class SudokuGameController {
 
     @Operation(summary = "End (leave) a game; final state is persisted server-side")
     @PostMapping("/{gameId}/end")
-    public ResponseEntity<Void> end(@PathVariable String gameId) {
-        gameService.endGame(gameId, authService.getCurrentPlayerId());
+    public ResponseEntity<Object> end(@PathVariable String gameId) {
+        String playerId = authService.getCurrentPlayerId();
+        try {
+            // Spectators may watch but not end someone's game.
+            SudokuBoard board = gameService.getGame(gameId);
+            if (!playerId.equals(board.getPlayerId())) {
+                return problemResponse(HttpStatus.FORBIDDEN, "Not Your Game",
+                    "Game " + gameId + " belongs to " + board.getPlayerId());
+            }
+        } catch (IllegalArgumentException e) {
+            return ResponseEntity.noContent().build(); // already gone — idempotent
+        }
+        gameService.endGame(gameId, playerId);
         return ResponseEntity.noContent().build();
     }
 

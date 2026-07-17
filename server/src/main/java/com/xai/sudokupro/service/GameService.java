@@ -409,6 +409,14 @@ public class GameService {
     /** Fans finished games out to feature listeners (daily puzzle, duels, ...). */
     private void notifyGameEndListeners(SudokuBoard board, String playerId) {
         if (gameEndListeners == null) return; // plain unit-test construction
+        // Reward-exploit guard: a board the AI solver touched is not a player
+        // solve. Without this, POST /solve + /end would win duels, advance
+        // streaks, and mint gems. Abandoned (unsolved) games still flow through
+        // — the smart-difficulty model wants those signals.
+        if (board.isSolved() && board.hasAutosolvedCells()) {
+            logger.info("Game {} solved with AI assistance — reward listeners skipped", board.getGameId());
+            return;
+        }
         gameEndListeners.stream().forEach(listener -> {
             try {
                 listener.onGameEnded(board, playerId);

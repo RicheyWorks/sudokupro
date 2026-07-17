@@ -133,6 +133,29 @@ class GameServiceTest {
             "getGame must throw for unknown ids (WebSocketController relies on this)");
     }
 
+    // ---- game-end listener guard ----
+
+    @Test
+    @SuppressWarnings("unchecked")
+    void autosolvedGamesNeverReachRewardListeners() {
+        GameEndListener listener = mock(GameEndListener.class);
+        org.springframework.beans.factory.ObjectProvider<GameEndListener> provider =
+            mock(org.springframework.beans.factory.ObjectProvider.class);
+        when(provider.stream()).thenAnswer(inv -> java.util.stream.Stream.of(listener));
+        gameService.setGameEndListeners(provider);
+
+        // AI-solved game: listeners must be suppressed (reward exploit guard)
+        SudokuBoard cheated = gameService.createNewGame(1, "p-cheat", false, false);
+        gameService.solveSudoku(cheated.getGameId());
+        gameService.endGame(cheated.getGameId(), "p-cheat");
+        verify(listener, never()).onGameEnded(any(), anyString());
+
+        // Abandoned (unsolved) game: listeners still fire — smart difficulty wants it
+        SudokuBoard abandoned = gameService.createNewGame(1, "p-quit", false, false);
+        gameService.endGame(abandoned.getGameId(), "p-quit");
+        verify(listener).onGameEnded(abandoned, "p-quit");
+    }
+
     // ---- puzzle sharing ----
 
     @Test
