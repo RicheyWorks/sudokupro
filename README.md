@@ -102,7 +102,13 @@ defaults (Hibernate `ddl-auto=update`, Flyway off). Production must set
 - Swagger UI: `http://localhost:8080/swagger-ui.html`
 - Health: `http://localhost:8080/actuator/health`
 
-### 2. Start the desktop client
+### 2. Play in the browser
+
+Open `http://localhost:8080/play/` — a zero-install web client served by the
+server itself. Register or log in, then play: new games, the daily puzzle,
+hints, and live WebSocket sync all work from the page.
+
+### 3. Start the desktop client
 
 ```bash
 mvn -pl client -am javafx:run

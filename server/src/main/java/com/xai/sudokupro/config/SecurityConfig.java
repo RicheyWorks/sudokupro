@@ -63,6 +63,7 @@ public class SecurityConfig {
                 .requestMatchers("/admin/**").hasRole("ADMIN") // Broaden to all admin endpoints
                 .requestMatchers("/actuator/health", "/actuator/info").permitAll() // Allow health checks
                 .requestMatchers("/ws/**").permitAll() // WebSocket endpoint for multiplayer
+                .requestMatchers("/play/**").permitAll() // static web client (data calls still authenticate)
                 .requestMatchers(org.springframework.http.HttpMethod.POST, "/api/auth/register")
                     .permitAll() // account creation precedes credentials by definition
                 .anyRequest().authenticated() // Tighten default access
