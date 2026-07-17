@@ -33,6 +33,7 @@ sudokupro/
 - **Puzzle engine** — backtracking generator with a verified unique solution at every difficulty
 - **Real-time multiplayer** — raw-WebSocket duels, drip showdowns, and daily challenges; broadcasts fan out across server replicas via Redis pub/sub
 - **AI solver & hints** — logical move hints with cosmic hotspot ranking; full backtracking auto-solve
+- **Save & resume** — explicit save persists the full grid to Postgres; the desktop client's Load button lists your unfinished games and resumes any of them, surviving server restarts and cache expiry
 - **Leaderboards** — points, cosmic drip, hype meter, duel wins, combined skill score
 - **Anti-cheat** — solve-time, move-rate, complexity, and peer-skill signal scoring with automatic flagging (random flavor mechanics deliberately excluded from enforcement)
 - **Economy** — gems, XP, power-ups, and tier progression (Unranked → Bronze → Silver → Gold → Cosmic)

@@ -5,6 +5,7 @@ import com.xai.sudokupro.client.net.ApiException;
 import com.xai.sudokupro.client.net.ServerApi;
 import com.xai.sudokupro.client.net.ServerConfig;
 import com.xai.sudokupro.model.SudokuBoard;
+import com.xai.sudokupro.model.api.BoardState;
 import com.xai.sudokupro.model.api.EventInfo;
 import com.xai.sudokupro.model.api.LeaderboardEntry;
 import javafx.animation.FadeTransition;
@@ -29,7 +30,9 @@ import java.net.URL;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.Deque;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 
 /**
  * JavaFX main window. Pure network client (AUDIT follow-up: client/server
@@ -237,7 +240,7 @@ public class MainStage extends Application {
         Button saveButton = new Button("Save");
         saveButton.setOnAction(e -> saveGame());
         Button loadButton = new Button("Load");
-        loadButton.setOnAction(e -> loadGame());
+        loadButton.setOnAction(e -> loadGame(primaryStage));
         Button themeButton = new Button("Themes");
         themeButton.setOnAction(e -> themeManager.showThemeCustomizer(primaryStage.getScene()));
         pauseButton = new ToggleButton("Pause");
@@ -414,7 +417,7 @@ public class MainStage extends Application {
         Thread saver = new Thread(() -> {
             try {
                 client.save();
-                notify("game", "Game saved successfully");
+                notify("game", "Game saved — resume it any time from Load");
                 logger.info("Game saved for player {}", client.playerId());
             } catch (Exception e) {
                 logger.error("Failed to save game: {}", e.getMessage(), e);
@@ -425,23 +428,73 @@ public class MainStage extends Application {
         saver.start();
     }
 
-    private void loadGame() {
+    /** Fetches the saved-games list off the FX thread, then shows the picker on it. */
+    private void loadGame(Stage primaryStage) {
         Thread loader = new Thread(() -> {
             try {
-                client.refresh();
-                Platform.runLater(() -> {
-                    startTimer(timerLabel);
-                    updateStats();
-                });
-                notify("game", "Game loaded successfully");
-                logger.info("Game loaded for player {}", client.playerId());
+                List<BoardState> saved = client.savedGames(10);
+                if (saved.isEmpty()) {
+                    notify("game", "No saved games to resume — use Save first");
+                    return;
+                }
+                Platform.runLater(() -> showResumePicker(primaryStage, saved));
             } catch (Exception e) {
-                logger.error("Failed to load game: {}", e.getMessage(), e);
+                logger.error("Failed to list saved games: {}", e.getMessage(), e);
                 notify("error", "Load failed: " + e.getMessage());
             }
         }, "sudokupro-load");
         loader.setDaemon(true);
         loader.start();
+    }
+
+    /** FX thread: pick one of the saved games, then resume it off the FX thread. */
+    private void showResumePicker(Stage primaryStage, List<BoardState> saved) {
+        Map<String, String> gameIdByLabel = new LinkedHashMap<>();
+        for (BoardState s : saved) gameIdByLabel.put(describeSavedGame(s), s.gameId());
+
+        ChoiceDialog<String> dialog = new ChoiceDialog<>(
+            gameIdByLabel.keySet().iterator().next(), gameIdByLabel.keySet());
+        dialog.setTitle("Resume Game");
+        dialog.setHeaderText("Saved games (newest first)");
+        dialog.setContentText("Resume:");
+        dialog.showAndWait().ifPresent(label -> resumeGame(primaryStage, gameIdByLabel.get(label)));
+    }
+
+    private String describeSavedGame(BoardState s) {
+        String difficulty = switch (s.difficulty()) {
+            case 1 -> "Easy"; case 2 -> "Medium"; case 3 -> "Hard"; case 4 -> "Insane";
+            default -> "Level " + s.difficulty();
+        };
+        StringBuilder sb = new StringBuilder(difficulty);
+        if (s.chaosMode())  sb.append(" · Chaos");
+        if (s.mirrorMode()) sb.append(" · Mirror");
+        sb.append(" · ").append(s.moveCount()).append(" moves")
+          .append(" · score ").append(s.score())
+          .append(" · #").append(s.gameId(), 0, Math.min(8, s.gameId().length()));
+        return sb.toString();
+    }
+
+    /** Resumes the chosen game (network call — runs off the FX thread), then rebuilds the board view. */
+    private void resumeGame(Stage primaryStage, String gameId) {
+        Thread resumer = new Thread(() -> {
+            try {
+                SudokuBoard resumed = client.resumeGame(gameId);
+                Platform.runLater(() -> {
+                    boardView = new BoardView(client, this::notify);
+                    BorderPane root = (BorderPane) primaryStage.getScene().getRoot();
+                    root.setCenter(boardView.getView());
+                    startTimer(timerLabel);
+                    updateStats();
+                    notify("game", "Game resumed — welcome back");
+                    logger.info("Resumed game {} for player {}", resumed.getGameId(), client.playerId());
+                });
+            } catch (Exception e) {
+                logger.error("Failed to resume game {}: {}", gameId, e.getMessage(), e);
+                notify("error", "Resume failed: " + e.getMessage());
+            }
+        }, "sudokupro-resume");
+        resumer.setDaemon(true);
+        resumer.start();
     }
 
     private void replayGame(Stage primaryStage) {

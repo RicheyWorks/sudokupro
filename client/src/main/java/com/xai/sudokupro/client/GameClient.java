@@ -68,7 +68,7 @@ public class GameClient implements AutoCloseable {
         return board;
     }
 
-    /** Re-fetches the authoritative state for the current game (e.g. Load button). */
+    /** Re-fetches the authoritative state for the current game. */
     public SudokuBoard refresh() {
         SudokuBoard current = requireBoard();
         board = api.getGame(current.getGameId()).toBoard();
@@ -85,12 +85,33 @@ public class GameClient implements AutoCloseable {
     }
 
     /**
-     * Legacy Save semantics: persists the game's current state server-side
-     * (the server writes through to the database on end). The gameplay channel
-     * stays open; the next interaction transparently reloads the game.
+     * Persists the current game server-side (full grid, via the server's
+     * cells_json snapshot) WITHOUT leaving it — play continues normally and
+     * the game can be resumed later, even after a server restart.
+     * (Replaces the legacy semantics that quietly ended the game.)
      */
     public void save() {
-        api.endGame(requireBoard().getGameId());
+        api.saveGame(requireBoard().getGameId());
+    }
+
+    /** The player's saved (unfinished, resumable) games, newest first. */
+    public List<BoardState> savedGames(int limit) {
+        return api.savedGames(limit);
+    }
+
+    /**
+     * Resumes a previously saved game: the server loads it back into its
+     * active set, local state is rebuilt from the returned snapshot, and the
+     * gameplay channel is (re)joined under the resumed gameId.
+     */
+    public synchronized SudokuBoard resumeGame(String gameId) {
+        closeSocket();
+        BoardState state = api.resumeGame(gameId);
+        board = state.toBoard();
+        socket = api.openSocket(state.gameId(), this::handleEnvelope,
+            () -> notifier.notify("ui", "Connection to game lost"));
+        logger.info("Resumed game {}", state.gameId());
+        return board;
     }
 
     // ---- moves ------------------------------------------------------------------
