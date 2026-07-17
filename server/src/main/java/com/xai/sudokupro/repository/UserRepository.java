@@ -28,6 +28,10 @@ public interface UserRepository extends JpaRepository<User, Long>,
     @Cacheable(value = "userByUsername", key = "#username")
     Optional<User> findByUsername(String username);
 
+    /** Duel ladder: highest-rated players first (rematch/ladder feature). */
+    @Query("SELECT u FROM User u WHERE u.duelWins > 0 OR u.duelLosses > 0 ORDER BY u.duelRating DESC")
+    List<User> findDuelLadder(org.springframework.data.domain.Pageable pageable);
+
     @Query("SELECT u FROM User u WHERE u.streak >= :streakThreshold")
     @Cacheable(value = "usersByStreak", key = "#streakThreshold")
     List<User> findByStreakGreaterThanEqual(@Param("streakThreshold") int streakThreshold);

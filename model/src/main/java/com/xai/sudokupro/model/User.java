@@ -41,6 +41,10 @@ public class User implements Serializable {
     @Min(value = 0, message = "Streak cannot be negative")
     private int streak;
 
+    /** ELO-style duel rating; everyone starts at 1000. */
+    @Min(value = 0, message = "Rating cannot be negative")
+    private int duelRating = 1000;
+
     @Min(value = 0, message = "Duel wins cannot be negative")
     private int duelWins;
 
@@ -143,6 +147,8 @@ public class User implements Serializable {
     public void setPoints(int points) { this.points = Math.max(0, points); }
     public int getStreak() { return streak; }
     public void setStreak(int streak) { this.streak = Math.max(0, streak); }
+    public int getDuelRating() { return duelRating; }
+    public void setDuelRating(int duelRating) { this.duelRating = Math.max(0, duelRating); }
     public int getDuelWins() { return duelWins; }
     public void setDuelWins(int duelWins) { this.duelWins = Math.max(0, duelWins); }
     public int getDuelLosses() { return duelLosses; }

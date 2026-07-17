@@ -33,7 +33,8 @@ sudokupro/
 - **Puzzle engine** — backtracking generator with a verified unique solution at every difficulty
 - **Real-time multiplayer** — raw-WebSocket duels, drip showdowns, and daily challenges; broadcasts fan out across server replicas via Redis pub/sub
 - **Daily puzzle & streaks** — one shared puzzle per UTC day (identical on every replica), per-player copies played through the normal game flow, consecutive-day streaks, and a fastest-solve daily leaderboard
-- **Head-to-head duels** — challenge any player, both race on identical copies of one puzzle, first correct solve wins; duel wins/losses recorded on the player profile
+- **Head-to-head duels** — challenge any player, both race on identical copies of one puzzle, first correct solve wins; ELO ratings, a duel ladder, and one-tap rematches
+- **Achievements & archive** — unlocks fire on real play (clean solves, speed, streaks, duel wins); past dailies stay playable from the archive (gems yes, streak credit no)
 - **Hint economy** — hints cost gems, solving earns them (difficulty-scaled, clean-solve bonus); wallets auto-provision with a starting balance
 - **AI solver & hints** — logical move hints with cosmic hotspot ranking; full backtracking auto-solve
 - **Save & resume** — explicit save persists the full grid to Postgres; the desktop client's Load button lists your unfinished games and resumes any of them, surviving server restarts and cache expiry
@@ -192,7 +193,12 @@ Cross-pod delivery is verified by a two-pod integration test on real Redis in CI
 | `POST` | `/api/duel/{id}/accept` | Accept a duel — returns your board, race starts |
 | `POST` | `/api/duel/{id}/decline` | Decline a pending duel |
 | `GET` | `/api/duel` | The caller's duels (pending, active, finished) |
-| `GET` | `/api/economy/wallet` | Gems, XP, level, duel record, hint price |
+| `POST` | `/api/duel/{id}/rematch` | Rematch a finished duel (fresh challenge, same difficulty) |
+| `GET` | `/api/duel/leaderboard?limit=` | Duel ladder by ELO rating |
+| `GET` | `/api/daily/archive?limit=` | Dates with playable archived dailies |
+| `POST` | `/api/daily/archive/{date}/join` | Play a past daily (no streak credit) |
+| `GET` | `/api/economy/wallet` | Gems, XP, level, duel record + rating, hint price |
+| `GET` | `/api/economy/achievements` | The caller's achievements |
 | `POST` | `/api/notifications/device-token` | Register the caller's FCM device token for push notifications |
 | `DELETE` | `/api/notifications/device-token` | Remove the caller's device token (opt out of push) |
 | `GET` | `/api/session` | Auth check + CSRF bootstrap for API clients |

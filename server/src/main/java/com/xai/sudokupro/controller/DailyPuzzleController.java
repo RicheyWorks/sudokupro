@@ -53,4 +53,26 @@ public class DailyPuzzleController {
             @RequestParam(defaultValue = "10") @Min(1) @Max(100) int limit) {
         return ResponseEntity.ok(dailyPuzzleService.leaderboard(limit));
     }
+
+    @Operation(summary = "Dates with an archived daily puzzle, newest first")
+    @GetMapping("/archive")
+    public ResponseEntity<List<String>> archive(
+            @RequestParam(defaultValue = "14") @Min(1) @Max(60) int limit) {
+        return ResponseEntity.ok(dailyPuzzleService.archiveDates(limit));
+    }
+
+    @Operation(summary = "Play an archived daily (gems yes, streak/leaderboard credit no)")
+    @PostMapping("/archive/{date}/join")
+    public ResponseEntity<Object> joinArchive(@PathVariable String date) {
+        try {
+            return ResponseEntity.ok(BoardState.from(dailyPuzzleService.joinArchive(
+                authService.getCurrentPlayerId(), java.time.LocalDate.parse(date))));
+        } catch (java.time.format.DateTimeParseException e) {
+            return ResponseEntity.badRequest().body(java.util.Map.of(
+                "title", "Bad Date", "detail", "Use ISO format, e.g. 2026-07-15"));
+        } catch (IllegalArgumentException e) {
+            return ResponseEntity.status(org.springframework.http.HttpStatus.NOT_FOUND)
+                .body(java.util.Map.of("title", "No Such Puzzle", "detail", e.getMessage()));
+        }
+    }
 }

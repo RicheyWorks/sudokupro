@@ -191,3 +191,15 @@ Suite: 130 tests, green (4 Docker-gated skips).
 **Hint economy.** The long-dormant gems/xp/level fields on User become real. Wallets auto-provision on first touch with a 15-gem signing bonus (`sudokupro.economy.starting-gems`). Hints cost 5 gems (`sudokupro.economy.hint-cost`), charged in `GameService.getHint` AFTER computing but BEFORE revealing — a broke player pays nothing and learns nothing (empty hints are free); REST maps `InsufficientGemsException` to 402 with the price quoted. Solves pay `difficulty*10` gems plus a clean-solve bonus (`sudokupro.economy.clean-solve-bonus`, forfeited if any hint was used) and XP, via the listener hook; template pseudo-players (`__daily__`) never earn. `GET /api/economy/wallet` exposes the balance and current hint price.
 
 **Tests (16 new: 7 duel, 5 economy, 3 duel-controller, 1 GameService wiring).** Duel: identical-grid proof for both copies, only-the-challenged-can-accept/decline, first-solve-wins with win/loss bookkeeping, second solver gets nothing, non-duel/unsolved ignored. Economy: signing-bonus provisioning (once), charge-to-zero then 402-shaped failure without going negative, difficulty-scaled award with clean bonus forfeiture, pseudo-player exclusion. GameService: hint charged to board owner, insufficient gems withholds the hint. FlywayMigrationTest extended to V4 (identity insert lands above 1e9; applies on legacy DBs without users). Suite: 165 tests, green (4 Docker-gated skips).
+
+---
+
+## Features batch A: achievements, daily archive, rematch + ELO ladder — 2026-07-16
+
+**Achievements.** `AchievementService` (GameEndListener) makes the dormant `User.achievements` map real using the canonical keys `initializeAchievements` always declared — StreakMaster (10-day daily streak via DailyStateStore), DuelChampion (5 wins), DailyPlayer, LevelUp — plus CleanSolver and SpeedDemon (<120s). Unlocks fire once, notify once (ACHIEVEMENT type), and are exposed at `GET /api/economy/achievements`.
+
+**Daily archive.** Past dailies stay playable: templates are already persisted rows, so `GET /api/daily/archive` lists dates and `POST /api/daily/archive/{date}/join` stamps a copy under `daily-<date>:archive:<player>` — an id shape that deliberately never matches the completion hook's expectation, so archive solves earn gems but can never rewrite streaks or leaderboards. Future/missing dates → 404.
+
+**Rematch + ELO ladder.** `users.duel_rating` (V5, default 1000, IF EXISTS/IF NOT EXISTS for legacy shapes). `recordResult` now moves both ratings by K=32 against the expected score; `POST /api/duel/{id}/rematch` re-challenges the other party of a FINISHED duel at the same difficulty (403 outsider / 409 unfinished); `GET /api/duel/leaderboard` ranks players with duel history by rating.
+
+**Tests (9 new).** Achievement unlock-once/notify-once, streak and duel-wins gates, pseudo-player exclusion; ELO ±16 on equal ratings; rematch guards (state + membership) and difficulty carry-over; archive playability without streak credit, future/missing-date refusal, archive listing. Suite: 174 tests, green.

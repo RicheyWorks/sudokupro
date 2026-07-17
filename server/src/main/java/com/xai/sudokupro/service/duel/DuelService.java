@@ -158,14 +158,45 @@ public class DuelService implements GameEndListener {
         return colon < 0 ? "" : gameId.substring(DUEL_PREFIX.length(), colon);
     }
 
+    /**
+     * Rematch: either party of a FINISHED duel challenges the other again at
+     * the same difficulty. Returns the new duel id (normal accept flow follows).
+     */
+    public String rematch(String duelId, String playerId) {
+        DuelRecord old = requireDuel(duelId);
+        if (!playerId.equals(old.challenger()) && !playerId.equals(old.opponent())) {
+            throw new SecurityException("You were not part of duel " + duelId);
+        }
+        if (!"FINISHED".equals(old.status())) {
+            throw new IllegalStateException("Duel " + duelId + " is " + old.status() + ", not FINISHED");
+        }
+        String other = playerId.equals(old.challenger()) ? old.opponent() : old.challenger();
+        return challenge(playerId, other, old.difficulty());
+    }
+
+    /** Duel ladder: players with a duel history, best rating first. */
+    public List<User> ladder(int limit) {
+        return userRepository.findDuelLadder(
+            org.springframework.data.domain.PageRequest.of(0, Math.max(1, Math.min(limit, 100))));
+    }
+
+    private static final int ELO_K = 32;
+
     private void recordResult(String winner, String loser) {
         try {
             User w = walletFor(winner);
-            w.setDuelWins(w.getDuelWins() + 1);
-            userRepository.save(w);
             User l = walletFor(loser);
+            // ELO: expected score from the rating gap, K=32.
+            double expectedWin = 1.0 / (1.0 + Math.pow(10, (l.getDuelRating() - w.getDuelRating()) / 400.0));
+            int delta = (int) Math.round(ELO_K * (1.0 - expectedWin));
+            w.setDuelRating(w.getDuelRating() + delta);
+            l.setDuelRating(l.getDuelRating() - delta);
+            w.setDuelWins(w.getDuelWins() + 1);
             l.setDuelLosses(l.getDuelLosses() + 1);
+            userRepository.save(w);
             userRepository.save(l);
+            logger.info("Duel ratings: {} +{} → {}, {} -{} → {}",
+                winner, delta, w.getDuelRating(), loser, delta, l.getDuelRating());
         } catch (Exception e) {
             logger.warn("Failed to record duel result {} beats {}: {}", winner, loser, e.getMessage());
         }

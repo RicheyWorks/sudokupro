@@ -37,7 +37,15 @@ public class EconomyController {
             "level", user.getLevel(),
             "duelWins", user.getDuelWins(),
             "duelLosses", user.getDuelLosses(),
+            "duelRating", user.getDuelRating(),
             "hintCost", economyService.hintCost()
         ));
+    }
+
+    @Operation(summary = "The caller's achievements (unlocked and locked)")
+    @GetMapping("/achievements")
+    public ResponseEntity<Object> achievements() {
+        return ResponseEntity.ok(
+            economyService.walletFor(authService.getCurrentPlayerId()).getAchievements());
     }
 }

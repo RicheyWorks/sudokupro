@@ -151,6 +151,34 @@ class DuelServiceTest {
         assertEquals("ACTIVE", store.find(duelId).status(), "no winner without a solved duel board");
     }
 
+    @Test
+    void winnerGainsRatingLoserLosesIt() {
+        String duelId = activeDuel();
+
+        service.onGameEnded(solvedBoard(DuelService.duelGameId(duelId, "rival"), "rival"), "rival");
+
+        // Equal 1000-ratings: expected score 0.5, K=32 → ±16
+        assertEquals(1016, users.get("rival").getDuelRating());
+        assertEquals(984, users.get("richmond").getDuelRating());
+    }
+
+    @Test
+    void rematchSwapsNothingButRequiresAFinishedDuel() {
+        String duelId = activeDuel();
+        assertThrows(IllegalStateException.class, () -> service.rematch(duelId, "richmond"),
+            "active duels cannot be rematched");
+
+        service.onGameEnded(solvedBoard(DuelService.duelGameId(duelId, "rival"), "rival"), "rival");
+
+        assertThrows(SecurityException.class, () -> service.rematch(duelId, "bystander"));
+        String newId = service.rematch(duelId, "richmond");
+        var fresh = store.find(newId);
+        assertEquals("PENDING", fresh.status());
+        assertEquals("richmond", fresh.challenger());
+        assertEquals("rival", fresh.opponent());
+        assertEquals(1, fresh.difficulty(), "rematch keeps the original difficulty");
+    }
+
     // ---- helpers ----
 
     private String activeDuel() {

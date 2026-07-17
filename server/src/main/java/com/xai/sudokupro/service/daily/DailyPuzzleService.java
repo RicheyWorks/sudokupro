@@ -110,6 +110,47 @@ public class DailyPuzzleService implements GameEndListener {
         }
     }
 
+    // ---- archive (past dailies stay playable — untimed, no streak credit) -----
+
+    /** Dates with a playable archived template, newest first (today included). */
+    public List<String> archiveDates(int limit) {
+        int capped = Math.max(1, Math.min(limit, 60));
+        List<String> out = new ArrayList<>();
+        for (SudokuBoard template : gameRepository.findByPlayerId(TEMPLATE_PLAYER,
+                org.springframework.data.domain.PageRequest.of(0, capped))) {
+            String gameId = template.getGameId();
+            if (gameId != null && gameId.startsWith(DAILY_PREFIX)) {
+                out.add(gameId.substring(DAILY_PREFIX.length()));
+            }
+        }
+        return out;
+    }
+
+    /**
+     * Plays an archived daily. The copy's gameId ({@code daily-<date>:archive:<player>})
+     * deliberately never matches {@link #playerGameId}, so archive solves earn
+     * gems but never streak credit or a leaderboard slot — replaying the past
+     * shouldn't rewrite it.
+     */
+    public SudokuBoard joinArchive(String playerId, LocalDate date) {
+        if (date.isAfter(today())) {
+            throw new IllegalArgumentException("No puzzle exists yet for " + date);
+        }
+        String gameId = templateId(date) + ":archive:" + playerId;
+        try {
+            return gameService.getGame(gameId);
+        } catch (IllegalArgumentException notFound) {
+            SudokuBoard template = gameRepository.findByGameId(templateId(date));
+            if (template == null) {
+                throw new IllegalArgumentException("No archived puzzle for " + date);
+            }
+            SudokuBoard copy = SudokuBoard.playerCopy(template, gameId, playerId);
+            gameService.adoptGame(copy);
+            logger.info("Player {} joined archived daily {}", playerId, date);
+            return copy;
+        }
+    }
+
     /** Today's fastest solvers. */
     public List<DailyScore> leaderboard(int limit) {
         int capped = Math.max(1, Math.min(limit, 100));

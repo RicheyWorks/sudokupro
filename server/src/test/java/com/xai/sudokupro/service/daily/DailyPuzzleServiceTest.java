@@ -156,6 +156,45 @@ class DailyPuzzleServiceTest {
     }
 
     @Test
+    void archivedDailiesArePlayableButEarnNoStreak() {
+        when(gameService.getGame(anyString())).thenThrow(new IllegalArgumentException("not found"));
+        when(gameService.adoptGame(any())).thenAnswer(inv -> inv.getArgument(0));
+
+        // Yesterday's template exists (as if created a day ago)
+        SudokuBoard yesterdayTemplate = new SudokuBoard(2, false, false, 0, "daily-2026-07-15");
+        yesterdayTemplate.setPlayerId("__daily__");
+        savedRows.put("daily-2026-07-15", yesterdayTemplate);
+
+        SudokuBoard archive = service.joinArchive("richmond", java.time.LocalDate.of(2026, 7, 15));
+        assertEquals("daily-2026-07-15:archive:richmond", archive.getGameId());
+
+        // Solving it must NOT touch today's streak/completion
+        com.xai.sudokupro.service.AISolverService solver = new com.xai.sudokupro.service.AISolverService(
+            new com.xai.sudokupro.util.SecureRandomGenerator(new io.micrometer.core.instrument.simple.SimpleMeterRegistry()));
+        solver.solveSudoku(archive);
+        service.onGameEnded(archive, "richmond");
+        assertFalse(dailyState.isCompleted(service.today(), "richmond"));
+        assertEquals(0, dailyState.getStreak("richmond", service.today()));
+
+        // Future dates and missing templates are refused
+        assertThrows(IllegalArgumentException.class,
+            () -> service.joinArchive("richmond", java.time.LocalDate.of(2026, 7, 17)));
+        assertThrows(IllegalArgumentException.class,
+            () -> service.joinArchive("richmond", java.time.LocalDate.of(2026, 7, 1)));
+    }
+
+    @Test
+    void archiveDatesListsTemplatesNewestFirst() {
+        SudokuBoard t = new SudokuBoard(2, false, false, 0, "daily-2026-07-15");
+        t.setPlayerId("__daily__");
+        savedRows.put("daily-2026-07-15", t);
+        when(gameRepository.findByPlayerId(eq("__daily__"), any()))
+            .thenReturn(java.util.List.of(t));
+
+        assertEquals(java.util.List.of("2026-07-15"), service.archiveDates(14));
+    }
+
+    @Test
     void leaderboardRanksFastestFirst() {
         dailyState.recordCompletion(service.today(), "slow", 500);
         dailyState.recordCompletion(service.today(), "fast", 90);

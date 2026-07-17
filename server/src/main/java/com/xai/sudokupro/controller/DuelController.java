@@ -87,6 +87,32 @@ public class DuelController {
         return ResponseEntity.ok(duelService.duelsFor(authService.getCurrentPlayerId()));
     }
 
+    @Operation(summary = "Rematch a finished duel — issues a fresh challenge to the other party")
+    @PostMapping("/{duelId}/rematch")
+    public ResponseEntity<Object> rematch(@PathVariable String duelId) {
+        try {
+            String newId = duelService.rematch(duelId, authService.getCurrentPlayerId());
+            return ResponseEntity.ok(Map.of("duelId", newId, "status", "PENDING"));
+        } catch (SecurityException e) {
+            return problem(HttpStatus.FORBIDDEN, "Not Your Duel", e.getMessage());
+        } catch (IllegalStateException e) {
+            return problem(HttpStatus.CONFLICT, "Duel Not Finished", e.getMessage());
+        } catch (IllegalArgumentException e) {
+            return problem(HttpStatus.NOT_FOUND, "Unknown Duel", e.getMessage());
+        }
+    }
+
+    @Operation(summary = "Duel ladder: highest ELO ratings first")
+    @GetMapping("/leaderboard")
+    public ResponseEntity<Object> ladder(
+            @RequestParam(defaultValue = "10") @Min(1) @Max(100) int limit) {
+        var rows = duelService.ladder(limit).stream()
+            .map(u -> Map.of("playerId", u.getUsername(), "rating", u.getDuelRating(),
+                "wins", u.getDuelWins(), "losses", u.getDuelLosses()))
+            .toList();
+        return ResponseEntity.ok(rows);
+    }
+
     private ResponseEntity<Object> problem(HttpStatus status, String title, String detail) {
         return ResponseEntity.status(status)
             .contentType(MediaType.APPLICATION_PROBLEM_JSON)
