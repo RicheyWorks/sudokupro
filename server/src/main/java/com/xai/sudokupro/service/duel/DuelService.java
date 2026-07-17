@@ -83,13 +83,23 @@ public class DuelService implements GameEndListener {
             throw new IllegalStateException("Duel " + duelId + " is " + duel.status() + ", not PENDING");
         }
 
+        // HARD is the generator's ceiling: EXTREME(70 removals) would leave 11
+        // clues, below the 17-clue minimum for a unique solution — generation
+        // always failed there. Difficulty 4 therefore also maps to HARD.
         Constants.Difficulty difficulty = switch (duel.difficulty()) {
             case 1 -> Constants.Difficulty.EASY;
-            case 3 -> Constants.Difficulty.HARD;
-            case 4 -> Constants.Difficulty.EXTREME;
+            case 3, 4 -> Constants.Difficulty.HARD;
             default -> Constants.Difficulty.MEDIUM;
         };
-        SudokuBoard template = generator.generate(difficulty, false, false, System.currentTimeMillis());
+        SudokuBoard template;
+        try {
+            template = generator.generate(difficulty, false, false, System.currentTimeMillis());
+        } catch (RuntimeException e) {
+            // HARD can exhaust the generator's retry budget (uniqueness gets
+            // scarce near the 17-clue floor) — degrade rather than fail the duel.
+            logger.warn("Duel generation at {} failed ({}); falling back to MEDIUM", difficulty, e.getMessage());
+            template = generator.generate(Constants.Difficulty.MEDIUM, false, false, System.currentTimeMillis());
+        }
         template.setDifficulty(duel.difficulty());
 
         SudokuBoard challengerCopy = SudokuBoard.playerCopy(

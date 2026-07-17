@@ -34,6 +34,9 @@ sudokupro/
 - **Real-time multiplayer** — raw-WebSocket duels, drip showdowns, and daily challenges; broadcasts fan out across server replicas via Redis pub/sub
 - **Daily puzzle & streaks** — one shared puzzle per UTC day (identical on every replica), per-player copies played through the normal game flow, consecutive-day streaks, and a fastest-solve daily leaderboard
 - **Head-to-head duels** — challenge any player, both race on identical copies of one puzzle, first correct solve wins; ELO ratings, a duel ladder, and one-tap rematches
+- **Weekly tournament** — five puzzles per ISO week with ramping difficulty; only players who finish all five are ranked, by cumulative solve time
+- **Seasons** — quarterly duel seasons with lazy exactly-once rollover: the ladder podium earns a SeasonChampion badge and ratings soft-reset toward 1000
+- **Power-up shop** — spend gems on EXTRA_LIFE, REVEAL_CELL, or FREEZE (locks a duel opponent for 10s); inventory lives on the player profile
 - **Friends & presence** — request/accept friendships, live online flags from the gameplay channel; spectate any game read-only (the server rejects spectator mutations)
 - **Puzzle sharing** — export any board as a compact share code (never the solution); friends import it as their own game
 - **Achievements & archive** — unlocks fire on real play (clean solves, speed, streaks, duel wins); past dailies stay playable from the archive (gems yes, streak credit no)
@@ -206,6 +209,13 @@ Cross-pod delivery is verified by a two-pod integration test on real Redis in CI
 | `POST` | `/api/friends/request/{name}` | Send a friend request |
 | `POST` | `/api/friends/accept/{name}` | Accept a request (mutual friendship) |
 | `DELETE` | `/api/friends/{name}` | Remove a friend |
+| `GET` | `/api/tournament` | This week's tournament progress |
+| `POST` | `/api/tournament/{1-5}/join` | Join one of the week's five puzzles |
+| `GET` | `/api/tournament/standings` | Weekly standings (full finishers only) |
+| `GET` | `/api/season` | Current season + end date (triggers due rollover) |
+| `GET` | `/api/powerups` | Power-up catalog and your inventory |
+| `POST` | `/api/powerups/buy/{type}` | Buy a power-up with gems |
+| `POST` | `/api/powerups/use/{type}` | Use one (gameId or target param) |
 | `GET` | `/api/economy/wallet` | Gems, XP, level, duel record + rating, hint price |
 | `GET` | `/api/economy/achievements` | The caller's achievements |
 | `POST` | `/api/notifications/device-token` | Register the caller's FCM device token for push notifications |

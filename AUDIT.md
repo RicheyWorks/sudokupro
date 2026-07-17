@@ -215,3 +215,17 @@ Suite: 130 tests, green (4 Docker-gated skips).
 **Spectator mode (also a hardening fix).** Anyone could already join another game's WebSocket channel — and, it turns out, MOVE on it: `applyMove`/`undo`/`redo` never checked ownership. Now `rejectSpectator` guards all three mutating envelope types (error envelope back; `sync` and chat stay open), which simultaneously makes read-only spectating a feature and closes the anyone-can-vandalize-your-board hole. Client: `GameClient.spectate(gameId)` loads state and joins the channel.
 
 **Tests (7 new).** Friendship lifecycle with presence flags and mutual removal, self/phantom rejections; share-code round-trip preserving puzzle-not-solution + garbage rejection; spectator matrix (move/undo rejected with error envelopes, sync still served). Suite: 183 tests, green.
+
+---
+
+## Features batch C: weekly tournament, seasons, power-up shop — 2026-07-16
+
+**Weekly tournament.** Five puzzles per ISO week (`week-<year-Www>-p<1..5>` templates via the daily-puzzle pattern: persisted rows + cross-replica creation lock), difficulty ramping EASY→HARD. Completion times land in a per-player Redis hash (putIfAbsent — first time stands), and standings rank ONLY full finishers by cumulative seconds. TOURNAMENT-typed progress notifications.
+
+**Found & fixed along the way: impossible difficulty tiers.** `Constants.Difficulty.EXTREME` removes 70 cells (11 clues) and NIGHTMARE 80 — both below the mathematical 17-clue minimum for a unique solution, so `SudokuGenerator.generate` could NEVER succeed there; difficulty-4 duels would have thrown on accept. Both duel and tournament mapping now cap at HARD, and since HARD (21 clues) itself sometimes exhausts the generator's 3-attempt budget, both services degrade to MEDIUM with a warning instead of failing the join/accept. (EventEngine's hourly HARD duels have been rolling these dice all along.)
+
+**Seasons.** Quarterly (`2026-Q3`), with LAZY exactly-once rollover — the first `/api/season` query after a boundary claims a SETNX marker (local-map degrade) and performs it: ladder podium (top 3) gets a `SeasonChampion-<season>` achievement + SEASON notification, every rated player's ELO soft-resets toward 1000 ((r+1000)/2). No scheduler to babysit; fresh installs just mark the current season.
+
+**Power-up shop.** The dormant `User.powerUps` map becomes inventory. Catalog: EXTRA_LIFE (15 gems, +1 life on your own game), REVEAL_CELL (20, solver fills one correct cell), FREEZE (25, locks an opponent's input 10s via the existing PlayerStateStore lock). Buying charges gems (402 when broke); using consumes a held unit — except when the attempt is rejected (e.g. targeting someone else's board, 403), which must not burn the unit. `GET /api/powerups`, `POST /buy/{type}`, `POST /use/{type}`.
+
+**Tests (13 new).** Tournament: ISO week identity, ramped templates + per-player copies, full-finishers-only standings, first-time-stands idempotency. Seasons: identity/end-date, exactly-once podium+soft-reset (second query no-op), empty-ladder quiet path. Power-ups: purchase stacking + wallet floor, per-effect behavior incl. ownership guard without unit burn, self-freeze rejection, unknown-type rejection. Suite: 196 tests, green.
