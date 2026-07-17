@@ -38,6 +38,7 @@ sudokupro/
 - **Anti-cheat** — solve-time, move-rate, complexity, and peer-skill signal scoring with automatic flagging (random flavor mechanics deliberately excluded from enforcement)
 - **Economy** — gems, XP, power-ups, and tier progression (Unranked → Bronze → Silver → Gold → Cosmic)
 - **Themes** — Astral Nebula, Cyber Grid, Manga Mode, Retro Pixel (saved locally per machine)
+- **Push notifications** — optional FCM HTTP-v1 delivery (OAuth2 service account, no Google SDK) with per-player device-token registry, 5-minute cooldown, and automatic dead-token cleanup; disabled unless `FCM_ENABLED=true`
 - **Observability** — Micrometer metrics and Spring Actuator health (db, Redis, disk, and a game-engine self-test at `/actuator/health`)
 
 ---
@@ -181,6 +182,8 @@ Cross-pod delivery is verified by a two-pod integration test on real Redis in CI
 | `GET` | `/api/game/saved?limit=` | The caller's unfinished, resumable games, newest first |
 | `POST` | `/api/game/{gameId}/resume` | Resume a saved game (survives restarts and cache expiry) |
 | `GET` | `/api/game/hint` | AI hint for the player's active game |
+| `POST` | `/api/notifications/device-token` | Register the caller's FCM device token for push notifications |
+| `DELETE` | `/api/notifications/device-token` | Remove the caller's device token (opt out of push) |
 | `GET` | `/api/session` | Auth check + CSRF bootstrap for API clients |
 | `GET` | `/api/leaderboard?limit=` | Public leaderboard |
 | `GET` | `/api/events` | Active live events |

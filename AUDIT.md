@@ -153,3 +153,17 @@ Independent review of HEAD after the save/load feature (62d99ac, b7ffc7c), focus
 Noted, not fixed (pre-existing, by design or out of scope): unauthenticated REST callers share the "anonymous" identity, so anonymous saved-game lists are shared — meaningless until real player accounts exist; `getGame`/`solve`/`end` have no ownership check, consistent with multiplayer games being joinable by design (save/resume, which are single-player concepts, do check ownership).
 
 Suite after this pass: 113 tests, green (4 Docker-gated integration tests skip without Docker).
+
+---
+
+## Feature: FCM HTTP-v1 push notifications — 2026-07-16
+
+Completes the P1-5 follow-up: the dead legacy server-key integration was removed on 2026-07-02 with the NotificationService queue + rate-limit kept as a hook; this pass builds the replacement on Google's supported HTTP-v1 API.
+
+**Implementation.** `FcmPushSender` authenticates with an OAuth2 service account — a self-signed RS256 JWT (JDK crypto, no Google SDK dependency) exchanged at the account's `token_uri` for an access token, cached until 5 minutes before expiry under a lock. Sends POST the v1 `messages:send` payload (`notification` title/body + string-valued `data.type`) with the Bearer token; HTTP 404/410 map to `INVALID_TOKEN` (dead registration), other non-2xx to `FAILED`, all counted in Micrometer (`sudokupro.push.sent/invalid_token/failed`). Disabled by default (`sudokupro.fcm.enabled=false`); when enabled, startup fails fast on a missing/malformed service-account file (SecretsGuard philosophy) rather than limping with pushes silently broken. Endpoint override (`sudokupro.fcm.send-endpoint`) exists for tests.
+
+**Device tokens.** FCM addresses devices, not players, so `DeviceTokenStore` maps playerId → registration token (one per player, last wins) in Redis with the established degrade-to-local-map-on-outage shape, 60-day idle TTL. `NotificationController` exposes `POST/DELETE /api/notifications/device-token` for the authenticated player (covered by the existing `anyRequest().authenticated()` + CSRF double-submit; no SecurityConfig change needed). `NotificationService.deliverPush` runs inside the existing 5-minute per-player cooldown, skips quietly when the provider is disabled or no token is registered, and drops tokens the provider reports dead.
+
+**Tests (17 new).** `FcmPushSenderTest` drives the real sender against a loopback HttpServer faking both Google endpoints with a throwaway RSA key — which lets it cryptographically VERIFY the RS256 signature on the minted JWT plus its iss/aud/scope claims, assert the Bearer header and v1 payload shape, token caching across sends (one token request for two sends), 404→INVALID_TOKEN vs 503→FAILED, disabled no-op, and fail-fast init. `DeviceTokenStoreTest` covers the Redis path (TTL write) and the degraded local fallback. `NotificationServiceTest` covers the wiring matrix (enabled+token → send; cooldown suppresses push but never WebSocket delivery; dead token removed; disabled provider never touches the store). `NotificationControllerTest` covers registration/removal under the authenticated identity.
+
+Suite: 130 tests, green (4 Docker-gated skips).

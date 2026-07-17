@@ -1,6 +1,8 @@
 package com.xai.sudokupro.service;
 
 import com.xai.sudokupro.model.Notification;
+import com.xai.sudokupro.service.push.DeviceTokenStore;
+import com.xai.sudokupro.service.push.PushSender;
 import com.xai.sudokupro.websocket.MultiplayerBroadcaster;
 import io.micrometer.core.instrument.MeterRegistry;
 import org.slf4j.Logger;
@@ -27,16 +29,22 @@ public class NotificationService {
 
     private final MultiplayerBroadcaster multiplayerBroadcaster;
     private final MeterRegistry meterRegistry;
+    private final PushSender pushSender;
+    private final DeviceTokenStore deviceTokenStore;
 
     private final ConcurrentLinkedQueue<Notification> notificationQueue = new ConcurrentLinkedQueue<>();
     private final ConcurrentHashMap<String, LocalDateTime> lastNotificationTimes = new ConcurrentHashMap<>();
 
     @Autowired
     public NotificationService(MultiplayerBroadcaster multiplayerBroadcaster,
-                               MeterRegistry meterRegistry) {
+                               MeterRegistry meterRegistry,
+                               PushSender pushSender,
+                               DeviceTokenStore deviceTokenStore) {
 
         this.multiplayerBroadcaster = Objects.requireNonNull(multiplayerBroadcaster);
         this.meterRegistry = Objects.requireNonNull(meterRegistry);
+        this.pushSender = Objects.requireNonNull(pushSender);
+        this.deviceTokenStore = Objects.requireNonNull(deviceTokenStore);
 
         meterRegistry.gauge("sudokupro.notification.queue.size", notificationQueue, Queue::size);
     }
@@ -113,18 +121,34 @@ public class NotificationService {
 
         notificationQueue.offer(notification);
 
-        // Bug fix: pushNotificationService.send() was called unconditionally here, bypassing
-        // the shouldSendPush() rate-limit in the callers. When the WebSocket fails, the push
-        // would fire on every exception regardless of the 5-minute cooldown. Guard with the
-        // same rate-limit check and update lastNotificationTimes so the cooldown is respected.
-        // Push delivery removed (AUDIT P1-5): the FCM legacy server-key API was shut
-        // down by Google in 2024, so the old PushNotificationService could never work.
-        // Queue + rate-limit stay so a future HTTP-v1 integration can hook in here.
+        // Rate-limit guard kept from the earlier bug fix: when the WebSocket path
+        // fails, pushes must still respect the 5-minute cooldown. Actual delivery
+        // is the FCM HTTP-v1 integration (the legacy server-key API removed under
+        // AUDIT P1-5 was replaced, not restored).
         String playerId = notification.playerId();
         if (shouldSendPush(playerId)) {
-            logger.debug("Push suppressed for {} — no push provider configured (FCM legacy removed)", playerId);
             lastNotificationTimes.put(playerId, LocalDateTime.now());
+            deliverPush(notification);
         }
+    }
+
+    /** Attempts real push delivery; quietly a no-op when FCM is not configured. */
+    private void deliverPush(Notification notification) {
+        if (!pushSender.isEnabled()) {
+            logger.debug("Push suppressed for {} — no push provider configured", notification.playerId());
+            return;
+        }
+        String playerId = notification.playerId();
+        deviceTokenStore.find(playerId).ifPresentOrElse(token -> {
+            PushSender.PushResult result =
+                pushSender.send(token, "SudokuPro", notification.message(), notification.type());
+            if (result == PushSender.PushResult.INVALID_TOKEN) {
+                // Dead registration (app uninstalled, token rotated) — drop it so
+                // we stop paying for doomed sends.
+                deviceTokenStore.remove(playerId);
+            }
+            logger.debug("Push to {} → {}", playerId, result);
+        }, () -> logger.debug("Push skipped for {} — no device token registered", playerId));
     }
 
     private boolean shouldSendPush(String playerId) {
