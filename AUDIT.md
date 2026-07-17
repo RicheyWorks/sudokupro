@@ -259,3 +259,9 @@ Independent review of the six feature commits. Four confirmed findings, all fixe
 **A-7 (fixed): REVEAL_CELL kept the clean-solve bonus.** A revealed cell is stronger assistance than a hint but didn't touch hintCount, so a reveal-assisted solve still collected the no-hint bonus. Reveals now increment hintCount.
 
 Noted, not fixed: `WeeklyTournamentService.allTimes` uses Redis KEYS (fine at this scale, an O(N) scan on big instances — switch to a per-week participant set if it ever matters); `SmartDifficultyService`'s global aggregate is per-pod since boot (documented as an approximation); `endGame` only fires listeners for boards in the local active cache (moves always land there, so the solving pod is the ending pod in practice). Suite: 205 tests, green.
+
+---
+
+## CI / release — 2026-07-16
+
+CI already gated on the full suite (`mvn -B verify`, all modules — and since GitHub's ubuntu runners have Docker, the four Testcontainers integration tests RUN in CI rather than skipping, covering the real Flyway chain V1→V5 on Postgres and cross-pod broadcast) plus a Docker build. Added the release lane: pushing a `v*` tag now builds the server jar, pushes the image to GHCR (`ghcr.io/<owner>/sudokupro:<version>` + `latest`), and creates a GitHub Release with generated notes and the exec jar attached. Tagged v1.0.0.

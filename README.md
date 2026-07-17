@@ -66,7 +66,7 @@ sudokupro/
 | API docs | springdoc-openapi (Swagger UI) |
 | Desktop client | JavaFX 21 + JDK `java.net.http` (REST & WebSocket) |
 | Testing | JUnit 5, Mockito, H2, Testcontainers (Postgres + Redis) |
-| Build / Deploy | Maven multi-module, Docker, docker-compose, Kubernetes, GitHub Actions |
+| Build / Deploy | Maven multi-module, Docker, docker-compose, Kubernetes, GitHub Actions (full-suite gate + tagged releases to GHCR) |
 
 ---
 
