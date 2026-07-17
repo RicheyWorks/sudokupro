@@ -32,6 +32,7 @@ sudokupro/
 
 - **Puzzle engine** — backtracking generator with a verified unique solution at every difficulty
 - **Real-time multiplayer** — raw-WebSocket duels, drip showdowns, and daily challenges; broadcasts fan out across server replicas via Redis pub/sub
+- **Daily puzzle & streaks** — one shared puzzle per UTC day (identical on every replica), per-player copies played through the normal game flow, consecutive-day streaks, and a fastest-solve daily leaderboard
 - **AI solver & hints** — logical move hints with cosmic hotspot ranking; full backtracking auto-solve
 - **Save & resume** — explicit save persists the full grid to Postgres; the desktop client's Load button lists your unfinished games and resumes any of them, surviving server restarts and cache expiry
 - **Leaderboards** — points, cosmic drip, hype meter, duel wins, combined skill score
@@ -182,6 +183,9 @@ Cross-pod delivery is verified by a two-pod integration test on real Redis in CI
 | `GET` | `/api/game/saved?limit=` | The caller's unfinished, resumable games, newest first |
 | `POST` | `/api/game/{gameId}/resume` | Resume a saved game (survives restarts and cache expiry) |
 | `GET` | `/api/game/hint` | AI hint for the player's active game |
+| `GET` | `/api/daily` | Caller's daily-puzzle status: joined, completed, streak |
+| `POST` | `/api/daily/join` | Join today's shared puzzle (idempotent, returns the caller's copy) |
+| `GET` | `/api/daily/leaderboard?limit=` | Today's fastest solvers |
 | `POST` | `/api/notifications/device-token` | Register the caller's FCM device token for push notifications |
 | `DELETE` | `/api/notifications/device-token` | Remove the caller's device token (opt out of push) |
 | `GET` | `/api/session` | Auth check + CSRF bootstrap for API clients |

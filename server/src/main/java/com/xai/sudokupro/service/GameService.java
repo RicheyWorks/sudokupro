@@ -11,6 +11,7 @@ import com.xai.sudokupro.util.SecureRandomGenerator;
 import com.xai.sudokupro.websocket.MultiplayerBroadcaster;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.data.redis.core.RedisTemplate;
@@ -45,6 +46,16 @@ public class GameService {
     private final PlayerStateStore playerState;
     private final GameLockManager  gameLocks;
     private final Object           creationLock = new Object();
+
+    // Lazily resolved to break the constructor cycle: DailyPuzzleService needs
+    // GameService (adoptGame/getGame), GameService needs to tell it about ended
+    // games. Optional — absent in unit tests that construct GameService directly.
+    private ObjectProvider<com.xai.sudokupro.service.daily.DailyPuzzleService> dailyPuzzles;
+
+    @Autowired
+    public void setDailyPuzzles(ObjectProvider<com.xai.sudokupro.service.daily.DailyPuzzleService> dailyPuzzles) {
+        this.dailyPuzzles = dailyPuzzles;
+    }
 
     @Autowired
     public GameService(AISolverService aiSolverService, GameRepository gameRepository,
@@ -112,6 +123,26 @@ public class GameService {
         chaosEngine.onGameEvent("RESET", pid);
         multiplayerBroadcaster.broadcastGameStart(gameId, pid);
         logger.info("Game created id={} player={} difficulty={}", gameId, pid, difficulty);
+        return board;
+    }
+
+    /**
+     * Registers an externally constructed board (e.g. a player's copy of the
+     * daily puzzle) exactly as createNewGame would: active set, cap enforcement,
+     * Redis write-through, database persist, and game-start broadcast.
+     */
+    public SudokuBoard adoptGame(SudokuBoard board) {
+        Objects.requireNonNull(board, "board");
+        String gameId = board.getGameId();
+        validateGameId(gameId);
+        synchronized (creationLock) {
+            activeGames.put(gameId, board);
+            trimActiveGames();
+        }
+        saveToRedis(gameId, board);
+        persistBoard(board);
+        multiplayerBroadcaster.broadcastGameStart(gameId, board.getPlayerId());
+        logger.info("Game adopted id={} player={}", gameId, board.getPlayerId());
         return board;
     }
 
@@ -231,6 +262,7 @@ public class GameService {
                 analyticsService.recordEvent(new GameEvent(type, playerId,
                     Map.of("solveTimeSeconds", String.valueOf(board.getSolveTime().toSeconds()))));
                 multiplayerBroadcaster.broadcastGameEnd(gameId, playerId);
+                notifyDailyPuzzles(board, playerId);
                 logger.info("Game {} ended for player {}", gameId, playerId);
             }
         }
@@ -312,6 +344,17 @@ public class GameService {
     private void persistBoard(SudokuBoard board) {
         board.syncCellsJson();
         gameRepository.save(board);
+    }
+
+    /** Lets the daily-puzzle feature observe finished games (solved or abandoned). */
+    private void notifyDailyPuzzles(SudokuBoard board, String playerId) {
+        if (dailyPuzzles == null) return; // plain unit-test construction
+        try {
+            var daily = dailyPuzzles.getIfAvailable();
+            if (daily != null) daily.onGameEnded(board, playerId);
+        } catch (Exception e) {
+            logger.warn("Daily-puzzle hook failed for game {}: {}", board.getGameId(), e.getMessage());
+        }
     }
 
     public void solveSudoku(String gameId) {

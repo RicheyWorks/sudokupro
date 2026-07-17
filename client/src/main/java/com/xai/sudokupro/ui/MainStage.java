@@ -228,6 +228,8 @@ public class MainStage extends Application {
         });
 
         // Controls
+        Button dailyButton = new Button("Daily");
+        dailyButton.setOnAction(e -> playDaily(primaryStage));
         Button hintButton = new Button("Hint");
         hintButton.setOnAction(e -> { if (boardView != null) boardView.requestHint(); });
         Button resetButton = new Button("Reset");
@@ -251,7 +253,7 @@ public class MainStage extends Application {
         settingsButton.setOnAction(e -> showSettings());
 
         HBox controls = new HBox(10, difficultySelector, chaosModeCheck, mirrorModeCheck, timerLabel, statsLabel,
-            hintButton, resetButton, leaderboardButton, soundToggle, saveButton, loadButton, themeButton, pauseButton,
+            dailyButton, hintButton, resetButton, leaderboardButton, soundToggle, saveButton, loadButton, themeButton, pauseButton,
             replayButton, settingsButton);
         controls.setAlignment(Pos.CENTER);
         controls.setPadding(new Insets(10));
@@ -472,6 +474,35 @@ public class MainStage extends Application {
           .append(" · score ").append(s.score())
           .append(" · #").append(s.gameId(), 0, Math.min(8, s.gameId().length()));
         return sb.toString();
+    }
+
+    /** Joins today's shared daily puzzle (network call — off the FX thread), then rebuilds the board view. */
+    private void playDaily(Stage primaryStage) {
+        Thread joiner = new Thread(() -> {
+            try {
+                var statusBefore = client.dailyStatus();
+                if (statusBefore.completed()) {
+                    notify("game", "Daily already solved — " + statusBefore.streakDays()
+                        + "-day streak. New puzzle at midnight UTC!");
+                    return;
+                }
+                client.joinDaily();
+                Platform.runLater(() -> {
+                    boardView = new BoardView(client, this::notify);
+                    BorderPane root = (BorderPane) primaryStage.getScene().getRoot();
+                    root.setCenter(boardView.getView());
+                    startTimer(timerLabel);
+                    updateStats();
+                    notify("game", "Daily puzzle " + statusBefore.date() + " — streak "
+                        + statusBefore.streakDays() + ". Good luck!");
+                });
+            } catch (Exception e) {
+                logger.error("Failed to join daily puzzle: {}", e.getMessage(), e);
+                notify("error", "Daily puzzle failed: " + e.getMessage());
+            }
+        }, "sudokupro-daily");
+        joiner.setDaemon(true);
+        joiner.start();
     }
 
     /** Resumes the chosen game (network call — runs off the FX thread), then rebuilds the board view. */

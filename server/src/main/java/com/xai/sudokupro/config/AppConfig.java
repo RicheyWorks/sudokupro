@@ -62,6 +62,11 @@ public class AppConfig {
     @Bean
     public ConcurrentHashMap<Long, String> playerStatsCache() { return new ConcurrentHashMap<>(); }
 
+    /** UTC clock — the daily puzzle's day boundary; tests override with a fixed clock. */
+    @Bean
+    @ConditionalOnMissingBean(java.time.Clock.class)
+    public java.time.Clock clock() { return java.time.Clock.systemUTC(); }
+
     // Single JedisPool for the remaining raw-Jedis consumers (RedisSyncScheduler,
     // RedisHealthIndicator, SudokuHealthMonitor). Reads the SAME spring.data.redis.*
     // properties as Boot's connection factory so both clients always target the same

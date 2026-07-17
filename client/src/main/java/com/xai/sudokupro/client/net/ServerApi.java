@@ -115,6 +115,24 @@ public class ServerApi {
         return post("/api/game/" + gameId + "/resume", BoardState.class);
     }
 
+    // ---- daily puzzle -------------------------------------------------------
+
+    /** The caller's status for today's shared puzzle. */
+    public com.xai.sudokupro.model.api.DailyStatus dailyStatus() {
+        return get("/api/daily", com.xai.sudokupro.model.api.DailyStatus.class);
+    }
+
+    /** Joins today's puzzle (idempotent) and returns the caller's board. */
+    public BoardState joinDaily() {
+        return post("/api/daily/join", BoardState.class);
+    }
+
+    /** Today's fastest solvers. */
+    public List<com.xai.sudokupro.model.api.DailyScore> dailyLeaderboard(int limit) {
+        return get("/api/daily/leaderboard?limit=" + limit,
+            new TypeReference<List<com.xai.sudokupro.model.api.DailyScore>>() {});
+    }
+
     public String hint(String gameId) {
         JsonNode node = get("/api/game/hint?gameId=" + gameId, JsonNode.class);
         return node.path("hint").asText("No hint available.");

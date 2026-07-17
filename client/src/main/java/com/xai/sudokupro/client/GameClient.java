@@ -134,6 +134,30 @@ public class GameClient implements AutoCloseable {
         requireSocket().send("move", move);
     }
 
+    /**
+     * Joins today's shared daily puzzle (idempotent server-side): rebuilds
+     * local state from the returned copy and (re)joins its gameplay channel.
+     */
+    public synchronized SudokuBoard joinDaily() {
+        closeSocket();
+        BoardState state = api.joinDaily();
+        board = state.toBoard();
+        socket = api.openSocket(state.gameId(), this::handleEnvelope,
+            () -> notifier.notify("ui", "Connection to game lost"));
+        logger.info("Joined daily puzzle game {}", state.gameId());
+        return board;
+    }
+
+    /** The caller's daily status: joined/completed/streak. */
+    public com.xai.sudokupro.model.api.DailyStatus dailyStatus() {
+        return api.dailyStatus();
+    }
+
+    /** Today's fastest solvers. */
+    public List<com.xai.sudokupro.model.api.DailyScore> dailyLeaderboard(int limit) {
+        return api.dailyLeaderboard(limit);
+    }
+
     /** Server-side undo — the fresh board arrives as a "board" envelope. */
     public void undo() {
         requireSocket().send("undo", "");
