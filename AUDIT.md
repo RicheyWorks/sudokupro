@@ -277,3 +277,9 @@ The platform's social features (friends, duels, ladders, wallets) all assumed di
 ## Feature: web client — 2026-07-16
 
 Zero-install browser client at `/play/` (two static files served by the server; split into index.html + app.js because the CSP's `script-src 'self'` forbids inline scripts — deliberately not weakened). Auth: Basic on fetches; the WebSocket handshake can't carry headers from a browser, so it authenticates via the session cookie that `GET /api/session` establishes (SessionCreationPolicy.IF_REQUIRED) — same-origin, so the default localhost WS origin allowlist holds. CSRF double-submit echoed from the session bootstrap. Covers register/login, new game with the adaptive difficulty preselect, daily puzzle with streak display, live board over the game WebSocket (optimistic moves, server-error resync via the sync envelope), hints, wallet/streak HUD, and typed notifications in the log pane. `/play/**` is permitAll (static shell only — every data call still authenticates). JS syntax verified with node; no server logic changed beyond the one matcher.
+
+---
+
+## Tooling: load-test harness — 2026-07-16
+
+`loadtest/loadtest.py` (asyncio, `websockets` + `requests`): N concurrent simulated players, each a FRESH registered account (exercising the accounts path at scale), opening a new game or joining the daily, connecting the gameplay WebSocket with cookie+Basic handshake auth, and playing moves that are legal against the visible board at an exponential think-time cadence. Reports p50/p95/max latency per operation (register, session, new_game, daily_join, move_roundtrip) plus error counts and solved-board tally. Syntax-verified here; needs a running server (docker-compose) to execute — the interesting first run is `--players 50` while watching /actuator/health and the Redis lock warnings.

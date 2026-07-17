@@ -154,6 +154,19 @@ See `.env.example` for a full template.
 
 ---
 
+## Load Testing
+
+`loadtest/loadtest.py` simulates N concurrent players — each one a fresh
+registered account that opens a game (or joins the daily), connects the
+gameplay WebSocket, and plays legal moves. Reports latency percentiles:
+
+```bash
+pip install websockets requests
+python loadtest/loadtest.py --base http://localhost:8080 --players 50
+```
+
+---
+
 ## Database Migrations
 
 Flyway owns the schema; Hibernate only validates it.
