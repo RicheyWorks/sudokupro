@@ -190,6 +190,12 @@ public class SudokuGameController {
             }
             logger.debug("Hint provided: {}", hint);
             return ResponseEntity.ok(Map.of("hint", hint));
+        } catch (com.xai.sudokupro.service.economy.InsufficientGemsException e) {
+            return ResponseEntity.status(HttpStatus.PAYMENT_REQUIRED)
+                .contentType(MediaType.APPLICATION_PROBLEM_JSON)
+                .body(buildProblem(HINT_FAILURE_ERROR, "Not Enough Gems",
+                    "Hints cost " + e.cost() + " gems; you have " + e.balance()
+                    + ". Solve puzzles to earn more."));
         } catch (Exception e) {
             logger.error("Failed to retrieve hint: {}", e.getMessage());
             return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)

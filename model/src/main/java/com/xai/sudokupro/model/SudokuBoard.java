@@ -146,6 +146,23 @@ public class SudokuBoard implements Serializable {
         logger.info("SudokuBoard initialized for gameId: {}", this.gameId);
     }
 
+    /**
+     * Stamps a player-owned copy of {@code template}'s grid under a new game
+     * identity — the primitive behind shared-puzzle features (daily puzzle,
+     * duels): everyone plays the same cells, each on their own board.
+     */
+    public static SudokuBoard playerCopy(SudokuBoard template, String gameId, String playerId) {
+        SudokuCell[][] blank = new SudokuCell[9][9];
+        for (int r = 0; r < 9; r++)
+            for (int c = 0; c < 9; c++)
+                blank[r][c] = new SudokuCell();
+        SudokuBoard copy = new SudokuBoard(blank, false, false, 0, gameId);
+        copy.restoreCells(template.snapshotCells());
+        copy.setPlayerId(playerId);
+        copy.setDifficulty(template.getDifficulty());
+        return copy;
+    }
+
     // =====================================================================
     // Grid persistence (save/load)
     // =====================================================================

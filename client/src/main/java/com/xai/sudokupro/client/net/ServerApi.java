@@ -133,6 +133,42 @@ public class ServerApi {
             new TypeReference<List<com.xai.sudokupro.model.api.DailyScore>>() {});
     }
 
+    // ---- duels ---------------------------------------------------------------
+
+    /** Challenges another player; returns the duel id they must accept. */
+    public String challengeDuel(String opponent, int difficulty) {
+        try {
+            String body = mapper.writeValueAsString(
+                java.util.Map.of("opponent", opponent, "difficulty", difficulty));
+            JsonNode node = postJson("/api/duel/challenge", body, JsonNode.class);
+            return node.path("duelId").asText();
+        } catch (IOException e) {
+            throw new ApiException("Malformed challenge request", e);
+        }
+    }
+
+    /** Accepts a pending duel; returns the caller's board — the race starts now. */
+    public BoardState acceptDuel(String duelId) {
+        return post("/api/duel/" + duelId + "/accept", BoardState.class);
+    }
+
+    /** Declines a pending duel. */
+    public void declineDuel(String duelId) {
+        post("/api/duel/" + duelId + "/decline", Void.class);
+    }
+
+    /** The caller's duels (pending, active, finished). */
+    public List<com.xai.sudokupro.model.api.DuelInfo> myDuels() {
+        return get("/api/duel", new TypeReference<List<com.xai.sudokupro.model.api.DuelInfo>>() {});
+    }
+
+    // ---- economy ---------------------------------------------------------------
+
+    /** The caller's wallet (gems, xp, level, duel record, hint price). */
+    public JsonNode wallet() {
+        return get("/api/economy/wallet", JsonNode.class);
+    }
+
     public String hint(String gameId) {
         JsonNode node = get("/api/game/hint?gameId=" + gameId, JsonNode.class);
         return node.path("hint").asText("No hint available.");
@@ -173,6 +209,14 @@ public class ServerApi {
 
     private <T> T post(String path, Class<T> type) {
         HttpRequest.Builder builder = request(path).POST(HttpRequest.BodyPublishers.noBody());
+        if (csrfToken != null) builder.header(csrfHeaderName, csrfToken);
+        return exchange(builder.build(), type);
+    }
+
+    private <T> T postJson(String path, String jsonBody, Class<T> type) {
+        HttpRequest.Builder builder = request(path)
+            .header("Content-Type", "application/json")
+            .POST(HttpRequest.BodyPublishers.ofString(jsonBody));
         if (csrfToken != null) builder.header(csrfHeaderName, csrfToken);
         return exchange(builder.build(), type);
     }

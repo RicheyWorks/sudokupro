@@ -3,6 +3,8 @@ package com.xai.sudokupro.model;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import jakarta.persistence.ElementCollection;
 import jakarta.persistence.Entity;
+import jakarta.persistence.GeneratedValue;
+import jakarta.persistence.GenerationType;
 import jakarta.persistence.Id;
 import jakarta.persistence.Table;
 import jakarta.validation.constraints.Min;
@@ -27,6 +29,7 @@ public class User implements Serializable {
     private static final Logger logger = LoggerFactory.getLogger(User.class);
 
     @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
     private Long id;
 
     @NotBlank(message = "Username cannot be blank")

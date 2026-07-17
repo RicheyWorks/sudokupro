@@ -230,6 +230,8 @@ public class MainStage extends Application {
         // Controls
         Button dailyButton = new Button("Daily");
         dailyButton.setOnAction(e -> playDaily(primaryStage));
+        Button duelButton = new Button("Duel");
+        duelButton.setOnAction(e -> showDuelDialog(primaryStage));
         Button hintButton = new Button("Hint");
         hintButton.setOnAction(e -> { if (boardView != null) boardView.requestHint(); });
         Button resetButton = new Button("Reset");
@@ -253,7 +255,7 @@ public class MainStage extends Application {
         settingsButton.setOnAction(e -> showSettings());
 
         HBox controls = new HBox(10, difficultySelector, chaosModeCheck, mirrorModeCheck, timerLabel, statsLabel,
-            dailyButton, hintButton, resetButton, leaderboardButton, soundToggle, saveButton, loadButton, themeButton, pauseButton,
+            dailyButton, duelButton, hintButton, resetButton, leaderboardButton, soundToggle, saveButton, loadButton, themeButton, pauseButton,
             replayButton, settingsButton);
         controls.setAlignment(Pos.CENTER);
         controls.setPadding(new Insets(10));
@@ -474,6 +476,83 @@ public class MainStage extends Application {
           .append(" · score ").append(s.score())
           .append(" · #").append(s.gameId(), 0, Math.min(8, s.gameId().length()));
         return sb.toString();
+    }
+
+    /** Duel hub: accept a pending challenge, rejoin an active race, or challenge someone new. */
+    private void showDuelDialog(Stage primaryStage) {
+        Thread fetcher = new Thread(() -> {
+            try {
+                var duels = client.myDuels();
+                Platform.runLater(() -> {
+                    Map<String, Runnable> actions = new LinkedHashMap<>();
+                    String me = client.playerId();
+                    for (var d : duels) {
+                        if ("PENDING".equals(d.status()) && me.equals(d.opponent())) {
+                            actions.put("Accept challenge from " + d.challenger() + " (#" + d.duelId() + ")",
+                                () -> acceptDuel(primaryStage, d.duelId()));
+                        } else if ("ACTIVE".equals(d.status()) && d.gameId() != null) {
+                            String rival = me.equals(d.challenger()) ? d.opponent() : d.challenger();
+                            actions.put("Rejoin race vs " + rival + " (#" + d.duelId() + ")",
+                                () -> resumeGame(primaryStage, d.gameId()));
+                        }
+                    }
+                    actions.put("Challenge a player…", () -> challengeDuel());
+                    ChoiceDialog<String> dialog = new ChoiceDialog<>(
+                        actions.keySet().iterator().next(), actions.keySet());
+                    dialog.setTitle("Duels");
+                    dialog.setHeaderText("First to solve wins");
+                    dialog.setContentText("Action:");
+                    dialog.showAndWait().ifPresent(choice -> actions.get(choice).run());
+                });
+            } catch (Exception e) {
+                logger.error("Failed to load duels: {}", e.getMessage(), e);
+                notify("error", "Duels unavailable: " + e.getMessage());
+            }
+        }, "sudokupro-duels");
+        fetcher.setDaemon(true);
+        fetcher.start();
+    }
+
+    private void challengeDuel() {
+        TextInputDialog prompt = new TextInputDialog();
+        prompt.setTitle("Challenge");
+        prompt.setHeaderText("Who do you want to duel?");
+        prompt.setContentText("Player name:");
+        prompt.showAndWait().ifPresent(opponent -> {
+            Thread sender = new Thread(() -> {
+                try {
+                    String duelId = client.challengeDuel(opponent.trim(),
+                        getDifficultyLevel(difficultySelector.getValue()));
+                    notify("game", "Challenge sent to " + opponent + " (#" + duelId + ") — waiting for them to accept");
+                } catch (Exception e) {
+                    logger.error("Challenge failed: {}", e.getMessage(), e);
+                    notify("error", "Challenge failed: " + e.getMessage());
+                }
+            }, "sudokupro-challenge");
+            sender.setDaemon(true);
+            sender.start();
+        });
+    }
+
+    private void acceptDuel(Stage primaryStage, String duelId) {
+        Thread acceptor = new Thread(() -> {
+            try {
+                client.acceptDuel(duelId);
+                Platform.runLater(() -> {
+                    boardView = new BoardView(client, this::notify);
+                    BorderPane root = (BorderPane) primaryStage.getScene().getRoot();
+                    root.setCenter(boardView.getView());
+                    startTimer(timerLabel);
+                    updateStats();
+                    notify("game", "Duel on! First correct solve wins.");
+                });
+            } catch (Exception e) {
+                logger.error("Failed to accept duel {}: {}", duelId, e.getMessage(), e);
+                notify("error", "Accept failed: " + e.getMessage());
+            }
+        }, "sudokupro-duel-accept");
+        acceptor.setDaemon(true);
+        acceptor.start();
     }
 
     /** Joins today's shared daily puzzle (network call — off the FX thread), then rebuilds the board view. */

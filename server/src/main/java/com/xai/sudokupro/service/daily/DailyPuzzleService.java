@@ -1,11 +1,11 @@
 package com.xai.sudokupro.service.daily;
 
 import com.xai.sudokupro.model.SudokuBoard;
-import com.xai.sudokupro.model.SudokuCell;
 import com.xai.sudokupro.model.SudokuGenerator;
 import com.xai.sudokupro.model.api.DailyScore;
 import com.xai.sudokupro.model.api.DailyStatus;
 import com.xai.sudokupro.repository.GameRepository;
+import com.xai.sudokupro.service.GameEndListener;
 import com.xai.sudokupro.service.GameLockManager;
 import com.xai.sudokupro.service.GameService;
 import com.xai.sudokupro.service.NotificationService;
@@ -38,7 +38,7 @@ import java.util.Map;
  * that side breaks the constructor cycle between the two services.
  */
 @Service
-public class DailyPuzzleService {
+public class DailyPuzzleService implements GameEndListener {
 
     private static final Logger logger = LoggerFactory.getLogger(DailyPuzzleService.class);
     static final String DAILY_PREFIX = "daily-";
@@ -126,6 +126,7 @@ public class DailyPuzzleService {
      * completion (once) and advances the streak when the finished game is the
      * player's copy of today's puzzle and it is actually solved.
      */
+    @Override
     public void onGameEnded(SudokuBoard board, String playerId) {
         LocalDate date = today();
         if (board == null || playerId == null) return;
@@ -174,14 +175,6 @@ public class DailyPuzzleService {
 
     /** Stamps a per-player copy of the template's grid. */
     private SudokuBoard copyOf(SudokuBoard template, String gameId, String playerId) {
-        SudokuCell[][] blank = new SudokuCell[9][9];
-        for (int r = 0; r < 9; r++)
-            for (int c = 0; c < 9; c++)
-                blank[r][c] = new SudokuCell();
-        SudokuBoard copy = new SudokuBoard(blank, false, false, 0, gameId);
-        copy.restoreCells(template.snapshotCells());
-        copy.setPlayerId(playerId);
-        copy.setDifficulty(DAILY_DIFFICULTY_LEVEL);
-        return copy;
+        return SudokuBoard.playerCopy(template, gameId, playerId);
     }
 }

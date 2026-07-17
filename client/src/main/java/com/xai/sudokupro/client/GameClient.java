@@ -158,6 +158,37 @@ public class GameClient implements AutoCloseable {
         return api.dailyLeaderboard(limit);
     }
 
+    // ---- duels -----------------------------------------------------------------
+
+    /** Challenges another player; returns the duel id. */
+    public String challengeDuel(String opponent, int difficulty) {
+        return api.challengeDuel(opponent, difficulty);
+    }
+
+    /** Accepts a duel and enters the race: local board + gameplay channel. */
+    public synchronized SudokuBoard acceptDuel(String duelId) {
+        closeSocket();
+        BoardState state = api.acceptDuel(duelId);
+        board = state.toBoard();
+        socket = api.openSocket(state.gameId(), this::handleEnvelope,
+            () -> notifier.notify("ui", "Connection to game lost"));
+        logger.info("Duel {} accepted — playing game {}", duelId, state.gameId());
+        return board;
+    }
+
+    public void declineDuel(String duelId) {
+        api.declineDuel(duelId);
+    }
+
+    public List<com.xai.sudokupro.model.api.DuelInfo> myDuels() {
+        return api.myDuels();
+    }
+
+    /** The caller's wallet (gems, xp, level, duel record, hint price). */
+    public com.fasterxml.jackson.databind.JsonNode wallet() {
+        return api.wallet();
+    }
+
     /** Server-side undo — the fresh board arrives as a "board" envelope. */
     public void undo() {
         requireSocket().send("undo", "");

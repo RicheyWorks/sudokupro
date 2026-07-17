@@ -133,6 +133,25 @@ class GameServiceTest {
             "getGame must throw for unknown ids (WebSocketController relies on this)");
     }
 
+    // ---- hint economy wiring ----
+
+    @Test
+    void hintsChargeTheBoardOwnerAndInsufficientGemsWithholdsTheHint() {
+        var economy = mock(com.xai.sudokupro.service.economy.EconomyService.class);
+        gameService.setEconomyService(economy);
+        SudokuBoard board = gameService.createNewGame(1, "p-hints", false, false);
+
+        when(economy.chargeForHint("p-hints")).thenReturn(10);
+        assertNotNull(gameService.getHint(board.getGameId()));
+        verify(economy).chargeForHint("p-hints");
+
+        when(economy.chargeForHint("p-hints"))
+            .thenThrow(new com.xai.sudokupro.service.economy.InsufficientGemsException("p-hints", 0, 5));
+        assertThrows(com.xai.sudokupro.service.economy.InsufficientGemsException.class,
+            () -> gameService.getHint(board.getGameId()),
+            "a broke player must not receive the hint");
+    }
+
     // ---- save / load ----
 
     @Test

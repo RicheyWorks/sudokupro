@@ -33,6 +33,8 @@ sudokupro/
 - **Puzzle engine** — backtracking generator with a verified unique solution at every difficulty
 - **Real-time multiplayer** — raw-WebSocket duels, drip showdowns, and daily challenges; broadcasts fan out across server replicas via Redis pub/sub
 - **Daily puzzle & streaks** — one shared puzzle per UTC day (identical on every replica), per-player copies played through the normal game flow, consecutive-day streaks, and a fastest-solve daily leaderboard
+- **Head-to-head duels** — challenge any player, both race on identical copies of one puzzle, first correct solve wins; duel wins/losses recorded on the player profile
+- **Hint economy** — hints cost gems, solving earns them (difficulty-scaled, clean-solve bonus); wallets auto-provision with a starting balance
 - **AI solver & hints** — logical move hints with cosmic hotspot ranking; full backtracking auto-solve
 - **Save & resume** — explicit save persists the full grid to Postgres; the desktop client's Load button lists your unfinished games and resumes any of them, surviving server restarts and cache expiry
 - **Leaderboards** — points, cosmic drip, hype meter, duel wins, combined skill score
@@ -186,6 +188,11 @@ Cross-pod delivery is verified by a two-pod integration test on real Redis in CI
 | `GET` | `/api/daily` | Caller's daily-puzzle status: joined, completed, streak |
 | `POST` | `/api/daily/join` | Join today's shared puzzle (idempotent, returns the caller's copy) |
 | `GET` | `/api/daily/leaderboard?limit=` | Today's fastest solvers |
+| `POST` | `/api/duel/challenge` | Challenge a player (`{opponent, difficulty}`) |
+| `POST` | `/api/duel/{id}/accept` | Accept a duel — returns your board, race starts |
+| `POST` | `/api/duel/{id}/decline` | Decline a pending duel |
+| `GET` | `/api/duel` | The caller's duels (pending, active, finished) |
+| `GET` | `/api/economy/wallet` | Gems, XP, level, duel record, hint price |
 | `POST` | `/api/notifications/device-token` | Register the caller's FCM device token for push notifications |
 | `DELETE` | `/api/notifications/device-token` | Remove the caller's device token (opt out of push) |
 | `GET` | `/api/session` | Auth check + CSRF bootstrap for API clients |

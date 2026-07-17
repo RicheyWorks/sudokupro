@@ -63,6 +63,18 @@ class FlywayMigrationTest {
             assertTrue(migrationApplied(c, "1"), "V1 must be recorded");
             assertTrue(migrationApplied(c, "2"), "V2 must be recorded (idempotent no-op here)");
             assertTrue(migrationApplied(c, "3"), "V3 (cells_json) must be recorded");
+            assertTrue(migrationApplied(c, "4"), "V4 (users.id identity) must be recorded");
+            // users.id is generated: inserting without an id must work
+            try (Statement st = c.createStatement()) {
+                st.execute("INSERT INTO users (username, points, streak, duel_wins, duel_losses, gems, "
+                    + "level, xp, fan_count, hype_meter, cosmic_drip, last_login) "
+                    + "VALUES ('idtest', 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, now())");
+                try (ResultSet rs = st.executeQuery("SELECT id FROM users WHERE username='idtest'")) {
+                    assertTrue(rs.next());
+                    assertTrue(rs.getLong(1) >= 1000000000L,
+                        "generated ids must start above the legacy manual range");
+                }
+            }
         }
     }
 
@@ -100,6 +112,8 @@ class FlywayMigrationTest {
             assertTrue(migrationApplied(c, "3"), "V3 must run on a legacy database");
             assertEquals("text", columnType(c, "sudoku_boards", "cells_json"),
                 "V3 must add cells_json to upgraded legacy databases");
+            assertTrue(migrationApplied(c, "4"),
+                "V4 must apply on legacy databases even without a users table (IF EXISTS)");
             // The BIGINT column is now a real timestamp, data converted not lost
             assertEquals("timestamp without time zone", columnType(c, "sudoku_boards", "start_time"));
             try (Statement st = c.createStatement();

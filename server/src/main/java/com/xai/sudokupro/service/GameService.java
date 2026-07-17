@@ -47,14 +47,24 @@ public class GameService {
     private final GameLockManager  gameLocks;
     private final Object           creationLock = new Object();
 
-    // Lazily resolved to break the constructor cycle: DailyPuzzleService needs
-    // GameService (adoptGame/getGame), GameService needs to tell it about ended
-    // games. Optional — absent in unit tests that construct GameService directly.
-    private ObjectProvider<com.xai.sudokupro.service.daily.DailyPuzzleService> dailyPuzzles;
+    // Lazily resolved to break constructor cycles: listeners (daily puzzle,
+    // duels) need GameService (adoptGame/getGame), GameService needs to tell
+    // them about ended games. Optional — absent in plain unit tests.
+    private ObjectProvider<GameEndListener> gameEndListeners;
 
     @Autowired
-    public void setDailyPuzzles(ObjectProvider<com.xai.sudokupro.service.daily.DailyPuzzleService> dailyPuzzles) {
-        this.dailyPuzzles = dailyPuzzles;
+    public void setGameEndListeners(ObjectProvider<GameEndListener> gameEndListeners) {
+        this.gameEndListeners = gameEndListeners;
+    }
+
+    // Hint-economy charge point (solve rewards flow through the listener hook
+    // above; EconomyService implements GameEndListener). Setter-injected and
+    // optional so plain unit tests can construct GameService without it.
+    private com.xai.sudokupro.service.economy.EconomyService economyService;
+
+    @Autowired(required = false)
+    public void setEconomyService(com.xai.sudokupro.service.economy.EconomyService economyService) {
+        this.economyService = economyService;
     }
 
     @Autowired
@@ -195,6 +205,12 @@ public class GameService {
         try (var lock = gameLocks.lock(gameId)) {
             SudokuBoard board = getGame(gameId);
             String hint = aiSolverService.getNextLogicalMove(board);
+            // Hint economy: charge AFTER computing but BEFORE revealing — a
+            // throw here (InsufficientGemsException) means the player pays
+            // nothing and learns nothing. Empty hints are free.
+            if (economyService != null && hint != null && !hint.isBlank()) {
+                economyService.chargeForHint(board.getPlayerId());
+            }
             analyticsService.recordEvent(new GameEvent(GameEvent.EventType.HINT, board.getPlayerId(),
                 Map.of("hint", hint, "gameId", gameId)));
             return hint;
@@ -262,7 +278,7 @@ public class GameService {
                 analyticsService.recordEvent(new GameEvent(type, playerId,
                     Map.of("solveTimeSeconds", String.valueOf(board.getSolveTime().toSeconds()))));
                 multiplayerBroadcaster.broadcastGameEnd(gameId, playerId);
-                notifyDailyPuzzles(board, playerId);
+                notifyGameEndListeners(board, playerId);
                 logger.info("Game {} ended for player {}", gameId, playerId);
             }
         }
@@ -346,15 +362,17 @@ public class GameService {
         gameRepository.save(board);
     }
 
-    /** Lets the daily-puzzle feature observe finished games (solved or abandoned). */
-    private void notifyDailyPuzzles(SudokuBoard board, String playerId) {
-        if (dailyPuzzles == null) return; // plain unit-test construction
-        try {
-            var daily = dailyPuzzles.getIfAvailable();
-            if (daily != null) daily.onGameEnded(board, playerId);
-        } catch (Exception e) {
-            logger.warn("Daily-puzzle hook failed for game {}: {}", board.getGameId(), e.getMessage());
-        }
+    /** Fans finished games out to feature listeners (daily puzzle, duels, ...). */
+    private void notifyGameEndListeners(SudokuBoard board, String playerId) {
+        if (gameEndListeners == null) return; // plain unit-test construction
+        gameEndListeners.stream().forEach(listener -> {
+            try {
+                listener.onGameEnded(board, playerId);
+            } catch (Exception e) {
+                logger.warn("Game-end listener {} failed for game {}: {}",
+                    listener.getClass().getSimpleName(), board.getGameId(), e.getMessage());
+            }
+        });
     }
 
     public void solveSudoku(String gameId) {
