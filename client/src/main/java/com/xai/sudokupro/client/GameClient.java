@@ -204,6 +204,30 @@ public class GameClient implements AutoCloseable {
         return api.wallet();
     }
 
+    // ---- tournament / friends / shop passthroughs -------------------------------
+
+    public com.fasterxml.jackson.databind.JsonNode tournamentStatus() { return api.tournamentStatus(); }
+    public com.fasterxml.jackson.databind.JsonNode tournamentStandings(int limit) { return api.tournamentStandings(limit); }
+    public com.fasterxml.jackson.databind.JsonNode friends() { return api.friends(); }
+    public void requestFriend(String name) { api.requestFriend(name); }
+    public void acceptFriend(String name) { api.acceptFriend(name); }
+    public com.fasterxml.jackson.databind.JsonNode pendingFriends() { return api.pendingFriends(); }
+    public com.fasterxml.jackson.databind.JsonNode powerUpShop() { return api.powerUpShop(); }
+    public void buyPowerUp(String type) { api.buyPowerUp(type); }
+    public void usePowerUp(String type, String gameId, String target) { api.usePowerUp(type, gameId, target); }
+    public int recommendedDifficulty() { return api.recommendedDifficulty(); }
+    public String activeGameOf(String playerId) { return api.activeGameOf(playerId); }
+
+    /** Joins tournament puzzle n and rejoins the gameplay channel. */
+    public synchronized SudokuBoard joinTournament(int puzzle) {
+        closeSocket();
+        BoardState state = api.joinTournament(puzzle);
+        board = state.toBoard();
+        socket = api.openSocket(state.gameId(), this::handleEnvelope,
+            () -> notifier.notify("ui", "Connection to game lost"));
+        return board;
+    }
+
     /** Server-side undo — the fresh board arrives as a "board" envelope. */
     public void undo() {
         requireSocket().send("undo", "");

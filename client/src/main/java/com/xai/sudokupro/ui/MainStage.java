@@ -191,6 +191,19 @@ public class MainStage extends Application {
         primaryStage.setScene(gameScene);
         resetBoard(primaryStage);
         loadActiveEvents();
+
+        // Smart difficulty: preselect the adaptive model's recommendation.
+        runOffFx("sudokupro-smart-difficulty", () -> {
+            int recommended = client.recommendedDifficulty();
+            String label = switch (recommended) {
+                case 1 -> "Easy"; case 3 -> "Hard"; case 4 -> "Insane"; default -> "Medium";
+            };
+            Platform.runLater(() -> {
+                if (!label.equals(difficultySelector.getValue())) {
+                    notify("ui", "Based on your recent games, " + label + " is recommended");
+                }
+            });
+        });
     }
 
     // =====================================================================
@@ -232,6 +245,12 @@ public class MainStage extends Application {
         dailyButton.setOnAction(e -> playDaily(primaryStage));
         Button duelButton = new Button("Duel");
         duelButton.setOnAction(e -> showDuelDialog(primaryStage));
+        Button weeklyButton = new Button("Weekly");
+        weeklyButton.setOnAction(e -> showTournamentDialog(primaryStage));
+        Button friendsButton = new Button("Friends");
+        friendsButton.setOnAction(e -> showFriendsDialog(primaryStage));
+        Button shopButton = new Button("Shop");
+        shopButton.setOnAction(e -> showShopDialog());
         Button hintButton = new Button("Hint");
         hintButton.setOnAction(e -> { if (boardView != null) boardView.requestHint(); });
         Button resetButton = new Button("Reset");
@@ -255,7 +274,7 @@ public class MainStage extends Application {
         settingsButton.setOnAction(e -> showSettings());
 
         HBox controls = new HBox(10, difficultySelector, chaosModeCheck, mirrorModeCheck, timerLabel, statsLabel,
-            dailyButton, duelButton, hintButton, resetButton, leaderboardButton, soundToggle, saveButton, loadButton, themeButton, pauseButton,
+            dailyButton, duelButton, weeklyButton, friendsButton, shopButton, hintButton, resetButton, leaderboardButton, soundToggle, saveButton, loadButton, themeButton, pauseButton,
             replayButton, settingsButton);
         controls.setAlignment(Pos.CENTER);
         controls.setPadding(new Insets(10));
@@ -476,6 +495,198 @@ public class MainStage extends Application {
           .append(" · score ").append(s.score())
           .append(" · #").append(s.gameId(), 0, Math.min(8, s.gameId().length()));
         return sb.toString();
+    }
+
+    /** Weekly tournament hub: join one of the five puzzles or view standings. */
+    private void showTournamentDialog(Stage primaryStage) {
+        runOffFx("sudokupro-weekly", () -> {
+            var status = client.tournamentStatus();
+            Platform.runLater(() -> {
+                Map<String, Runnable> actions = new LinkedHashMap<>();
+                for (var p : status.get("puzzles")) {
+                    int n = p.get("puzzle").asInt();
+                    boolean done = p.get("completed").asBoolean();
+                    String label = "Puzzle " + n + (done ? " ✓ (" + p.get("seconds").asLong() + "s)" : " — play");
+                    if (!done) actions.put(label, () -> joinTournamentPuzzle(primaryStage, n));
+                    else actions.put(label, () -> notify("game", "Puzzle " + n + " already done"));
+                }
+                actions.put("Standings…", () -> runOffFx("sudokupro-standings", () -> {
+                    StringBuilder sb = new StringBuilder();
+                    for (var row : client.tournamentStandings(10)) {
+                        sb.append(row.get("rank").asInt()).append(". ")
+                          .append(row.get("playerId").asText()).append(" — ")
+                          .append(row.get("totalSeconds").asLong()).append("s\n");
+                    }
+                    String text = sb.length() == 0 ? "No full finishers yet — five solves to get ranked!" : sb.toString();
+                    Platform.runLater(() -> {
+                        Alert a = new Alert(Alert.AlertType.INFORMATION);
+                        a.setTitle("Weekly Standings");
+                        a.setHeaderText(status.get("weekId").asText() + " — full finishers by total time");
+                        a.setContentText(text);
+                        a.showAndWait();
+                    });
+                }));
+                ChoiceDialog<String> dialog = new ChoiceDialog<>(actions.keySet().iterator().next(), actions.keySet());
+                dialog.setTitle("Weekly Tournament");
+                dialog.setHeaderText(status.get("weekId").asText() + " — " + status.get("completed").asInt()
+                    + "/5 done, total " + status.get("totalSeconds").asLong() + "s");
+                dialog.setContentText("Choose:");
+                dialog.showAndWait().ifPresent(k -> actions.get(k).run());
+            });
+        });
+    }
+
+    private void joinTournamentPuzzle(Stage primaryStage, int puzzle) {
+        runOffFx("sudokupro-weekly-join", () -> {
+            client.joinTournament(puzzle);
+            Platform.runLater(() -> {
+                swapInBoard(primaryStage);
+                notify("game", "Tournament puzzle " + puzzle + " — the clock counts!");
+            });
+        });
+    }
+
+    /** Friends hub: accept requests, watch online friends, add new ones. */
+    private void showFriendsDialog(Stage primaryStage) {
+        runOffFx("sudokupro-friends", () -> {
+            var friends = client.friends();
+            Platform.runLater(() -> {
+                Map<String, Runnable> actions = new LinkedHashMap<>();
+                for (var f : friends) {
+                    String name = f.get("playerId").asText();
+                    boolean online = f.get("online").asBoolean();
+                    if (online) {
+                        actions.put("● " + name + " (online) — watch", () -> spectateFriend(primaryStage, name));
+                    } else {
+                        actions.put("○ " + name + " (offline)", () -> notify("ui", name + " is offline"));
+                    }
+                }
+                actions.put("Add a friend…", this::addFriend);
+                actions.put("Pending requests…", this::showPendingRequests);
+                ChoiceDialog<String> dialog = new ChoiceDialog<>(actions.keySet().iterator().next(), actions.keySet());
+                dialog.setTitle("Friends");
+                dialog.setHeaderText("Your friends");
+                dialog.setContentText("Choose:");
+                dialog.showAndWait().ifPresent(k -> actions.get(k).run());
+            });
+        });
+    }
+
+    private void addFriend() {
+        TextInputDialog prompt = new TextInputDialog();
+        prompt.setTitle("Add Friend");
+        prompt.setHeaderText("Send a friend request");
+        prompt.setContentText("Player name:");
+        prompt.showAndWait().ifPresent(name -> runOffFx("sudokupro-friend-req", () -> {
+            client.requestFriend(name.trim());
+            notify("game", "Friend request sent to " + name.trim());
+        }));
+    }
+
+    private void showPendingRequests() {
+        runOffFx("sudokupro-friend-pending", () -> {
+            var pending = client.pendingFriends();
+            Platform.runLater(() -> {
+                if (!pending.iterator().hasNext()) { notify("ui", "No pending friend requests"); return; }
+                Map<String, Runnable> actions = new LinkedHashMap<>();
+                for (var p : pending) {
+                    String name = p.asText();
+                    actions.put("Accept " + name, () -> runOffFx("sudokupro-friend-accept", () -> {
+                        client.acceptFriend(name);
+                        notify("game", "You and " + name + " are now friends");
+                    }));
+                }
+                ChoiceDialog<String> dialog = new ChoiceDialog<>(actions.keySet().iterator().next(), actions.keySet());
+                dialog.setTitle("Friend Requests");
+                dialog.setHeaderText("Pending requests");
+                dialog.setContentText("Choose:");
+                dialog.showAndWait().ifPresent(k -> actions.get(k).run());
+            });
+        });
+    }
+
+    private void spectateFriend(Stage primaryStage, String name) {
+        runOffFx("sudokupro-spectate", () -> {
+            String gameId = client.activeGameOf(name);
+            client.spectate(gameId);
+            Platform.runLater(() -> {
+                swapInBoard(primaryStage);
+                notify("game", "Watching " + name + " — read-only, enjoy the show");
+            });
+        });
+    }
+
+    /** Power-up shop: buy with gems, use on the current game (or freeze a rival). */
+    private void showShopDialog() {
+        runOffFx("sudokupro-shop", () -> {
+            var shop = client.powerUpShop();
+            var wallet = client.wallet();
+            Platform.runLater(() -> {
+                Map<String, Runnable> actions = new LinkedHashMap<>();
+                shop.get("catalog").fields().forEachRemaining(e -> {
+                    String type = e.getKey();
+                    int price = e.getValue().asInt();
+                    int held = shop.get("inventory").path(type).asInt(0);
+                    actions.put("Buy " + type + " — " + price + " gems (held: " + held + ")",
+                        () -> runOffFx("sudokupro-shop-buy", () -> {
+                            client.buyPowerUp(type);
+                            notify("game", type + " purchased");
+                        }));
+                    if (held > 0) {
+                        actions.put("Use " + type, () -> usePowerUp(type));
+                    }
+                });
+                ChoiceDialog<String> dialog = new ChoiceDialog<>(actions.keySet().iterator().next(), actions.keySet());
+                dialog.setTitle("Power-Up Shop");
+                dialog.setHeaderText("You have " + wallet.path("gems").asInt() + " gems");
+                dialog.setContentText("Choose:");
+                dialog.showAndWait().ifPresent(k -> actions.get(k).run());
+            });
+        });
+    }
+
+    private void usePowerUp(String type) {
+        if ("FREEZE".equals(type)) {
+            TextInputDialog prompt = new TextInputDialog();
+            prompt.setTitle("Freeze");
+            prompt.setHeaderText("Freeze whom for 10 seconds?");
+            prompt.setContentText("Player name:");
+            prompt.showAndWait().ifPresent(target -> runOffFx("sudokupro-shop-use", () -> {
+                client.usePowerUp(type, null, target.trim());
+                notify("game", target.trim() + " is frozen — go go go!");
+            }));
+            return;
+        }
+        SudokuBoard current = client.board();
+        if (current == null) { notify("error", "Start a game first"); return; }
+        runOffFx("sudokupro-shop-use", () -> {
+            client.usePowerUp(type, current.getGameId(), null);
+            Platform.runLater(() -> { if (boardView != null) boardView.refresh(); updateStats(); });
+            notify("game", type + " used");
+        });
+    }
+
+    /** Replaces the center board view after the client swapped games. */
+    private void swapInBoard(Stage primaryStage) {
+        boardView = new BoardView(client, this::notify);
+        BorderPane root = (BorderPane) primaryStage.getScene().getRoot();
+        root.setCenter(boardView.getView());
+        startTimer(timerLabel);
+        updateStats();
+    }
+
+    /** Background worker with uniform error reporting — UI actions must not block the FX thread. */
+    private void runOffFx(String name, Runnable work) {
+        Thread t = new Thread(() -> {
+            try {
+                work.run();
+            } catch (Exception e) {
+                logger.error("{} failed: {}", name, e.getMessage(), e);
+                notify("error", e.getMessage());
+            }
+        }, name);
+        t.setDaemon(true);
+        t.start();
     }
 
     /** Duel hub: accept a pending challenge, rejoin an active race, or challenge someone new. */

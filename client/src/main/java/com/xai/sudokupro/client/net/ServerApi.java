@@ -192,6 +192,52 @@ public class ServerApi {
         post("/api/friends/accept/" + playerId, Void.class);
     }
 
+    /** Incoming friend requests (array of player names). */
+    public JsonNode pendingFriends() {
+        return get("/api/friends/pending", JsonNode.class);
+    }
+
+    // ---- tournament / shop / adaptive difficulty ---------------------------------
+
+    public JsonNode tournamentStatus() {
+        return get("/api/tournament", JsonNode.class);
+    }
+
+    public BoardState joinTournament(int puzzle) {
+        return post("/api/tournament/" + puzzle + "/join", BoardState.class);
+    }
+
+    public JsonNode tournamentStandings(int limit) {
+        return get("/api/tournament/standings?limit=" + limit, JsonNode.class);
+    }
+
+    /** Catalog prices and the caller's inventory. */
+    public JsonNode powerUpShop() {
+        return get("/api/powerups", JsonNode.class);
+    }
+
+    public void buyPowerUp(String type) {
+        post("/api/powerups/buy/" + type, Void.class);
+    }
+
+    public void usePowerUp(String type, String gameId, String target) {
+        StringBuilder q = new StringBuilder("/api/powerups/use/").append(type);
+        char sep = '?';
+        if (gameId != null) { q.append(sep).append("gameId=").append(gameId); sep = '&'; }
+        if (target != null) { q.append(sep).append("target=").append(target); }
+        post(q.toString(), Void.class);
+    }
+
+    /** The adaptive model's recommended difficulty (1-4) for the caller. */
+    public int recommendedDifficulty() {
+        return get("/api/game/recommended-difficulty", JsonNode.class).path("difficulty").asInt(2);
+    }
+
+    /** A player's current active game id, for spectating. Throws 404 ApiException if idle. */
+    public String activeGameOf(String playerId) {
+        return get("/api/game/active-of/" + playerId, JsonNode.class).path("gameId").asText();
+    }
+
     // ---- economy ---------------------------------------------------------------
 
     /** The caller's wallet (gems, xp, level, duel record, hint price). */

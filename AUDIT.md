@@ -237,3 +237,9 @@ Suite: 130 tests, green (4 Docker-gated skips).
 `SmartDifficultyService` (GameEndListener) keeps a per-player skill state (Redis hash, 90-day TTL, local degrade): three consecutive FAST signals — clean sub-5-minute solves at or above the current recommendation — promote the recommended level (cap 4); three consecutive SLOW signals — 15-minute-plus solves or abandoned games — demote it (floor 1). Hinted or below-level solves are neutral: they neither promote nor break a slow streak. Exposed at `GET /api/game/recommended-difficulty`. The `TelemetryService` DifficultyTuner stub (returning 0 since the module split) now reports a bounded global factor derived from the population's average recommended level (@Lazy-injected — Constants consumes it at startup, before any history exists, and simply reads 0).
 
 Tests (5): start-at-2, promotion with cap, demotion with floor, neutral-solve semantics, fast-solve-resets-slow-streak. Suite: 201 tests, green.
+
+---
+
+## Client UI for batches A-D — 2026-07-16
+
+MainStage gains Weekly (tournament hub: per-puzzle join with completion ticks, standings view), Friends (online-flagged list, watch an online friend via the new `GET /api/game/active-of/{player}` + read-only spectate, add-friend and pending-request flows), and Shop (catalog with prices and held counts, buy, use-on-current-game, FREEZE with a target prompt) buttons; entering the game screen asks the adaptive model for a recommended difficulty and surfaces it as a suggestion. All network work runs off the FX thread through a shared `runOffFx` worker with uniform error reporting; board swaps go through a shared `swapInBoard`. ServerApi/GameClient gained the corresponding typed passthroughs. Server: one new endpoint (`active-of`, per-pod lookup for spectating). Suite unchanged in count: 201 green (UI itself is not unit-testable headlessly; the API layer it calls is covered).

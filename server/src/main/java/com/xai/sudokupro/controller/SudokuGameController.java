@@ -177,6 +177,17 @@ public class SudokuGameController {
             smartDifficulty.recommendedDifficulty(authService.getCurrentPlayerId())));
     }
 
+    @Operation(summary = "The player's current active game id (for spectating). Per-pod lookup.")
+    @GetMapping("/active-of/{playerId}")
+    public ResponseEntity<Object> activeGameOf(@PathVariable String playerId) {
+        String gameId = gameService.findActiveGameForPlayer(playerId);
+        if (gameId == null) {
+            return problemResponse(HttpStatus.NOT_FOUND, "No Active Game",
+                playerId + " is not playing right now");
+        }
+        return ResponseEntity.ok(Map.of("gameId", gameId));
+    }
+
     @Operation(summary = "Share code for a puzzle (gzipped grid, never the solution)")
     @GetMapping("/{gameId}/share")
     public ResponseEntity<Object> share(@PathVariable String gameId) {
