@@ -5,21 +5,32 @@ import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
 
 /**
- * Stub telemetry service.
- * Wire in real analytics data here when ready.
+ * DifficultyTuner backed by real data: reports how far the population's average
+ * recommended difficulty (SmartDifficultyService) sits from the default. Was a
+ * stub returning 0 since the module split; the injection is @Lazy because
+ * Constants consumes this at startup, before any telemetry exists — the factor
+ * simply reads 0 until players have history.
  */
 @Service
 public class TelemetryService implements com.xai.sudokupro.util.DifficultyTuner {
 
     private static final Logger logger = LoggerFactory.getLogger(TelemetryService.class);
 
-    /**
-     * Returns an XP/points adjustment factor derived from live telemetry.
-     * Returns 0 (no adjustment) until real data pipeline is connected.
-     */
+    private final SmartDifficultyService smartDifficulty;
+
+    public TelemetryService(@org.springframework.context.annotation.Lazy SmartDifficultyService smartDifficulty) {
+        this.smartDifficulty = smartDifficulty;
+    }
+
     @Override
     public int getDifficultyAdjustmentFactor() {
-        logger.debug("TelemetryService: getDifficultyAdjustmentFactor called — returning 0 (stub)");
-        return 0;
+        try {
+            int factor = smartDifficulty.globalAdjustmentFactor();
+            logger.debug("Difficulty adjustment factor from live skill data: {}", factor);
+            return factor;
+        } catch (Exception e) {
+            logger.debug("Telemetry unavailable ({}); reporting neutral factor", e.getMessage());
+            return 0;
+        }
     }
 }

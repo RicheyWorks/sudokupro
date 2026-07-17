@@ -229,3 +229,11 @@ Suite: 130 tests, green (4 Docker-gated skips).
 **Power-up shop.** The dormant `User.powerUps` map becomes inventory. Catalog: EXTRA_LIFE (15 gems, +1 life on your own game), REVEAL_CELL (20, solver fills one correct cell), FREEZE (25, locks an opponent's input 10s via the existing PlayerStateStore lock). Buying charges gems (402 when broke); using consumes a held unit — except when the attempt is rejected (e.g. targeting someone else's board, 403), which must not burn the unit. `GET /api/powerups`, `POST /buy/{type}`, `POST /use/{type}`.
 
 **Tests (13 new).** Tournament: ISO week identity, ramped templates + per-player copies, full-finishers-only standings, first-time-stands idempotency. Seasons: identity/end-date, exactly-once podium+soft-reset (second query no-op), empty-ladder quiet path. Power-ups: purchase stacking + wallet floor, per-effect behavior incl. ownership guard without unit burn, self-freeze rejection, unknown-type rejection. Suite: 196 tests, green.
+
+---
+
+## Feature batch D: smart difficulty — 2026-07-16
+
+`SmartDifficultyService` (GameEndListener) keeps a per-player skill state (Redis hash, 90-day TTL, local degrade): three consecutive FAST signals — clean sub-5-minute solves at or above the current recommendation — promote the recommended level (cap 4); three consecutive SLOW signals — 15-minute-plus solves or abandoned games — demote it (floor 1). Hinted or below-level solves are neutral: they neither promote nor break a slow streak. Exposed at `GET /api/game/recommended-difficulty`. The `TelemetryService` DifficultyTuner stub (returning 0 since the module split) now reports a bounded global factor derived from the population's average recommended level (@Lazy-injected — Constants consumes it at startup, before any history exists, and simply reads 0).
+
+Tests (5): start-at-2, promotion with cap, demotion with floor, neutral-solve semantics, fast-solve-resets-slow-streak. Suite: 201 tests, green.

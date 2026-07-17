@@ -40,11 +40,14 @@ public class SudokuGameController {
 
     private final GameService gameService;
     private final AuthService authService;
+    private final com.xai.sudokupro.service.SmartDifficultyService smartDifficulty;
 
     @Autowired
-    public SudokuGameController(GameService gameService, AuthService authService) {
+    public SudokuGameController(GameService gameService, AuthService authService,
+                                com.xai.sudokupro.service.SmartDifficultyService smartDifficulty) {
         this.gameService  = gameService;
         this.authService  = authService;
+        this.smartDifficulty = smartDifficulty;
     }
 
     @Operation(summary = "Create a new Sudoku game with specified difficulty")
@@ -165,6 +168,13 @@ public class SudokuGameController {
         } catch (IllegalArgumentException e) {
             return problemResponse(HttpStatus.NOT_FOUND, "Unknown Game", e.getMessage());
         }
+    }
+
+    @Operation(summary = "The difficulty the adaptive model recommends for the caller")
+    @GetMapping("/recommended-difficulty")
+    public ResponseEntity<Object> recommendedDifficulty() {
+        return ResponseEntity.ok(Map.of("difficulty",
+            smartDifficulty.recommendedDifficulty(authService.getCurrentPlayerId())));
     }
 
     @Operation(summary = "Share code for a puzzle (gzipped grid, never the solution)")

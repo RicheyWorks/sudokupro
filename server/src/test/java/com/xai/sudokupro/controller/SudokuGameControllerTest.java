@@ -23,13 +23,14 @@ class SudokuGameControllerTest {
 
     @Mock private GameService gameService;
     @Mock private AuthService authService;
+    @Mock private com.xai.sudokupro.service.SmartDifficultyService smartDifficulty;
 
     private SudokuGameController controller;
     private SudokuBoard board;
 
     @BeforeEach
     void setUp() {
-        controller = new SudokuGameController(gameService, authService);
+        controller = new SudokuGameController(gameService, authService, smartDifficulty);
         board = new SudokuBoard(1, false, false, 0, "g-1");
         board.setPlayerId("richmond");
     }
