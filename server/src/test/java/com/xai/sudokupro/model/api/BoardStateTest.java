@@ -60,6 +60,24 @@ class BoardStateTest {
     }
 
     @Test
+    void toBoardCarriesPlayProgressCounters() {
+        // Regression: these were dropped, so every server resync (resume,
+        // undo/redo "board" envelopes) reset the client's Moves/Hints/Score to 0.
+        SudokuBoard original = new SudokuBoard(1, false, false, 0, "game-counters");
+        original.setScore(70);
+        original.setMoveCount(13);
+        original.setHintCount(2);
+        original.setLives(2);
+
+        SudokuBoard copy = BoardState.from(original).toBoard();
+
+        assertEquals(70, copy.getScore());
+        assertEquals(13, copy.getMoveCount());
+        assertEquals(2, copy.getHintCount());
+        assertEquals(2, copy.getLives());
+    }
+
+    @Test
     void jsonRoundTripsThroughSharedRecord() throws Exception {
         SudokuBoard board = new SudokuBoard(1, false, true, 0, "game-json");
         String wire = mapper.writeValueAsString(BoardState.from(board));

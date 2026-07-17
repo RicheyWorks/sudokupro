@@ -74,6 +74,12 @@ public record BoardState(
         board.setPlayerId(playerId);
         board.setDifficulty(difficulty);
         board.setLives(lives);
+        // Carry the play-progress counters too — without these, every server
+        // resync (resume, undo/redo "board" envelopes) reset the client's
+        // Moves/Hints/Score display to zero.
+        board.setScore(score);
+        board.setHintCount(hintCount);
+        board.setMoveCount(moveCount);
         return board;
     }
 }

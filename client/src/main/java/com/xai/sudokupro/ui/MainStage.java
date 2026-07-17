@@ -565,7 +565,10 @@ public class MainStage extends Application {
     private void updateStats() {
         SudokuBoard board = client.board();
         if (board == null) return;
-        int moves = board.getMoveHistory().size();
+        // getMoveCount(), not getMoveHistory().size(): the history deque is
+        // transient and empty on any board rebuilt from a server snapshot
+        // (resume, undo/redo resyncs); the counter carries the real total.
+        int moves = board.getMoveCount();
         int hints = board.getHintCount();
         String stats = String.format("Moves: %d | Hints: %d", moves, hints);
         Platform.runLater(() -> statsLabel.setText(stats));

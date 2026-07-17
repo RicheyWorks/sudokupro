@@ -185,6 +185,33 @@ class GameServiceTest {
     }
 
     @Test
+    void resumeGameRejectsBlankPreMigrationBoards() {
+        // A row persisted before the V3 cells_json migration restores as a blank
+        // 9x9 shell — resume must refuse it instead of serving an empty board.
+        SudokuCell[][] blank = new SudokuCell[9][9];
+        for (int r = 0; r < 9; r++) for (int c = 0; c < 9; c++) blank[r][c] = new SudokuCell();
+        SudokuBoard preMigration = new SudokuBoard(blank, false, false, 0, "g-pre-v3");
+        preMigration.setPlayerId("p-old");
+
+        when(valueOps.get(anyString())).thenReturn(null);
+        when(gameRepository.findByGameId("g-pre-v3")).thenReturn(preMigration);
+
+        assertThrows(IllegalStateException.class,
+            () -> gameService.resumeGame("g-pre-v3", "p-old"));
+    }
+
+    @Test
+    void solveSudokuPersistsTheSolvedBoard() {
+        SudokuBoard board = gameService.createNewGame(1, "p-solve", false, false);
+        clearInvocations(gameRepository);
+
+        gameService.solveSudoku(board.getGameId());
+
+        verify(gameRepository).save(board);
+        assertTrue(board.isSolved(), "AI solve should complete the board");
+    }
+
+    @Test
     void resumeGameRejectsNonOwner() {
         SudokuBoard board = gameService.createNewGame(1, "p-mine", false, false);
         assertThrows(SecurityException.class,

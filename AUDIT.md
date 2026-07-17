@@ -137,3 +137,19 @@ The old `POST /api/game/save` stub was deleted under P1-3; this pass implements 
 **Feature surface.** Server: `POST /api/game/{id}/save` (explicit persist, 403 if not owner), `GET /api/game/saved?limit=` (unfinished games with a snapshot, newest first, limit capped at 50, non-cached query), `POST /api/game/{id}/resume` (read-through load + re-registration; 403 not owner / 404 unknown / 409 already solved). Service: `saveGame`/`listSavedGames`/`resumeGame` with an ownership check (`SecurityException` → 403). Repository: `findResumableByPlayerId` (filters `solved = false AND cells_json IS NOT NULL` — pre-V3 rows have no grid to restore). Client: `ServerApi.saveGame`/`savedGames`/`resumeGame`.
 
 **Tests.** `SudokuBoardSnapshotTest` (round-trip fidelity incl. pencil marks/conflicts/move sources, restored givens still refuse modification, malformed-snapshot atomicity, Jackson-property path), `GameSaveLoadJpaTest` (@DataJpaTest on H2: real `@PrePersist`/`@PostLoad` lifecycle round-trip, `findResumableByPlayerId` scoping), plus `GameServiceTest` (owner checks, DB-fallback resume restores the grid and re-registers, limit cap) and controller/`ServerApiTest` endpoint coverage.
+
+---
+
+## Audit pass — 2026-07-16 (post save/load)
+
+Independent review of HEAD after the save/load feature (62d99ac, b7ffc7c), focused on the serialization paths that work touched. Three confirmed findings, all fixed with regression tests; spot-checked the earlier F-1/F-2 fixes plus persistBoard coverage of every GameService write path — all sound. EventEngine/PuzzleEditorService save fresh entities only (covered by @PrePersist), and RedisSyncScheduler writes metrics, not boards.
+
+**A-1 (fixed): `BoardState.toBoard()` dropped the play-progress counters.** score, hintCount, and moveCount weren't carried onto the rebuilt client board (no setters existed), so every server resync — resuming a game, or the "board" envelopes that follow undo/redo — reset the desktop client's Moves/Hints/Score display to zero. This predates save/load but resume made it a first-class bug. Added `setMoveCount`/`setHintCount` to `SudokuBoard` (documented as client-rebuild hooks), `toBoard()` now carries score/hintCount/moveCount/lives, and `MainStage.updateStats` reads `getMoveCount()` instead of the transient (empty-after-rebuild) history deque. Pinned by `BoardStateTest.toBoardCarriesPlayProgressCounters`.
+
+**A-2 (fixed): resume served blank boards for pre-V3 rows.** `findResumableByPlayerId` filters out rows without a cells_json snapshot, but `resumeGame` by raw gameId had no such guard: a row persisted before the V3 migration restores as the no-arg constructor's blank 9x9 shell, which resume would happily re-activate and hand to the player as an empty, unwinnable "game". Added `SudokuBoard.hasAnyCellValues()` and a resume guard that throws `IllegalStateException` (→ 409 at the REST layer, which already mapped it). Pinned by `GameServiceTest.resumeGameRejectsBlankPreMigrationBoards`.
+
+**A-3 (fixed): auto-solve was never persisted.** `GameService.solveSudoku` wrote the solved board to Redis only — unlike every other mutation path, no `persistBoard`. After the 60-minute cache TTL (or a restart) the solve evaporated: the game reappeared unsolved in the database, and post-save/load it would show up again in the resumable list. Now persists like applyMove/undo/redo. Pinned by `GameServiceTest.solveSudokuPersistsTheSolvedBoard`.
+
+Noted, not fixed (pre-existing, by design or out of scope): unauthenticated REST callers share the "anonymous" identity, so anonymous saved-game lists are shared — meaningless until real player accounts exist; `getGame`/`solve`/`end` have no ownership check, consistent with multiplayer games being joinable by design (save/resume, which are single-player concepts, do check ownership).
+
+Suite after this pass: 113 tests, green (4 Docker-gated integration tests skip without Docker).

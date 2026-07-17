@@ -891,6 +891,19 @@ public class SudokuBoard implements Serializable {
 
     public int     getHintCount()       { return hintCount; }
     public synchronized void incrementHintCount() { this.hintCount++; }
+    /** For rebuilding non-authoritative client boards from a BoardState snapshot. */
+    public void setHintCount(int n)     { this.hintCount = Math.max(0, n); }
+    /** For rebuilding non-authoritative client boards from a BoardState snapshot. */
+    public void setMoveCount(int n)     { this.moveCount = Math.max(0, n); }
+
+    /** True if any cell holds a value — false only for a blank 9x9 shell
+     *  (e.g. a pre-V3 database row that has no cells_json snapshot to restore). */
+    public synchronized boolean hasAnyCellValues() {
+        for (int i = 0; i < size; i++)
+            for (int j = 0; j < size; j++)
+                if (board[i][j].getValue() != 0) return true;
+        return false;
+    }
 
     public boolean isUsedUndo()        { return usedUndo; }
 

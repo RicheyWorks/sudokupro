@@ -286,6 +286,12 @@ public class GameService {
             if (board.isSolved()) {
                 throw new IllegalStateException("Game already solved: " + gameId);
             }
+            if (!board.hasAnyCellValues()) {
+                // Rows persisted before the V3 cells_json migration have no grid
+                // snapshot: @PostLoad leaves the blank constructor shell. Refuse
+                // rather than hand the player an empty, unwinnable board.
+                throw new IllegalStateException("Game " + gameId + " has no saved grid to resume");
+            }
             logger.info("Game {} resumed by player {}", gameId, playerId);
             return board;
         }
@@ -314,6 +320,9 @@ public class GameService {
             SudokuBoard board = getGame(gameId);
             aiSolverService.solveSudoku(board);
             saveToRedis(gameId, board);
+            // Persist like every other mutation — previously the auto-solve
+            // lived only in the Redis cache and evaporated with its TTL.
+            persistBoard(board);
         }
     }
 
