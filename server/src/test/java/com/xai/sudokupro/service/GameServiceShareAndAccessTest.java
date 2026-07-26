@@ -4,6 +4,10 @@ import com.xai.sudokupro.model.SudokuBoard;
 import com.xai.sudokupro.model.SudokuCell;
 import org.junit.jupiter.api.Test;
 
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Mockito.lenient;
+import static org.mockito.Mockito.mock;
+
 import java.util.Base64;
 import java.util.zip.GZIPOutputStream;
 
@@ -181,65 +185,106 @@ class GameServiceShareAndAccessTest {
         assertFalse(GameService.isCompetitiveGameId(null));
     }
 
-    // ── helper ────────────────────────────────────────────────────────────────
+    // ── real service under test ───────────────────────────────────────────────
 
     /**
-     * Runs a snapshot through the same decode/validate path as
-     * {@code GameService.importShareCode}, without needing the full service graph.
+     * A real {@link GameService}.
+     *
+     * <p>These tests used to call a private {@code ImportHarness} that MIRRORED
+     * {@code importShareCode}, on the reasoning that it kept the assertions readable
+     * without a Spring context. That was a mistake, and a mutation audit proved it:
+     * deleting the clue-count rejection from the real method, and deleting the real
+     * cell-clearing loop — which is verbatim the P0 currency mint this class exists to
+     * prevent — both left every test in this file green. A test that reimplements the
+     * code it covers asserts only that the copy is self-consistent.
+     *
+     * <p>The service is real; only its collaborators are mocked, and Redis is a mock that
+     * throws on every call so the in-memory fallback path runs.
      */
+    private static GameService realService() {
+        var gameRepository = mock(com.xai.sudokupro.repository.GameRepository.class);
+        lenient().when(gameRepository.save(any())).thenAnswer(inv -> inv.getArgument(0));
+
+        @SuppressWarnings("unchecked")
+        org.springframework.data.redis.core.RedisTemplate<String, SudokuBoard> redis =
+            mock(org.springframework.data.redis.core.RedisTemplate.class);
+        @SuppressWarnings("unchecked")
+        org.springframework.data.redis.core.ValueOperations<String, SudokuBoard> valueOps =
+            mock(org.springframework.data.redis.core.ValueOperations.class);
+        lenient().when(redis.opsForValue()).thenReturn(valueOps);
+
+        var stringRedis = mock(org.springframework.data.redis.core.StringRedisTemplate.class,
+            inv -> { throw new org.springframework.data.redis.RedisConnectionFailureException("down (test)"); });
+
+        var rng = new com.xai.sudokupro.util.SecureRandomGenerator(
+            new io.micrometer.core.instrument.simple.SimpleMeterRegistry());
+
+        return new GameService(
+            new AISolverService(rng), gameRepository,
+            mock(com.xai.sudokupro.websocket.MultiplayerBroadcaster.class),
+            redis, rng,
+            new PlayerStateStore(stringRedis), new GameLockManager(stringRedis),
+            mock(AnalyticsService.class), mock(AntiCheatEngine.class),
+            mock(com.xai.sudokupro.engine.ChaosEngine.class));
+    }
+
+    /** Runs a snapshot through the PRODUCTION import path. */
     private static SudokuBoard importSnapshot(String cellsJsonOrCode) throws Exception {
         String code = cellsJsonOrCode.startsWith("[") ? encode(cellsJsonOrCode) : cellsJsonOrCode;
-        return ImportHarness.decodeAndSanitise(code);
+        return realService().importShareCode(code, "importer");
+    }
+
+    // ── the guards that protect a real board ──────────────────────────────────
+
+    /**
+     * Regression for a mutation-audit blind spot: nothing exercised
+     * {@code getGameForReader}, only the pure {@code isCompetitiveGameId} predicate. The
+     * whole condition could be replaced with {@code false} and the suite stayed green —
+     * leaving the P0 this class documents (reading another player's daily board over
+     * REST) completely unguarded.
+     */
+    @Test
+    void aCompetitiveBoardIsRefusedToAnyoneButItsOwner() {
+        GameService service = realService();
+        SudokuBoard victim = new SudokuBoard(2, false, false, 0, "daily-2026-07-25:victim");
+        victim.setPlayerId("victim");
+        service.adoptGame(victim);
+
+        assertThrows(SecurityException.class,
+            () -> service.getGameForReader("daily-2026-07-25:victim", "attacker"),
+            "an attacker must not read another player's daily board");
+
+        assertDoesNotThrow(() -> service.getGameForReader("daily-2026-07-25:victim", "victim"),
+            "the owner must still be able to read their own board");
+    }
+
+    /** A casual board is not competitive, so spectating it stays allowed. */
+    @Test
+    void aCasualBoardIsStillReadableByOthers() {
+        GameService service = realService();
+        SudokuBoard casual = new SudokuBoard(2, false, false, 0, "casual-abc");
+        casual.setPlayerId("owner");
+        service.adoptGame(casual);
+
+        assertDoesNotThrow(() -> service.getGameForReader("casual-abc", "someone-else"));
     }
 
     /**
-     * Mirrors the production import pipeline. Kept in the test so the assertions describe
-     * behaviour rather than reaching into a Spring context; the production code is
-     * exercised end to end by testing/adversarial_api_test.py, which runs in CI.
+     * Regression: the share-export ownership check was unguarded. Only the one-argument
+     * overload was ever called in tests, and that overload skips the check by design, so
+     * deleting {@code requireOwner} from the real method changed nothing in the suite.
      */
-    static final class ImportHarness {
-        static SudokuBoard decodeAndSanitise(String code) {
-            String cellsJson;
-            try {
-                byte[] compressed = Base64.getUrlDecoder().decode(code.trim());
-                try (var gzip = new java.util.zip.GZIPInputStream(
-                        new java.io.ByteArrayInputStream(compressed))) {
-                    byte[] raw = gzip.readNBytes(64 * 1024 + 1);
-                    if (raw.length > 64 * 1024) {
-                        throw new IllegalArgumentException("Share code expands beyond the allowed size");
-                    }
-                    cellsJson = new String(raw, java.nio.charset.StandardCharsets.UTF_8);
-                }
-            } catch (IllegalArgumentException e) {
-                throw e;
-            } catch (Exception e) {
-                throw new IllegalArgumentException("Malformed share code", e);
-            }
-            SudokuCell[][] blank = new SudokuCell[9][9];
-            for (int r = 0; r < 9; r++) for (int c = 0; c < 9; c++) blank[r][c] = new SudokuCell();
-            SudokuBoard board = new SudokuBoard(blank, false, false, 0, "shared-test");
-            board.restoreCells(cellsJson);
+    @Test
+    void shareExportIsRefusedToAnyoneButTheOwner() {
+        GameService service = realService();
+        SudokuBoard board = new SudokuBoard(2, false, false, 0, "duel-ff00:victim");
+        board.setPlayerId("victim");
+        service.adoptGame(board);
 
-            int givens = 0;
-            SudokuCell[][] grid = board.getBoard();
-            for (int r = 0; r < 9; r++)
-                for (int c = 0; c < 9; c++)
-                    if (grid[r][c].isGiven() && grid[r][c].getValue() != 0) givens++;
-            if (givens > 64) {
-                throw new IllegalArgumentException(
-                    "Share code is not a playable puzzle: " + givens + " clues");
-            }
-            for (int r = 0; r < 9; r++) {
-                for (int c = 0; c < 9; c++) {
-                    SudokuCell cell = grid[r][c];
-                    if (cell.isGiven()) continue;
-                    cell.setValue(0, SudokuCell.MoveSource.INITIAL);
-                    cell.clearPencilMarks();
-                    cell.clearConflicts();
-                }
-            }
-            if (board.isSolved()) throw new IllegalArgumentException("Share code is already solved");
-            return board;
-        }
+        assertThrows(SecurityException.class,
+            () -> service.exportShareCode("duel-ff00:victim", "attacker"),
+            "a share code is the victim's live grid, including their pencil marks");
+
+        assertDoesNotThrow(() -> service.exportShareCode("duel-ff00:victim", "victim"));
     }
 }

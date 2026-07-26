@@ -38,12 +38,23 @@ class EnhancedMoveBoundsTest {
         }
     }
 
+    /**
+     * Every real coordinate, actually varied.
+     *
+     * <p>This looped r,c over 0..8 but the body was hardcoded to {@code (0, 0)}, so 81
+     * iterations tested one coordinate. A mutation audit proved it: narrowing the guard to
+     * reject row 3 or column 5 left this class green. The loop variables are now used.
+     */
     @Test
     void everyRealCoordinateIsAccepted() {
-        for (int r = 0; r < 9; r++)
-            for (int c = 0; c < 9; c++)
+        for (int r = 0; r < 9; r++) {
+            for (int c = 0; c < 9; c++) {
+                final int row = r, col = c;
                 assertDoesNotThrow(
-                    () -> new EnhancedMove(0, 0, 0, 5, SudokuCell.MoveSource.PLAYER));
+                    () -> new EnhancedMove(row, col, 0, 5, SudokuCell.MoveSource.PLAYER),
+                    "(" + row + "," + col + ") is a real board coordinate");
+            }
+        }
         assertDoesNotThrow(() -> new EnhancedMove(0, 0, 0, 0, SudokuCell.MoveSource.PLAYER));
         assertDoesNotThrow(() -> new EnhancedMove(8, 8, 9, 9, SudokuCell.MoveSource.PLAYER));
     }

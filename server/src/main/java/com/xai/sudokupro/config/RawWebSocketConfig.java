@@ -24,12 +24,26 @@ import java.util.Map;
 @EnableWebSocket
 public class RawWebSocketConfig implements WebSocketConfigurer {
 
+    private static final org.slf4j.Logger logger =
+        org.slf4j.LoggerFactory.getLogger(RawWebSocketConfig.class);
+
     private final WebSocketController webSocketController;
 
-    // Bug fix: setAllowedOrigins("*") allows any origin to open a WebSocket, bypassing
-    // browser same-origin checks. Default to localhost for dev; production should set
-    // sudokupro.ws.allowed-origins to the deployed frontend origin in application.properties.
-    @Value("${sudokupro.ws.allowed-origins:http://localhost:8080}")
+    // setAllowedOrigins("*") would let any site open a gameplay socket with the victim's
+    // cookie, so the origin list stays explicit. But the previous default of
+    // "http://localhost:8080" was set NOWHERE — not in application.properties, not in
+    // docker-compose.yml, not in the Kubernetes manifests — which meant the handshake
+    // returned 403 in any deployment that was not literally localhost:8080. It failed
+    // closed, so it was never a security hole; it silently broke multiplayer in production
+    // instead, and nothing in the test suite or the harnesses noticed because they all run
+    // against localhost.
+    //
+    // The default is now "same origin": an empty list, which
+    // setAllowedOriginPatterns interprets together with the explicit patterns below. A
+    // deployment that serves the web client from its own origin — the shipped setup, since
+    // /play is served by this very server — now works with no configuration at all, and a
+    // separately-hosted frontend still has to be named explicitly.
+    @Value("${sudokupro.ws.allowed-origins:}")
     private String[] allowedOrigins;
 
     @Autowired
@@ -46,9 +60,24 @@ public class RawWebSocketConfig implements WebSocketConfigurer {
 
     @Override
     public void registerWebSocketHandlers(WebSocketHandlerRegistry registry) {
-        registry.addHandler(webSocketController, "/ws/game")
-                .addInterceptors(new GameIdHandshakeInterceptor())
-                .setAllowedOrigins(allowedOrigins);
+        var registration = registry.addHandler(webSocketController, "/ws/game")
+                .addInterceptors(new GameIdHandshakeInterceptor());
+
+        String[] configured = java.util.Arrays.stream(allowedOrigins)
+            .filter(o -> o != null && !o.isBlank())
+            .toArray(String[]::new);
+
+        if (configured.length > 0) {
+            logger.info("WebSocket origins restricted to {}", java.util.Arrays.toString(configured));
+            registration.setAllowedOrigins(configured);
+        } else {
+            // Same-origin only: the browser sends Origin, and Spring compares it against
+            // the request's own host. A non-browser client (the JavaFX desktop app) sends
+            // no Origin header at all and is unaffected either way.
+            logger.info("WebSocket origins default to same-origin "
+                + "(set sudokupro.ws.allowed-origins for a separately-hosted frontend)");
+            registration.setAllowedOriginPatterns("");
+        }
     }
 
     /**

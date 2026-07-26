@@ -149,6 +149,60 @@ class SudokuBoardMoveSemanticsTest {
             "five generated boards must not all resolve to one identical solution");
     }
 
+    /**
+     * Structural diversity — the check the literal comparison above cannot make.
+     *
+     * <p>The test above compares completed grids as strings, and that is exactly how the
+     * relabelling bug survived a "fix". Drawing ONE 1..9 permutation per board and reusing
+     * it at every cell only RENAMES the digits: the backtracker walks the identical search
+     * path, so every puzzle is the same grid with different labels. Those grids differ
+     * literally, so the string comparison sees five distinct solutions and passes.
+     *
+     * <p>Canonicalising first — relabel each solution so its top row reads 1..9 — collapses
+     * the disguise. Measured before the real fix: 30 boards across all difficulties reduced
+     * to ONE canonical grid, which means nine clues (one per digit) pin the entire solution
+     * to every daily, duel and tournament board on the platform, with no solving required.
+     *
+     * <p>A mutation audit confirmed this gap was still open in the Java suite even after
+     * the engine harness had been taught to canonicalise: reintroducing the one-permutation
+     * bug left all 270 tests green.
+     */
+    @Test
+    void generatedBoardsAreNotOneGridWithTheDigitsRenamed() {
+        java.util.Set<String> canonical = new java.util.HashSet<>();
+        int boards = 0;
+        for (int difficulty = 1; difficulty <= 4; difficulty++) {
+            for (int i = 0; i < 4; i++) {
+                SudokuBoard board = new SudokuBoard(difficulty, false, false, 0,
+                    "canon-" + difficulty + "-" + i);
+                int[][] grid = new int[9][9];
+                for (int r = 0; r < 9; r++)
+                    for (int c = 0; c < 9; c++)
+                        grid[r][c] = board.getBoard()[r][c].isGiven()
+                            ? board.getBoard()[r][c].getValue() : 0;
+                solve(grid);
+                canonical.add(canonicalise(grid));
+                boards++;
+            }
+        }
+        assertTrue(canonical.size() > boards / 2,
+            "only " + canonical.size() + " structurally distinct grids across " + boards
+                + " boards once canonicalised by relabeling row 0 — the generator is "
+                + "producing one grid with the digits renamed, so a handful of clues "
+                + "reveals every answer on the platform");
+    }
+
+    /** Relabels a completed grid so its first row reads 1..9. */
+    private static String canonicalise(int[][] grid) {
+        int[] map = new int[10];
+        for (int c = 0; c < 9; c++) map[grid[0][c]] = c + 1;
+        StringBuilder sb = new StringBuilder(81);
+        for (int r = 0; r < 9; r++)
+            for (int c = 0; c < 9; c++)
+                sb.append(map[grid[r][c]]);
+        return sb.toString();
+    }
+
     /** In mirror mode one player action writes two cells; one undo must revert both. */
     @Test
     void mirrorModeUndoRevertsThePairAsOneAction() {

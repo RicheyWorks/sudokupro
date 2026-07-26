@@ -64,13 +64,29 @@ class SecurityRulesTest {
             "expected an actuator health verdict, got " + status);
     }
 
+    /**
+     * Ensures the player account the authenticating tests use actually exists.
+     *
+     * <p>It was previously created as a side effect of {@code registrationIsPublicAndCsrfExempt},
+     * so any test that authenticated depended on JUnit's method order. That is why the new
+     * admin-role test first failed with 401 instead of 403 — it was asserting against an
+     * account that did not exist yet, which would have masked the very rule it checks.
+     * Registering here is idempotent: a duplicate returns 409, which we ignore.
+     */
+    @org.junit.jupiter.api.BeforeEach
+    void ensureTestPlayerExists() throws Exception {
+        mockMvc.perform(post("/api/auth/register")
+            .contentType("application/json")
+            .content("{\"username\":\"secrules1\",\"password\":\"password123\"}"));
+    }
+
     @Test
     void registrationIsPublicAndCsrfExempt() throws Exception {
         // Registration precedes any credentials or session by definition, so it is both
         // permitAll and CSRF-exempt. Sending no CSRF token must NOT be a 403.
         mockMvc.perform(post("/api/auth/register")
                 .contentType("application/json")
-                .content("{\"username\":\"secrules1\",\"password\":\"password123\"}"))
+                .content("{\"username\":\"secrules-fresh\",\"password\":\"password123\"}"))
             .andExpect(status().isCreated());
     }
 
@@ -104,6 +120,44 @@ class SecurityRulesTest {
     @Test
     void adminEndpointsAreNotReachableAnonymously() throws Exception {
         mockMvc.perform(get("/admin/constants")).andExpect(status().isUnauthorized());
+    }
+
+    /**
+     * The admin ROLE rule, as distinct from merely requiring a login.
+     *
+     * <p>The class javadoc claims to cover "the admin-role rule", but the anonymous test
+     * above only proves that /admin needs *some* authentication. A mutation audit weakened
+     * {@code hasRole("ADMIN")} to {@code authenticated()} and the suite stayed green —
+     * meaning any registered player could have reached {@code /admin/constants}, which
+     * exposes the platform's economy and XP configuration.
+     */
+    @Test
+    void adminEndpointsAreForbiddenToAnOrdinaryAuthenticatedPlayer() throws Exception {
+        mockMvc.perform(get("/admin/constants")
+                .with(org.springframework.security.test.web.servlet.request.SecurityMockMvcRequestPostProcessors
+                    .httpBasic("secrules1", "password123")))
+            .andExpect(status().isForbidden());
+    }
+
+    /**
+     * Path-shape variants must not slip past the matcher. Spring's StrictHttpFirewall
+     * blocks some of these outright (400) — that is an acceptable refusal; what must never
+     * happen is a 200 reaching the handler.
+     */
+    @Test
+    void adminPathVariantsDoNotBypassTheRule() throws Exception {
+        String[] variants = {
+            "/admin/constants/", "/ADMIN/constants", "/admin//constants",
+            "/admin/./constants", "/admin/constants.json", "/./admin/constants"
+        };
+        for (String path : variants) {
+            int status = mockMvc.perform(get(path)
+                    .with(org.springframework.security.test.web.servlet.request.SecurityMockMvcRequestPostProcessors
+                        .httpBasic("secrules1", "password123")))
+                .andReturn().getResponse().getStatus();
+            org.junit.jupiter.api.Assertions.assertNotEquals(200, status,
+                "an ordinary player reached the admin handler via " + path);
+        }
     }
 
     @Test

@@ -246,7 +246,15 @@ public class BoardView {
                 String hint = client.hint();
                 notifier.notify("hint", hint);
                 refresh();
-                updateMoveHistory(new EnhancedMove(-1, -1, 0, SudokuCell.MoveSource.HINT));
+                // A hint is not a move at a coordinate, so it has no cell to name. This
+                // used to build EnhancedMove(-1, -1, ...) as a "no cell" sentinel, which
+                // was legal while the constructor accepted -1..8. Tightening that guard to
+                // the real board range (0..8) turned this line into a thrown
+                // IllegalArgumentException *after* the hint had already been shown and the
+                // gems charged, so the player saw their hint followed immediately by
+                // "Hint failed: Row/col must be 0..8" — and the hint never reached the
+                // move-history list, leaving the Hints filter permanently empty.
+                recordHintInHistory(hint);
             } catch (Exception e) {
                 logger.error("Hint failed: {}", e.getMessage());
                 notifier.notify("error", "Hint failed: " + e.getMessage());
@@ -414,8 +422,27 @@ public class BoardView {
         return marks.stream().sorted().map(String::valueOf).collect(Collectors.joining(" "));
     }
 
+    /**
+     * Records a hint in the move history.
+     *
+     * <p>Separate from {@link #updateMoveHistory(EnhancedMove)} because a hint has no
+     * cell: it is advice, not a placement. Encoding "no cell" as coordinate -1 required
+     * the move constructor to accept an out-of-board value, which is exactly the laxness
+     * that let a real -1 slip through to the server and throw an array-index error deep in
+     * the board. The history entry is a string, so it never needed a move object at all.
+     */
+    private void recordHintInHistory(String hint) {
+        Platform.runLater(() -> {
+            allMoveHistory.add(HINT_HISTORY_LABEL);
+            filterMoveHistory();
+        });
+    }
+
+    /** The single spelling of the hint entry, shared by the writer and the filter. */
+    private static final String HINT_HISTORY_LABEL = "Hint Applied";
+
     private void updateMoveHistory(EnhancedMove move) {
-        String text = move.source() == SudokuCell.MoveSource.HINT ? "Hint Applied"
+        String text = move.source() == SudokuCell.MoveSource.HINT ? HINT_HISTORY_LABEL
             : String.format("(%d,%d)=%d", move.row()+1, move.col()+1, move.newVal());
         // Bug 1 fix: append to the immutable backing list, then re-render
         Platform.runLater(() -> {
@@ -474,11 +501,29 @@ public class BoardView {
     // Public API
     // =====================================================================
 
+    /**
+     * The view root. Built once and cached.
+     *
+     * <p>This used to construct a NEW {@code VBox} on every call, passing the same three
+     * children each time. A JavaFX node has exactly one parent, so adding an
+     * already-parented node silently removes it from its previous parent — meaning the
+     * second call to this method tore the grid, the control bar and the move history out
+     * of the live scene and into a detached container nobody displays.
+     *
+     * <p>It fired on every completed puzzle: {@code MainStage} installs the first
+     * {@code getView()} as the window's centre, then calls it again to run the victory
+     * animation. At the instant of winning, the entire board vanished and the "victory
+     * pulse" played on an off-screen node. Only starting a new game brought the UI back.
+     */
     public VBox getView() {
-        VBox root = new VBox(10, controlsBox, grid, moveHistoryList);
-        root.setStyle("-fx-background-color: #000000;");
-        return root;
+        if (viewRoot == null) {
+            viewRoot = new VBox(10, controlsBox, grid, moveHistoryList);
+            viewRoot.setStyle("-fx-background-color: #000000;");
+        }
+        return viewRoot;
     }
+
+    private VBox viewRoot;
 
     public SudokuBoard getBoard() { return board(); }
 }
