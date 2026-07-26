@@ -63,7 +63,7 @@ public interface EconomyAnalyticsRepository extends JpaRepository<User, Long> {
 
     @Query(value = "SELECT u.* FROM users u " +
            "JOIN (SELECT user_id, COUNT(*) as match_count, AVG(CASE WHEN won THEN 1.0 ELSE 0.0 END) as win_rate " +
-           "FROM match_history GROUP BY user_id HAVING match_count >= :minMatches) mh " +
+           "FROM user_match_history GROUP BY user_id HAVING match_count >= :minMatches) mh " +
            "ON u.id = mh.user_id WHERE u.hype_meter >= :minHype ORDER BY mh.win_rate DESC, u.points DESC",
            nativeQuery = true)
     @Cacheable(value = "hypeMatchMasters", key = "#minMatches + '-' + #minHype + '-' + #pageable.pageNumber")

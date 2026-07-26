@@ -116,7 +116,11 @@ public class DailyPuzzleService implements GameEndListener {
     public List<String> archiveDates(int limit) {
         int capped = Math.max(1, Math.min(limit, 60));
         List<String> out = new ArrayList<>();
-        for (SudokuBoard template : gameRepository.findByPlayerId(TEMPLATE_PLAYER,
+        // Filter by prefix in SQL, not after the LIMIT. Weekly-tournament templates share
+        // TEMPLATE_PLAYER, so paging the owner and discarding non-daily rows in Java spent
+        // the limit on rows that were then thrown away — see findByPlayerIdAndGameIdPrefix.
+        for (SudokuBoard template : gameRepository.findByPlayerIdAndGameIdPrefix(
+                TEMPLATE_PLAYER, DAILY_PREFIX,
                 org.springframework.data.domain.PageRequest.of(0, capped))) {
             String gameId = template.getGameId();
             if (gameId != null && gameId.startsWith(DAILY_PREFIX)) {
@@ -135,6 +139,15 @@ public class DailyPuzzleService implements GameEndListener {
     public SudokuBoard joinArchive(String playerId, LocalDate date) {
         if (date.isAfter(today())) {
             throw new IllegalArgumentException("No puzzle exists yet for " + date);
+        }
+        // TODAY is not archive material, and allowing it was a solution oracle: the
+        // archive copy is a throwaway (its id shape earns no streak or leaderboard
+        // credit), so a player could take an archive copy of today's puzzle, auto-solve
+        // THAT, read the completed grid off the response, then join the real daily and
+        // type in the answers for a top leaderboard time.
+        if (!date.isBefore(today())) {
+            throw new IllegalArgumentException(
+                "Today's puzzle is played through /api/daily/join, not the archive");
         }
         String gameId = templateId(date) + ":archive:" + playerId;
         try {

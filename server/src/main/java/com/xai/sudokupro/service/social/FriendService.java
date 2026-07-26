@@ -50,6 +50,14 @@ public class FriendService {
 
     public void request(String from, String to) {
         if (from.equals(to)) throw new IllegalArgumentException("You cannot befriend yourself");
+        // The target must actually exist. Without this the endpoint accepted any string —
+        // a fuzz run got HTTP 200 for a friend request to an emoji username — writing a
+        // pending-request entry (and a 14-day Redis key) for an account that will never
+        // exist. That is unbounded attacker-controlled key growth, and it also let a
+        // caller probe/populate arbitrary names.
+        if (userRepository.findByUsername(to).isEmpty()) {
+            throw new IllegalArgumentException("No such player: " + to);
+        }
         try {
             redis.opsForSet().add(PENDING_KEY + to, from);
             redis.expire(PENDING_KEY + to, PENDING_TTL);
@@ -83,8 +91,20 @@ public class FriendService {
 
     @Transactional
     public void remove(String me, String exFriend) {
+        // walletFor PROVISIONS a row for an unknown name, so calling it on an unvalidated
+        // path variable turned DELETE /api/friends/{anything} into a row factory: one
+        // authenticated account could mint a users row per request just by varying the
+        // path. `request` was hardened against exactly this ("unbounded attacker-controlled
+        // key growth"); `remove` was missed. Look the target up instead of provisioning
+        // it, and treat an unknown name as a no-op — un-friending someone who does not
+        // exist has already achieved what the caller wanted.
+        var target = userRepository.findByUsername(exFriend);
+        if (target.isEmpty()) {
+            logger.debug("Ignoring un-friend of unknown player {}", exFriend);
+            return;
+        }
         User a = economyService.walletFor(me);
-        User b = economyService.walletFor(exFriend);
+        User b = target.get();
         Set<Long> af = a.getFriends(); af.remove(b.getId()); a.setFriends(af);
         Set<Long> bf = b.getFriends(); bf.remove(a.getId()); b.setFriends(bf);
         userRepository.save(a);

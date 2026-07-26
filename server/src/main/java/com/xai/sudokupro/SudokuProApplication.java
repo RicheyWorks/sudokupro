@@ -33,7 +33,7 @@ public class SudokuProApplication {
             logger.info("SudokuPro server started (headless) — web server threads keep the JVM alive");
         } catch (Exception e) {
             logger.error("SudokuPro startup failed", e);
-            shutdown();
+            shutdown(1);
         }
     }
 
@@ -109,10 +109,23 @@ public class SudokuProApplication {
 
     /** Orderly stop — also registered as the JVM shutdown hook. */
     public static void shutdown() {
+        shutdown(0);
+    }
+
+    /**
+     * Orderly stop with an explicit exit status.
+     *
+     * <p>This always exited 0, including on the startup-failure path in {@code main},
+     * so a deployment that refused to start for a good reason (SecretsGuard rejecting a
+     * default credential, a port clash, an unreachable database) reported success to
+     * the orchestrator — which then treated the pod as having completed normally rather
+     * than crash-looping and surfacing the error.
+     */
+    public static void shutdown(int status) {
         if (context != null && context.isActive()) {
             context.close();
         }
-        System.exit(0);
+        System.exit(status);
     }
 
     private static class SudokuProBanner implements Banner {

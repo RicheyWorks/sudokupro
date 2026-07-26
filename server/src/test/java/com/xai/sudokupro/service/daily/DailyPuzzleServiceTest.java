@@ -188,7 +188,10 @@ class DailyPuzzleServiceTest {
         SudokuBoard t = new SudokuBoard(2, false, false, 0, "daily-2026-07-15");
         t.setPlayerId("__daily__");
         savedRows.put("daily-2026-07-15", t);
-        when(gameRepository.findByPlayerId(eq("__daily__"), any()))
+        // archiveDates now filters by the daily- prefix in SQL rather than after the
+        // LIMIT: weekly-tournament templates share TEMPLATE_PLAYER, so paging the owner
+        // and discarding non-daily rows in Java spent the limit on rows it threw away.
+        when(gameRepository.findByPlayerIdAndGameIdPrefix(eq("__daily__"), eq("daily-"), any()))
             .thenReturn(java.util.List.of(t));
 
         assertEquals(java.util.List.of("2026-07-15"), service.archiveDates(14));

@@ -45,22 +45,39 @@ class SeasonServiceTest {
         assertEquals("2026-10-01", service.seasonEnds().toString());
     }
 
+    /**
+     * Regression: the podium badge must carry the season that ENDED.
+     *
+     * <p>Rollover labelled the badge with {@code seasonId()} — the season now STARTING —
+     * while scoring the outgoing ladder. With the clock in Q3 the Q2 winners were crowned
+     * "SeasonChampion-2026-Q3", so nobody ever held a badge for the season they actually
+     * won, and the real Q3 champion could never receive that badge because the key was
+     * already taken.
+     *
+     * <p>Also: the soft reset used to iterate the same top-100 page as the podium, leaving
+     * everyone from rank 101 down un-reset. It is now one bulk statement over every rated
+     * player.
+     */
     @Test
-    void rolloverCrownsPodiumAndSoftResetsRatingsExactlyOnce() {
+    void rolloverCrownsLastSeasonsPodiumAndResetsEveryRatedPlayerExactlyOnce() {
         User first = rated("champ", 1400);
         User second = rated("runner", 1200);
         User third = rated("third", 1100);
-        User fourth = rated("fourth", 900);
-        when(userRepository.findDuelLadder(any())).thenReturn(List.of(first, second, third, fourth));
+        when(userRepository.findDuelLadder(any())).thenReturn(List.of(first, second, third));
+        when(userRepository.softResetDuelRatings()).thenReturn(150);
 
         service.current();  // triggers the rollover
         service.current();  // second call must be a no-op
 
-        assertTrue(first.getAchievements().get("SeasonChampion-2026-Q3"));
-        assertTrue(third.getAchievements().get("SeasonChampion-2026-Q3"));
-        assertNull(fourth.getAchievements().get("SeasonChampion-2026-Q3"));
-        assertEquals((1400 + 1000) / 2, first.getDuelRating(), "soft reset toward 1000");
-        assertEquals((900 + 1000) / 2, fourth.getDuelRating());
+        // Clock is fixed in Q3, so the season that just ended is Q2.
+        assertEquals("2026-Q2", service.previousSeasonId());
+        assertTrue(first.getAchievements().get("SeasonChampion-2026-Q2"));
+        assertTrue(third.getAchievements().get("SeasonChampion-2026-Q2"));
+        assertNull(first.getAchievements().get("SeasonChampion-2026-Q3"),
+            "the badge must not be stamped with the season that is only just starting");
+
+        // Every rated player is reset by one statement, not just the podium page.
+        verify(userRepository, times(1)).softResetDuelRatings();
         verify(userRepository, times(1)).findDuelLadder(any());
         verify(notificationService, times(3))
             .sendTypedNotification(anyString(), eq("SEASON"), anyString());

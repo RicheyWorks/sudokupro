@@ -123,4 +123,98 @@ class SudokuBoardSnapshotTest {
             }
         }
     }
+
+    /**
+     * Regression: a board with ANY move could not be read back out of the Redis cache.
+     *
+     * <p>{@code SudokuBoard.getReplayHistory()} is serialized, and each element is an
+     * {@link com.xai.sudokupro.model.EnhancedMove} whose bean alias {@code getValue()}
+     * emitted a {@code "value"} property the record's canonical creator does not accept —
+     * so deserialization threw {@code UnrecognizedPropertyException: "value"}.
+     * {@code @JsonIgnoreProperties} sits on SudokuBoard, not on the nested record, so it
+     * did not help. Because {@code GameService.getGame} does not guard the Redis read, the
+     * exception propagated instead of falling back to the database: every read of a played
+     * game 500'd for the whole cache TTL once it left the in-memory active set (pod
+     * restart, eviction, or a second replica).
+     */
+    @Test
+    void aPlayedBoardSurvivesTheJacksonCacheRoundTrip() throws Exception {
+        com.fasterxml.jackson.databind.ObjectMapper mapper =
+            new com.fasterxml.jackson.databind.ObjectMapper();
+        mapper.registerModule(new com.fasterxml.jackson.datatype.jsr310.JavaTimeModule());
+
+        SudokuBoard board = new SudokuBoard(1, false, false, 0, "cache-rt");
+        board.setPlayerId("p1");
+        // one genuine move, which is all it took to poison the cache entry
+        outer:
+        for (int r = 0; r < 9; r++)
+            for (int c = 0; c < 9; c++)
+                if (board.getBoard()[r][c].getValue() == 0)
+                    for (int v = 1; v <= 9; v++)
+                        if (board.isValidMove(r, c, v)) {
+                            board.makeMove(r, c, v, SudokuCell.MoveSource.PLAYER);
+                            break outer;
+                        }
+        assertEquals(1, board.getMoveCount());
+
+        String json = mapper.writeValueAsString(board);
+        SudokuBoard restored = assertDoesNotThrow(() -> mapper.readValue(json, SudokuBoard.class),
+            "a played board must survive the Redis serializer");
+
+        assertEquals(board.getMoveCount(), restored.getMoveCount());
+        for (int r = 0; r < 9; r++)
+            for (int c = 0; c < 9; c++)
+                assertEquals(board.getBoard()[r][c].getValue(), restored.getBoard()[r][c].getValue(),
+                    "cell (" + r + "," + c + ") must round-trip");
+    }
+
+    /** Old cache entries still carry the "value" alias; they must not break on read. */
+    @Test
+    void legacyCacheEntriesCarryingTheValueAliasStillDeserialize() throws Exception {
+        com.fasterxml.jackson.databind.ObjectMapper mapper =
+            new com.fasterxml.jackson.databind.ObjectMapper();
+        EnhancedMove move = assertDoesNotThrow(() -> mapper.readValue(
+            "{\"row\":1,\"col\":2,\"oldVal\":0,\"newVal\":5,\"value\":5,\"source\":\"PLAYER\"}",
+            EnhancedMove.class));
+        assertEquals(5, move.newVal());
+    }
+
+    /**
+     * Regression: {@code snapshotCells} omitted each cell's {@code strategy}.
+     * {@code calculateCosmicDripLevel()} counts cells whose strategy is COSMIC or
+     * STARFORGE, so every board restored from the database or the Redis cache recomputed
+     * a drip level of 0 — the value was silently wiped on any round-trip.
+     */
+    @Test
+    void cellStrategySurvivesTheSnapshotRoundTrip() {
+        SudokuBoard board = new SudokuBoard(1, false, false, 0, "strategy-rt");
+        int marked = 0;
+        outer:
+        for (int r = 0; r < 9; r++)
+            for (int c = 0; c < 9; c++)
+                if (board.getBoard()[r][c].getValue() == 0) {
+                    board.getBoard()[r][c].setStrategy(SudokuCell.Strategy.COSMIC);
+                    if (++marked == 3) break outer;
+                }
+        assertEquals(3, marked, "test setup: three cells marked COSMIC");
+
+        String snapshot = board.snapshotCells();
+        SudokuBoard restored = new SudokuBoard(1, false, false, 0, "strategy-target");
+        restored.restoreCells(snapshot);
+
+        int cosmic = 0;
+        for (int r = 0; r < 9; r++)
+            for (int c = 0; c < 9; c++)
+                if (restored.getBoard()[r][c].getStrategy() == SudokuCell.Strategy.COSMIC) cosmic++;
+        assertEquals(3, cosmic, "strategy must round-trip, or cosmicDripLevel resets to 0");
+    }
+
+    /** Snapshots written before "st" existed must still load. */
+    @Test
+    void snapshotsWithoutAStrategyKeyStillRestore() {
+        SudokuBoard board = new SudokuBoard(1, false, false, 0, "legacy-st");
+        String legacy = board.snapshotCells().replaceAll(",\"st\":\"[A-Z_]+\"", "");
+        SudokuBoard restored = new SudokuBoard(1, false, false, 0, "legacy-target");
+        assertDoesNotThrow(() -> restored.restoreCells(legacy));
+    }
 }

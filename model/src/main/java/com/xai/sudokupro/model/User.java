@@ -1,6 +1,7 @@
 package com.xai.sudokupro.model;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import jakarta.persistence.Column;
 import jakarta.persistence.ElementCollection;
 import jakarta.persistence.Entity;
 import jakarta.persistence.GeneratedValue;
@@ -32,7 +33,16 @@ public class User implements Serializable {
     @GeneratedValue(strategy = GenerationType.IDENTITY)
     private Long id;
 
+    /**
+     * The player's real identity — every lookup is {@code findByUsername}, a single-result
+     * query. Nothing enforced uniqueness here or in the schema, so two concurrent
+     * check-then-insert callers (see {@code EconomyService.walletFor}) could create two
+     * rows for one player, after which every read of that player threw
+     * {@code IncorrectResultSizeDataAccessException} forever — including login. Flyway V9
+     * dedupes and adds the index; this makes Hibernate agree with the database.
+     */
     @NotBlank(message = "Username cannot be blank")
+    @Column(unique = true)
     private String username;
 
     @Min(value = 0, message = "Points cannot be negative")

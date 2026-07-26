@@ -37,6 +37,13 @@ public class RawWebSocketConfig implements WebSocketConfigurer {
         this.webSocketController = webSocketController;
     }
 
+    // Frame-size limits are set PER SESSION in WebSocketController.afterConnectionEstablished
+    // (session.setTextMessageSizeLimit / setBinaryMessageSizeLimit). A
+    // ServletServerContainerFactoryBean was tried here first and is the wrong tool twice
+    // over: it configures the JSR-356 container, which Spring's raw WebSocket stack does
+    // not consult (frames were still cut off at the 8 KB default), and it requires a real
+    // embedded servlet container, so it broke every MockMvc @SpringBootTest context.
+
     @Override
     public void registerWebSocketHandlers(WebSocketHandlerRegistry registry) {
         registry.addHandler(webSocketController, "/ws/game")

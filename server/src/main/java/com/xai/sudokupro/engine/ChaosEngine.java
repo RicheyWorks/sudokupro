@@ -25,10 +25,48 @@ public class ChaosEngine {
     private final Map<String, String> playerBrainprints = new ConcurrentHashMap<>();
     private final Map<String, String> universeSignatures = new ConcurrentHashMap<>();
 
+    /**
+     * Last time each tracked player was touched, and the cap on how many we keep.
+     *
+     * <p>The five maps above are keyed by player and were only ever cleared by
+     * {@code resetPlayerState}, which runs on the "RESET" event alone. Meanwhile
+     * {@code GameService.applyMove} fires {@code onGameEvent("MOVE", playerId)} on every
+     * single move, and that path writes {@code playerLuck} and creates a
+     * {@code LuckProfile}. So a server accumulated five permanent entries for every
+     * player who had ever made one move and released them only on restart — an unbounded
+     * heap leak proportional to lifetime unique players, in a component holding nothing
+     * worth keeping past a session. Bounded LRU: evict the least-recently-touched player
+     * from all five maps together, so a player's state stays internally consistent.
+     */
+    private final Map<String, Long> lastTouch = new ConcurrentHashMap<>();
+    static final int MAX_TRACKED_PLAYERS = 10_000;
+    private final java.util.concurrent.atomic.AtomicLong touchClock =
+        new java.util.concurrent.atomic.AtomicLong();
+
     @Autowired
     public ChaosEngine(SecureRandomGenerator rng, @Lazy GameService gameService) {
         this.rng = rng;
         this.gameService = gameService;
+    }
+
+    /** Records access and evicts the coldest players once the cap is exceeded. */
+    private void touch(String playerId) {
+        if (playerId == null) return;
+        lastTouch.put(playerId, touchClock.incrementAndGet());
+        while (lastTouch.size() > MAX_TRACKED_PLAYERS) {
+            String coldest = lastTouch.entrySet().stream()
+                .min(Map.Entry.comparingByValue())
+                .map(Map.Entry::getKey)
+                .orElse(null);
+            if (coldest == null) return;
+            lastTouch.remove(coldest);
+            resetPlayerState(coldest);
+        }
+    }
+
+    /** Number of players currently held in the chaos maps (test/observability hook). */
+    public int trackedPlayerCount() {
+        return lastTouch.size();
     }
 
     public double simulateReactionTime(String playerId) {
@@ -74,6 +112,7 @@ public class ChaosEngine {
     public void updateLuck(String playerId, double delta) {
         playerLuck.merge(playerId, delta, Double::sum);
         updateProfile(playerId, p -> p.luckFactor = getPlayerLuck(playerId));
+        touch(playerId);
     }
 
     public double getPlayerLuck(String playerId) {
@@ -90,6 +129,7 @@ public class ChaosEngine {
         playerKarma.remove(playerId);
         playerBrainprints.remove(playerId);
         universeSignatures.remove(playerId);
+        lastTouch.remove(playerId);
     }
 
     public void onGameEvent(String type, String playerId) {
@@ -128,6 +168,7 @@ public class ChaosEngine {
         LuckProfile profile = getLuckProfile(playerId);
         updater.accept(profile);
         profile.seedSnapshot = rng.getSeedSnapshot();
+        touch(playerId);
     }
 
     public String exportLuckProfileJson(String playerId) {
@@ -155,6 +196,7 @@ public class ChaosEngine {
 
     public void setKarma(String playerId, double karma) {
         playerKarma.put(playerId, karma);
+        touch(playerId);
     }
 
     public double calculateMoveEntropy(SudokuBoard board) {
@@ -176,6 +218,7 @@ public class ChaosEngine {
 
     public void updateBrainprint(String playerId, String pattern) {
         playerBrainprints.put(playerId, pattern);
+        touch(playerId);
     }
 
     public String getUniverseSignature(String playerId) {
@@ -185,6 +228,7 @@ public class ChaosEngine {
     public void adjustRealityParameters(String playerId, String newSignature) {
         universeSignatures.put(playerId, newSignature);
         updateLuck(playerId, -0.02);
+        touch(playerId);
     }
 
     public void boostEntropy(byte[] seed) {

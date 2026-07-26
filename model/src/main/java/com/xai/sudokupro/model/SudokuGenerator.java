@@ -138,12 +138,37 @@ public class SudokuGenerator {
         return false;
     }
 
+    /**
+     * Clears {@code cellsToRemove} cells, keeping the puzzle uniquely solvable.
+     *
+     * <p>Cells are visited in a shuffled single pass over all 81 positions rather than by
+     * repeated random sampling with a {@code cellsToRemove * 2} budget. The old scheme
+     * regularly ran dry on HARD (60 removals): as the grid empties, random picks keep
+     * landing on already-cleared cells, and each surviving candidate is likelier to break
+     * uniqueness and be restored — so the budget was consumed before the target was met.
+     * Observed live at 55–58 of 60, ten times in a single startup, which surfaced as
+     * "Cosmic duel failed to erupt" from EventEngine and made difficulty-4 games fail.
+     *
+     * <p>A full sweep tries every cell exactly once: strictly more thorough than the old
+     * budget, and bounded by 81 uniqueness checks instead of an unbounded retry loop.
+     */
     private void removeNumbers(SudokuCell[][] board, int cellsToRemove, boolean enforceSymmetry, boolean maximizeConflicts) {
-        int attempts = cellsToRemove * 2;
+        List<int[]> positions = new ArrayList<>(size * size);
+        for (int r = 0; r < size; r++)
+            for (int c = 0; c < size; c++)
+                positions.add(new int[]{r, c});
+        // Fisher-Yates using the generator's own RNG, so seeding still drives layout.
+        for (int i = positions.size() - 1; i > 0; i--) {
+            int j = rand.nextInt(i + 1);
+            int[] tmp = positions.get(i);
+            positions.set(i, positions.get(j));
+            positions.set(j, tmp);
+        }
+
         int removed = 0;
-        while (removed < cellsToRemove && attempts > 0) {
-            int row = rand.nextInt(size);
-            int col = rand.nextInt(size);
+        for (int[] pos : positions) {
+            if (removed >= cellsToRemove) break;
+            int row = pos[0], col = pos[1];
             if (board[row][col].getValue() != 0) {
                 int temp = board[row][col].getValue();
                 // Bug fix: setGiven(false) must precede setValue(0) — SudokuCell.setValue
@@ -193,12 +218,11 @@ public class SudokuGenerator {
                     board[row][col].setValue(temp, SudokuCell.MoveSource.INITIAL);
                     board[row][col].setGiven(true);
                 }
-                attempts--;
             }
         }
         if (removed < cellsToRemove) {
-            logger.warn("Failed to remove {} cells after {} attempts; achieved: {}", cellsToRemove - removed, attempts, removed);
-            generationLog.add("Failed to remove " + (cellsToRemove - removed) + " cells after " + attempts + " attempts");
+            logger.warn("Exhausted all {} cells; removed {} of {} requested", size * size, removed, cellsToRemove);
+            generationLog.add("Failed to remove " + (cellsToRemove - removed) + " cells after a full sweep");
             throw new IllegalStateException("Failed to remove enough cells for difficulty: " + removed + "/" + cellsToRemove);
         }
     }

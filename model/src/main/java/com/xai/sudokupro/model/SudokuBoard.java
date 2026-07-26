@@ -71,6 +71,19 @@ public class SudokuBoard implements Serializable {
     @JsonProperty private long solveTimeSeconds = 0L;
     @JsonProperty private int moveCount = 0;
 
+    /**
+     * True once this board's completion has paid out (gems, XP, achievements,
+     * streaks, duel results). Persisted so the payout survives a restart or a
+     * cache eviction, because {@code POST /api/game/{id}/end} re-hydrates a
+     * finished board into the active set and could otherwise fire every reward
+     * listener again on each call — a trivial unbounded currency farm
+     * (measured: +15 gems and +15 XP per replayed request).
+     * Only ever set for a SOLVED board: abandoning an unfinished game must not
+     * poison a later, legitimate completion of the same game after a resume.
+     */
+    @Column(name = "rewards_granted")
+    @JsonProperty private boolean rewardsGranted = false;
+
     // Lives / scoring
     private int lives      = 3;
     private int maxLives   = 3;
@@ -169,7 +182,12 @@ public class SudokuBoard implements Serializable {
 
     /**
      * Serializes the live grid to a compact JSON snapshot: a 9x9 array of
-     * {@code {"v":value,"g":given,"ms":moveSource,"pm":[...],"cf":[...]}}.
+     * {@code {"v":value,"g":given,"ms":moveSource,"st":strategy,"pm":[...],"cf":[...]}}.
+     *
+     * <p>{@code st} (strategy) must be included: {@code calculateCosmicDripLevel()} counts
+     * cells whose strategy is COSMIC or STARFORGE, so omitting it made every restored board
+     * recompute a drip level of 0 — silently wiping the value on any DB or Redis
+     * round-trip. Older snapshots simply have no {@code st} key and restore as before.
      * This is the format persisted in the {@code cells_json} column and carried
      * through the Redis cache; {@link #restoreCells(String)} is its inverse.
      */
@@ -184,6 +202,8 @@ public class SudokuBoard implements Serializable {
                 n.put("g", cell.isGiven());
                 SudokuCell.MoveSource ms = cell.getMoveSource();
                 n.put("ms", (ms != null ? ms : SudokuCell.MoveSource.UNKNOWN).name());
+                SudokuCell.Strategy st = cell.getStrategy();
+                if (st != null) n.put("st", st.name());
                 Set<Integer> pm = cell.getPencilMarks();
                 if (!pm.isEmpty()) {
                     ArrayNode a = n.putArray("pm");
@@ -236,6 +256,14 @@ public class SudokuBoard implements Serializable {
                         cell.setValue(v, ms); // must precede setGiven — given cells refuse value changes
                     }
                     cell.setGiven(n.path("g").asBoolean(false));
+                    String strategyName = n.path("st").asText(null);
+                    if (strategyName != null && !strategyName.isBlank()) {
+                        try {
+                            cell.setStrategy(SudokuCell.Strategy.valueOf(strategyName));
+                        } catch (IllegalArgumentException ignored) {
+                            // Unknown strategy from an older/newer build — leave it unset.
+                        }
+                    }
                     for (JsonNode m : n.path("pm")) cell.addPencilMark(m.asInt());
                     for (JsonNode c : n.path("cf")) cell.addConflict(c.asInt());
                     restored[i][j] = cell;
@@ -275,6 +303,27 @@ public class SudokuBoard implements Serializable {
         if (cellsJson != null && !cellsJson.isBlank()) {
             restoreCells(cellsJson);
         }
+        restoreSolveTimeFromSeconds();
+    }
+
+    /**
+     * Rebuilds the {@code @Transient} {@link #solveTime} Duration from the persisted
+     * {@link #solveTimeSeconds} column.
+     *
+     * <p>Without this, {@code getSolveTime()} returned {@link Duration#ZERO} for every
+     * board that came back from the database or the Redis cache, however long the player
+     * had actually taken. Three consumers read it and all three were wrong:
+     * {@code AntiCheatEngine.detectCheating(board, user)} scored "solved impossibly fast"
+     * against a rehydrated board (0 &lt; difficulty x 10s is always true) and
+     * "sub-500ms per move" on top of it, manufacturing suspicion signals out of a
+     * serialization artefact; {@code EventEngine.calculateEventScore} computed a zero
+     * time penalty, so a slow solve replayed after a cache miss outscored the same solve
+     * held in memory; and the solve-time analytics recorded 0 for those games.
+     */
+    private void restoreSolveTimeFromSeconds() {
+        if (solveTimeSeconds > 0 && (solveTime == null || solveTime.isZero())) {
+            solveTime = Duration.ofSeconds(solveTimeSeconds);
+        }
     }
 
     // Jackson (Redis cache path): the same snapshot rides along the cached JSON
@@ -298,7 +347,8 @@ public class SudokuBoard implements Serializable {
 
     private void generateBoard(int difficulty) {
         int[][] solved = new int[size][size];
-        solve(solved, 0, 0);
+        // Randomised candidate order — otherwise every generated board shares one solution.
+        solve(solved, 0, 0, true);
         // Mark all cells as given initially
         for (int i = 0; i < size; i++)
             for (int j = 0; j < size; j++) {
@@ -339,13 +389,32 @@ public class SudokuBoard implements Serializable {
     // Move validation
     // =====================================================================
 
+    /**
+     * Whether {@code value} may legally go in this cell. A pure query — it records nothing.
+     *
+     * <p>It used to increment {@code heatmapMistakeCounter} on every false result, which is
+     * wrong for a public predicate: it is called to PROBE legality (by the WebSocket
+     * handler before applying, by the apply paths themselves, by the solver and by clients
+     * listing candidates), so a single rejected move was counted twice and merely asking
+     * "which digits fit here?" logged a mistake per digit that did not. The heatmap gates
+     * {@link #isPerfectClear()}, so probing could silently cost a flawless solve. Mistakes
+     * are now recorded only where a move is genuinely rejected, by
+     * {@link #recordMistake(int, int)}.
+     */
     public synchronized boolean isValidMove(int row, int col, int value) {
-        boolean valid = checkRow(row, value) && checkCol(col, value) && checkBox(row, col, value);
-        if (!valid) {
-            String key = row + "," + col;
-            heatmapMistakeCounter.merge(key, 1, Integer::sum);
-        }
-        return valid;
+        // Clearing a cell is always legal on an editable cell. The duplicate scan below
+        // compares against 0 as if it were a digit, and an unfinished board always has an
+        // empty cell in the same row/column/box — so every clear was rejected. A player
+        // could not erase a wrong entry through ANY move path (makeMove,
+        // applyExternalMove, applyBatchMoves, and therefore the WebSocket move handler and
+        // both clients' erase buttons); only a server-side undo could take a value back.
+        if (value == 0) return true;
+        return checkRow(row, value) && checkCol(col, value) && checkBox(row, col, value);
+    }
+
+    /** Records a genuinely rejected player attempt for the mistake heatmap. */
+    private void recordMistake(int row, int col) {
+        heatmapMistakeCounter.merge(row + "," + col, 1, Integer::sum);
     }
 
     private boolean checkRow(int row, int value) {
@@ -373,75 +442,93 @@ public class SudokuBoard implements Serializable {
     public synchronized void makeMove(int row, int col, int value, SudokuCell.MoveSource source) {
         if (!isCellEditable(row, col) || !isValidMove(row, col, value)) {
             logger.warn("Rejected move ({},{})={} by {}", row, col, value, source);
+            recordMistake(row, col);
             return;
         }
         int oldVal = board[row][col].getValue();
+        SudokuCell.MoveSource oldSource = board[row][col].getMoveSource();
         board[row][col].setValue(value, source);
-        Move move = new Move(row, col, oldVal, value, source);
+        Move move = new Move(row, col, oldVal, value, source, oldSource);
         moveHistory.push(move);
         replayHistory.add(new EnhancedMove(row, col, oldVal, value, source));
         redoStack.clear();
         moveCount++;
         if (mirrorMode) applyMirrorMove(row, col, value, source);
         cosmicDripLevel = calculateCosmicDripLevel();
-        if (isSolved()) {
-            solveTime = Duration.between(startTime, LocalDateTime.now());
-            solved = true;
-            solveTimeSeconds = solveTime.getSeconds();
+        refreshSolvedState();
+    }
+
+    /**
+     * Applies an external move and broadcasts it only if it actually landed.
+     *
+     * <p>The broadcast used to be unconditional, so a move {@code applyExternalMove}
+     * had just REJECTED was still announced to every peer. Their clients applied a value
+     * the authoritative board never recorded and nothing ever corrected it — {@code sync}
+     * is client-initiated and no error envelope is sent on this path.
+     *
+     * @return true if the board changed
+     */
+    public synchronized boolean applyMove(EnhancedMove move, MoveBroadcaster broadcaster) {
+        boolean applied = applyExternalMove(move);
+        if (applied && broadcaster != null) broadcaster.sendMove(gameId, move);
+        return applied;
+    }
+
+    /** @return true if the move was accepted and the board changed. */
+    public synchronized boolean applyExternalMove(EnhancedMove move) {
+        if (move == null) return false;
+        if (!isCellEditable(move.row(), move.col())
+                || !isValidMove(move.row(), move.col(), move.newVal())) {
+            recordMistake(move.row(), move.col());
+            return false;
         }
-    }
-
-    /** Apply an external move and optionally broadcast. */
-    public synchronized void applyMove(EnhancedMove move, MoveBroadcaster broadcaster) {
-        applyExternalMove(move);
-        if (broadcaster != null) broadcaster.sendMove(gameId, move);
-    }
-
-    public synchronized void applyExternalMove(EnhancedMove move) {
-        if (move == null || !isCellEditable(move.row(), move.col())
-                || !isValidMove(move.row(), move.col(), move.newVal())) return;
         int oldVal = board[move.row()][move.col()].getValue();
+        SudokuCell.MoveSource oldSource = board[move.row()][move.col()].getMoveSource();
         board[move.row()][move.col()].setValue(move.newVal(), move.source());
-        moveHistory.push(new Move(move.row(), move.col(), oldVal, move.newVal(), move.source()));
+        moveHistory.push(new Move(move.row(), move.col(), oldVal, move.newVal(),
+            move.source(), oldSource));
         replayHistory.add(move);
         redoStack.clear();
         moveCount++;
         if (mirrorMode) applyMirrorMove(move.row(), move.col(), move.newVal(), move.source());
         cosmicDripLevel = calculateCosmicDripLevel();
-        if (isSolved()) {
-            solveTime = Duration.between(startTime, LocalDateTime.now());
-            solved = true;
-            solveTimeSeconds = solveTime.getSeconds();
-        }
+        refreshSolvedState();
+        return true;
     }
 
     public synchronized void applyBatchMoves(List<EnhancedMove> moves) {
         if (moves == null || moves.isEmpty()) return;
+        int applied = 0;
         for (EnhancedMove m : moves) {
             if (isCellEditable(m.row(), m.col()) && isValidMove(m.row(), m.col(), m.newVal())) {
                 int oldVal = board[m.row()][m.col()].getValue();
+                SudokuCell.MoveSource oldSource = board[m.row()][m.col()].getMoveSource();
                 board[m.row()][m.col()].setValue(m.newVal(), m.source());
-                moveHistory.push(new Move(m.row(), m.col(), oldVal, m.newVal(), m.source()));
+                moveHistory.push(new Move(m.row(), m.col(), oldVal, m.newVal(),
+                    m.source(), oldSource));
                 replayHistory.add(m);
+                applied++;
                 if (mirrorMode) applyMirrorMove(m.row(), m.col(), m.newVal(), m.source());
             }
         }
         redoStack.clear();
-        moveCount += moves.size();
+        // Count what was actually applied, not what was offered. This was
+        // `moveCount += moves.size()`, so every rejected move still inflated the
+        // counter — and jumpToMove()/loadReplayFromJson() inherited the inflation.
+        // Anti-cheat move-rate scoring and the player's own stats read this number.
+        moveCount += applied;
         cosmicDripLevel = calculateCosmicDripLevel();
-        if (isSolved()) {
-            solveTime = Duration.between(startTime, LocalDateTime.now());
-            solved = true;
-            solveTimeSeconds = solveTime.getSeconds();
-        }
+        refreshSolvedState();
     }
 
     private void applyMirrorMove(int row, int col, int value, SudokuCell.MoveSource source) {
         int mr = size - 1 - row, mc = size - 1 - col;
         if (isCellEditable(mr, mc) && isValidMove(mr, mc, value)) {
             int oldVal = board[mr][mc].getValue();
+            SudokuCell.MoveSource oldSource = board[mr][mc].getMoveSource();
             board[mr][mc].setValue(value, source);
-            moveHistory.push(new Move(mr, mc, oldVal, value, source));
+            // Flagged as the mirror twin so undo/redo treat the pair as ONE player action.
+            moveHistory.push(new Move(mr, mc, oldVal, value, source, oldSource, true));
             replayHistory.add(new EnhancedMove(mr, mc, oldVal, value, source));
         }
     }
@@ -449,21 +536,35 @@ public class SudokuBoard implements Serializable {
     public synchronized void undo() {
         if (moveHistory.isEmpty()) return;
         Move move = moveHistory.pop();
-        board[move.row()][move.col()].setValue(move.oldVal());
+        // Restore the value AND the source it had before this move; the single-arg
+        // setValue() would reset the source to UNKNOWN.
+        board[move.row()][move.col()].setValue(move.oldVal(), move.oldSource());
         redoStack.push(move);
+        // In mirror mode one player action writes two cells and pushes two entries (the
+        // twin last). Undoing only the twin left the primary cell filled, so the move
+        // could not be cleanly taken back. Revert the pair as a unit.
+        if (move.mirrored() && !moveHistory.isEmpty()) {
+            Move primary = moveHistory.pop();
+            board[primary.row()][primary.col()].setValue(primary.oldVal(), primary.oldSource());
+            redoStack.push(primary);
+        }
         usedUndo = true;
         cosmicDripLevel = calculateCosmicDripLevel();
+        refreshSolvedState();
     }
 
     /** Returns the re-applied move, or null if nothing to redo. */
     public synchronized EnhancedMove redo() {
         if (redoStack.isEmpty()) return null;
         Move move = redoStack.pop();
-        board[move.row()][move.col()].setValue(move.newVal());
+        // Re-apply with the ORIGINAL source. Without this an AUTOSOLVE cell came back as
+        // UNKNOWN, so hasAutosolvedCells() went false and the board could claim rewards.
+        board[move.row()][move.col()].setValue(move.newVal(), move.source());
         moveHistory.push(move);
         EnhancedMove em = new EnhancedMove(move.row(), move.col(), move.oldVal(), move.newVal(), move.source());
         replayHistory.add(em);
         cosmicDripLevel = calculateCosmicDripLevel();
+        refreshSolvedState();
         return em;
     }
 
@@ -506,17 +607,61 @@ public class SudokuBoard implements Serializable {
     }
 
     private boolean solve(int[][] b, int row, int col) {
+        return solve(b, row, col, false);
+    }
+
+    /**
+     * Backtracking fill. When {@code randomise} is true, a FRESH 1..9 permutation is drawn
+     * at every cell; otherwise candidates are tried in plain ascending order.
+     *
+     * <p>Generation MUST randomise. Two separate bugs have lived here.
+     *
+     * <p>The first: a fixed ascending order made this function fully deterministic, so
+     * {@code generateBoard} produced the SAME completed grid for every game ever created
+     * and only the clue positions varied. Solving one puzzle gave you the answer to every
+     * board on the platform.
+     *
+     * <p>The second — the fix for the first, which did not go far enough. Drawing ONE
+     * permutation and reusing it at every cell only renames the digits: the backtracker
+     * still walks the identical search path, so all 40 boards in a spread across every
+     * difficulty canonicalised (relabel row 0 to 1..9) to a single grid. Nine clues, one
+     * per digit, pin the permutation and hence the entire solution, with no solving
+     * required — which defeats the hint economy, clean-solve bonuses, achievements,
+     * streaks and the anti-cheat move model in one step.
+     *
+     * <p>The engine harness missed it because its diversity check compared completed grids
+     * literally, and relabelled grids differ literally. It now canonicalises first.
+     *
+     * <p>Re-drawing per cell is what actually randomises the structure — the same thing
+     * {@code SudokuGenerator.solveSudoku} has always done, which is why the daily, duel
+     * and tournament boards built through that path were never affected.
+     */
+    private boolean solve(int[][] b, int row, int col, boolean randomise) {
         if (row == size) return true;
-        if (col == size) return solve(b, row + 1, 0);
-        if (b[row][col] != 0) return solve(b, row, col + 1);
-        for (int n = 1; n <= 9; n++) {
+        if (col == size) return solve(b, row + 1, 0, randomise);
+        if (b[row][col] != 0) return solve(b, row, col + 1, randomise);
+        int[] order = randomise ? shuffledDigits() : null;
+        for (int i = 1; i <= 9; i++) {
+            int n = (order == null) ? i : order[i - 1];
             if (isValidTempMove(b, row, col, n)) {
                 b[row][col] = n;
-                if (solve(b, row, col + 1)) return true;
+                if (solve(b, row, col + 1, randomise)) return true;
                 b[row][col] = 0;
             }
         }
         return false;
+    }
+
+    /** A fresh 1..9 permutation from the board RNG, for randomised generation. */
+    private static int[] shuffledDigits() {
+        int[] digits = {1, 2, 3, 4, 5, 6, 7, 8, 9};
+        for (int i = digits.length - 1; i > 0; i--) {
+            int j = BOARD_RNG.nextInt(i + 1);
+            int tmp = digits[i];
+            digits[i] = digits[j];
+            digits[j] = tmp;
+        }
+        return digits;
     }
 
     // =====================================================================
@@ -667,6 +812,32 @@ public class SudokuBoard implements Serializable {
     // =====================================================================
     // State checks
     // =====================================================================
+
+    /**
+     * Keeps the persisted {@code solved} flag in step with the live grid.
+     *
+     * <p>Previously every mutation only ever set the flag TRUE and nothing cleared it, so
+     * undoing (or now erasing) a cell on a finished board left {@code solved=true} while
+     * {@code isSolved()} reported false. A board persisted in that state is filtered out of
+     * {@code GameRepository.findResumableByPlayerId} (which requires {@code solved = false}),
+     * permanently hiding a game the player can still finish.
+     *
+     * <p>Note this deliberately does NOT touch {@code rewardsGranted}: a board that has
+     * already paid out must not pay again just because it was un-solved and re-solved.
+     */
+    private void refreshSolvedState() {
+        if (isSolved()) {
+            if (!solved) {
+                solveTime = Duration.between(startTime, LocalDateTime.now());
+                solved = true;
+                solveTimeSeconds = solveTime.getSeconds();
+            }
+        } else if (solved) {
+            solved = false;
+            solveTimeSeconds = 0L;
+            solveTime = Duration.ZERO;
+        }
+    }
 
     public boolean isSolved() {
         for (int i = 0; i < size; i++)
@@ -903,7 +1074,25 @@ public class SudokuBoard implements Serializable {
     public LocalDateTime getStartTime() { return startTime; }
 
     public boolean isSolvedState()     { return solved; }
+
+    /** True once a solved board has already paid out its rewards. */
+    public boolean isRewardsGranted()  { return rewardsGranted; }
+    /** Marks this board as having paid out; see {@link #rewardsGranted}. */
+    public void setRewardsGranted(boolean granted) { this.rewardsGranted = granted; }
     public long    getSolveTimeSeconds() { return solveTimeSeconds; }
+
+    /**
+     * Jackson (Redis cache) counterpart to the JPA {@code @PostLoad} restore. The field
+     * carries {@code @JsonProperty}, so without an explicit setter Jackson wrote straight
+     * to it and the transient {@link #solveTime} Duration stayed at zero on the way back
+     * out of the cache. Jackson prefers a setter over direct field access, so this is the
+     * hook that keeps the cached and the database paths agreeing.
+     */
+    @JsonProperty("solveTimeSeconds")
+    public synchronized void setSolveTimeSeconds(long seconds) {
+        this.solveTimeSeconds = Math.max(0L, seconds);
+        restoreSolveTimeFromSeconds();
+    }
     public int     getMoveCount()       { return moveCount; }
 
     public int     getHintCount()       { return hintCount; }
@@ -945,7 +1134,28 @@ public class SudokuBoard implements Serializable {
 
     // ── Inner types ────────────────────────────────────────────────────────
 
-    public record Move(int row, int col, int oldVal, int newVal, SudokuCell.MoveSource source) {}
+    /**
+     * A recorded move. {@code source} is what the cell became; {@code oldSource} is what it
+     * was, captured so undo can restore provenance rather than blanking it.
+     *
+     * <p>undo()/redo() used the single-argument {@code setValue(int)}, which resets a cell's
+     * MoveSource to UNKNOWN. That lost hint/auto-solve provenance — and because
+     * {@code hasAutosolvedCells()} is exactly what suppresses rewards on an AI-solved board,
+     * an undo/redo round trip laundered an auto-solved board into a "legitimate" solve that
+     * paid out gems, streaks and achievements.
+     */
+    public record Move(int row, int col, int oldVal, int newVal,
+                       SudokuCell.MoveSource source, SudokuCell.MoveSource oldSource,
+                       boolean mirrored) {
+        /** Legacy 5-arg form: the prior source is unknown, so treat it as an initial cell. */
+        public Move(int row, int col, int oldVal, int newVal, SudokuCell.MoveSource source) {
+            this(row, col, oldVal, newVal, source, SudokuCell.MoveSource.INITIAL, false);
+        }
+        public Move(int row, int col, int oldVal, int newVal,
+                    SudokuCell.MoveSource source, SudokuCell.MoveSource oldSource) {
+            this(row, col, oldVal, newVal, source, oldSource, false);
+        }
+    }
 
     public record Hint(int row, int col, Object value, Strategy strategy) {
         public enum Strategy { NAKED_SINGLE, CANDIDATE, HIDDEN_SINGLE, POINTING_PAIR }

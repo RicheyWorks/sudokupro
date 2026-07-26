@@ -78,4 +78,51 @@ class SudokuGeneratorTest {
                     assertEquals(givens[i][j], cells[i][j].getValue(),
                         "Solver must not change given at (" + i + "," + j + ")");
     }
+
+    /**
+     * Regression: EVERY difficulty tier must actually produce a puzzle.
+     *
+     * <p>HARD asked for 60 removals (21 clues), which single-cell digging can never reach —
+     * an exhaustive shuffled sweep tops out at 55-58 removals — so HARD generation failed
+     * 100% of the time (measured 0/20), surfacing as {@code Failed to remove enough cells}
+     * and EventEngine's "Cosmic duel failed to erupt". EXTREME (70) and NIGHTMARE (80) left
+     * 11 and 1 clues, below the proven 17-clue minimum for a unique solution, so they were
+     * impossible by construction. The removal loop is now a shuffled single pass over all
+     * 81 cells and the ladder sits inside the achievable range.
+     */
+    @Test
+    void everyDifficultyTierGeneratesAUniquelySolvablePuzzle() {
+        for (Constants.Difficulty difficulty : Constants.Difficulty.values()) {
+            for (int seed = 0; seed < 3; seed++) {
+                final Constants.Difficulty d = difficulty;
+                final long s = seed;
+                SudokuBoard board = assertDoesNotThrow(
+                    () -> generator.generate(d, false, false, s),
+                    () -> d + " (remove " + d.cellsRemoved + ") must be generatable, seed " + s);
+
+                int empty = 0;
+                SudokuCell[][] grid = board.getBoard();
+                for (int r = 0; r < 9; r++)
+                    for (int c = 0; c < 9; c++)
+                        if (grid[r][c].getValue() == 0) empty++;
+
+                assertEquals(difficulty.cellsRemoved, empty,
+                    difficulty + " must clear exactly its configured cell count");
+                assertTrue(81 - empty >= 17,
+                    difficulty + " must leave at least the 17 clues a unique solution requires");
+                assertTrue(generator.validateBoard(grid),
+                    difficulty + " must still have a unique solution");
+            }
+        }
+    }
+
+    /** The ladder must stay strictly increasing, or the tiers stop meaning anything. */
+    @Test
+    void difficultyLadderIsStrictlyIncreasing() {
+        Constants.Difficulty[] tiers = Constants.Difficulty.values();
+        for (int i = 1; i < tiers.length; i++) {
+            assertTrue(tiers[i].cellsRemoved > tiers[i - 1].cellsRemoved,
+                tiers[i] + " must remove more cells than " + tiers[i - 1]);
+        }
+    }
 }

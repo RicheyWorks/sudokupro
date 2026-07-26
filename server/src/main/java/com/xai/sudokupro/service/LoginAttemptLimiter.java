@@ -42,6 +42,37 @@ public class LoginAttemptLimiter {
         this.lockoutWindow = Duration.ofSeconds(lockoutSeconds);
     }
 
+    /**
+     * Builds the counter key.
+     *
+     * <p>Keying on the remote address ALONE made the whole limiter bypassable, because
+     * {@link #recordSuccess} deletes the key and any successful login from that address
+     * cleared it — including a login to a different account. {@code POST /api/auth/register}
+     * is permitAll and CSRF-exempt, so an attacker registers their own account for free,
+     * then guesses four passwords against the victim, logs in once as themselves, and
+     * repeats. Measured: twelve consecutive wrong-password attempts against one target,
+     * zero 429s, where the control run without the reset produced a 429 on the sixth.
+     *
+     * <p>Scoping the counter to (address, username) means a success can only clear the
+     * counter for the account that succeeded, so another account's failures keep counting.
+     */
+    private static String scope(String remoteAddress, String username) {
+        String who = (username == null || username.isBlank()) ? "-" : username.toLowerCase(java.util.Locale.ROOT);
+        return remoteAddress + "|" + who;
+    }
+
+    public boolean isBlocked(String remoteAddress, String username) {
+        return isBlocked(scope(remoteAddress, username));
+    }
+
+    public void recordFailure(String remoteAddress, String username) {
+        recordFailure(scope(remoteAddress, username));
+    }
+
+    public void recordSuccess(String remoteAddress, String username) {
+        recordSuccess(scope(remoteAddress, username));
+    }
+
     public boolean isBlocked(String remoteAddress) {
         try {
             String v = redis.opsForValue().get(KEY_PREFIX + remoteAddress);

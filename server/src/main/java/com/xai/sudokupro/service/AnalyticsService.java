@@ -26,7 +26,11 @@ public class AnalyticsService {
     private final Map<String, Integer> cosmicDripHeatmap = new ConcurrentHashMap<>();
     private final Map<String, Map<String, Integer>> cellMistakeHeatmap = new ConcurrentHashMap<>();
     private final Map<String, Integer> hintUsage = new ConcurrentHashMap<>();
+    // Cumulative seconds spent solving, per player, and the number of solves that make it
+    // up. The count is what makes getAverageSolveTime() an average per SOLVE rather than
+    // an average of per-player totals.
     private final Map<String, Long> solveTimes = new ConcurrentHashMap<>();
+    private final Map<String, Integer> solveCounts = new ConcurrentHashMap<>();
     private final Map<String, LocalDateTime> lastEventTimestamps = new ConcurrentHashMap<>();
     private final Map<String, Integer> duelWins = new ConcurrentHashMap<>();
     private final Map<String, Integer> duelLosses = new ConcurrentHashMap<>();
@@ -78,6 +82,7 @@ public class AnalyticsService {
         } else if ("SOLVE".equals(eventType)) {
             long solveTime = Long.parseLong(String.valueOf(payload.getOrDefault("solveTimeSeconds", "0")));
             solveTimes.merge(playerId, solveTime, Long::sum);
+            solveCounts.merge(playerId, 1, Integer::sum);
 
         } else if ("DUEL_WIN".equals(eventType)) {
             duelWins.merge(playerId, 1, Integer::sum);
@@ -118,11 +123,22 @@ public class AnalyticsService {
         return new HashMap<>();
     }
 
+    /**
+     * Mean seconds per solve across all recorded solves.
+     *
+     * <p>This averaged {@code solveTimes.values()} directly, but that map holds a
+     * CUMULATIVE sum per player, not one entry per solve. So the "average solve time"
+     * reported to the {@code sudokupro.solve.time.average} gauge was really the average
+     * lifetime total per player, and it climbed without bound as players kept playing —
+     * a regular who had solved forty puzzles contributed forty puzzles' worth of seconds
+     * as a single sample. Dividing the summed seconds by the summed solve count gives the
+     * per-solve figure the metric name promises.
+     */
     public synchronized double getAverageSolveTime() {
-        return solveTimes.values().stream()
-                .mapToLong(Long::longValue)
-                .average()
-                .orElse(0.0);
+        long totalSolves = solveCounts.values().stream().mapToLong(Integer::longValue).sum();
+        if (totalSolves == 0) return 0.0;
+        long totalSeconds = solveTimes.values().stream().mapToLong(Long::longValue).sum();
+        return (double) totalSeconds / totalSolves;
     }
 
     public synchronized Map<String, Integer> getActivePlayers(LocalDateTime since) {
@@ -140,6 +156,7 @@ public class AnalyticsService {
         cellMistakeHeatmap.clear();
         hintUsage.clear();
         solveTimes.clear();
+        solveCounts.clear();
         lastEventTimestamps.clear();
         duelWins.clear();
         duelLosses.clear();
@@ -158,6 +175,7 @@ public class AnalyticsService {
         trim(cellMistakeHeatmap);
         trim(hintUsage);
         trim(solveTimes);
+        trim(solveCounts);
         trim(lastEventTimestamps);
         trim(duelWins);
         trim(duelLosses);

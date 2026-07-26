@@ -2,7 +2,7 @@ package com.xai.sudokupro.config;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import org.springframework.beans.factory.InitializingBean;
+import org.springframework.beans.factory.SmartInitializingSingleton;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.context.annotation.Profile;
 import org.springframework.stereotype.Component;
@@ -20,9 +20,28 @@ import java.util.Set;
  * guard turns an empty or well-known value into a startup failure instead of a
  * silently insecure deployment.
  */
+/*
+ * Implements SmartInitializingSingleton, and that is load-bearing rather than stylistic.
+ *
+ * SudokuProApplication.optimizeStartup calls app.setLazyInitialization(true), which makes
+ * Boot's LazyInitializationBeanFactoryPostProcessor mark EVERY bean definition lazy — the
+ * only built-in exemption is SmartInitializingSingleton. This class is injected by nothing
+ * and fetched by nothing, so as a plain lazy @Component it was never instantiated and
+ * afterPropertiesSet() never ran. The entire fail-fast credential check has been dead since
+ * the day it was written: a prod deployment started happily on ADMIN_PASSWORD=secret and
+ * DB_PASSWORD=sudoku123 — the exact defaults still shipped in application-dev.properties,
+ * and the exact values this class exists to reject. Verified by booting the real
+ * application under the prod profile with both defaults: no log line, no exception, and
+ * /admin/constants answered 200 to admin:secret. Adding
+ * --spring.main.lazy-initialization=false to the same command made it refuse to start.
+ *
+ * Neither unit nor integration tests could catch it: SecretsGuardTest constructs the class
+ * directly, and @SpringBootTest never goes through SudokuProApplication.start(), so lazy
+ * initialization is never applied in CI.
+ */
 @Component
 @Profile("!dev & !test")
-public class SecretsGuard implements InitializingBean {
+public class SecretsGuard implements SmartInitializingSingleton {
 
     private static final Logger logger = LoggerFactory.getLogger(SecretsGuard.class);
 
@@ -40,8 +59,14 @@ public class SecretsGuard implements InitializingBean {
         this.adminPassword = adminPassword;
     }
 
+    /**
+     * Boot exempts SmartInitializingSingleton from the lazy sweep, so this runs once the
+     * singleton pre-instantiation phase completes — whether or not anything injects this
+     * bean, and regardless of {@code spring.main.lazy-initialization}. That is the whole
+     * point: as a plain lazy {@code @Component} with no injector, the check never ran.
+     */
     @Override
-    public void afterPropertiesSet() {
+    public void afterSingletonsInstantiated() {
         require("DB_PASSWORD (spring.datasource.password)", dbPassword);
         require("ADMIN_PASSWORD (spring.security.user.password)", adminPassword);
         logger.info("SecretsGuard: credential checks passed");

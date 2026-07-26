@@ -75,25 +75,40 @@ public class EventEngine {
         scheduleDripShowdown();
     }
 
-    /** Triggers a single daily-challenge cycle immediately. Used by EventScheduler. */
+    // The three trigger* methods below used to call schedule*(), which does NOT run one
+    // cycle — it installs ANOTHER permanent scheduleAtFixedRate task. EventScheduler calls
+    // them on its own fixed rate, so every tick added a new repeating task on top of the
+    // ones already running: after a day there were ~97 concurrent drip-showdown schedules,
+    // each generating a board, saving it and broadcasting to every client every 15 minutes,
+    // growing linearly forever against a 3-thread pool. They now run exactly one cycle.
+
+    /** Runs a single daily-challenge cycle immediately. Used by EventScheduler. */
     public void triggerDailyChallenge() {
-        scheduleDailyChallenge();
+        runDailyChallenge();
     }
 
-    /** Triggers a single cosmic-duel cycle immediately. Used by EventScheduler. */
+    /** Runs a single cosmic-duel cycle immediately. Used by EventScheduler. */
     public void triggerCosmicDuel() {
-        scheduleCosmicDuel();
+        runCosmicDuel();
     }
 
-    /** Triggers a single drip-showdown cycle immediately. Used by EventScheduler. */
+    /** Runs a single drip-showdown cycle immediately. Used by EventScheduler. */
     public void triggerDripShowdown() {
-        scheduleDripShowdown();
+        runDripShowdown();
     }
 
     // Bug fix: @Retryable on a private method is silently ignored by Spring AOP —
     // the proxy cannot intercept private calls, so retries never fire. Annotation removed.
     private void scheduleDailyChallenge() {
-        scheduler.scheduleAtFixedRate(() -> {
+        // safeRepeat: a task that throws out of scheduleAtFixedRate is CANCELLED for the
+        // life of the JVM and the exception is swallowed into the ScheduledFuture, so one
+        // transient DB or generator failure used to silently retire the whole event stream.
+        scheduler.scheduleAtFixedRate(safeRepeat("daily challenge", this::runDailyChallenge),
+            0, DAILY_CHALLENGE_INTERVAL_HOURS, TimeUnit.HOURS);
+    }
+
+    private void runDailyChallenge() {
+        {
             try {
                 logger.info("Cosmic daily challenge ignites—drip levels rising!");
                 String eventId = "daily-" + LocalDateTime.now().toString();
@@ -103,20 +118,31 @@ public class EventEngine {
                 );
                 activeEvents.put(eventId, new EventDetails(dailyBoard, LocalDateTime.now().plus(DAILY_CHALLENGE_DURATION)));
                 eventParticipants.put(eventId, Collections.synchronizedSet(new HashSet<>()));
-                gameRepository.save(dailyBoard);
+                // Deliberately NOT persisted. These event boards live only in the
+                // activeEvents map and are never read back by game id: nothing calls
+                // findByGameId for them, and endEvent just drops the entry. Saving them
+                // wrote ~242 unreadable rows a day (~88k a year) that nothing ever
+                // deleted, and because they carry solved=false with a recent start_time
+                // they permanently inflated countActiveUnfinishedGames and polluted
+                // findActiveUnfinishedGames / findAbandonedLowHintGames / findTimedOutGames
+                // with games no player owns. See the audit's hardening pass 9.
                 multiplayerBroadcaster.broadcastEvent("daily_challenge", "New Cosmic Daily Challenge", dailyBoard.getGameId());
                 logger.info("Daily challenge {} unleashed—cosmic grid ID: {}", eventId, dailyBoard.getGameId());
                 scheduleEventEnd(eventId, DAILY_CHALLENGE_DURATION);
             } catch (Exception e) {
                 logger.error("Cosmic daily challenge failed to ignite: {}", e.getMessage(), e);
-                throw e; // Trigger retry
             }
-        }, 0, DAILY_CHALLENGE_INTERVAL_HOURS, TimeUnit.HOURS);
+        }
     }
 
     // Bug fix: @Retryable on private methods is ignored by Spring AOP. Annotation removed.
     private void scheduleCosmicDuel() {
-        scheduler.scheduleAtFixedRate(() -> {
+        scheduler.scheduleAtFixedRate(safeRepeat("cosmic duel", this::runCosmicDuel),
+            0, COSMIC_DUEL_INTERVAL_MINUTES, TimeUnit.MINUTES);
+    }
+
+    private void runCosmicDuel() {
+        {
             try {
                 logger.info("Cosmic duel erupts—drip warriors assemble!");
                 String eventId = "duel-" + LocalDateTime.now().toString();
@@ -136,18 +162,29 @@ public class EventEngine {
                     logger.info("Player {} joins cosmic duel {}—drip battle ID: {}", u.getUsername(), eventId, duelBoard.getGameId());
                 });
                 eventParticipants.put(eventId, participants);
-                gameRepository.save(duelBoard);
+                // Deliberately NOT persisted. These event boards live only in the
+                // activeEvents map and are never read back by game id: nothing calls
+                // findByGameId for them, and endEvent just drops the entry. Saving them
+                // wrote ~242 unreadable rows a day (~88k a year) that nothing ever
+                // deleted, and because they carry solved=false with a recent start_time
+                // they permanently inflated countActiveUnfinishedGames and polluted
+                // findActiveUnfinishedGames / findAbandonedLowHintGames / findTimedOutGames
+                // with games no player owns. See the audit's hardening pass 9.
                 scheduleEventEnd(eventId, COSMIC_DUEL_DURATION);
             } catch (Exception e) {
                 logger.error("Cosmic duel failed to erupt: {}", e.getMessage(), e);
-                throw e; // Trigger retry
             }
-        }, 0, COSMIC_DUEL_INTERVAL_MINUTES, TimeUnit.MINUTES);
+        }
     }
 
     // Bug fix: @Retryable on private methods is ignored by Spring AOP. Annotation removed.
     private void scheduleDripShowdown() {
-        scheduler.scheduleAtFixedRate(() -> {
+        scheduler.scheduleAtFixedRate(safeRepeat("drip showdown", this::runDripShowdown),
+            0, DRIP_SHOWDOWN_INTERVAL_MINUTES, TimeUnit.MINUTES);
+    }
+
+    private void runDripShowdown() {
+        {
             try {
                 logger.info("Drip showdown explodes—cosmic chaos unleashed!");
                 String eventId = "showdown-" + LocalDateTime.now().toString();
@@ -157,15 +194,36 @@ public class EventEngine {
                 );
                 activeEvents.put(eventId, new EventDetails(showdownBoard, LocalDateTime.now().plus(DRIP_SHOWDOWN_DURATION)));
                 eventParticipants.put(eventId, Collections.synchronizedSet(new HashSet<>()));
-                gameRepository.save(showdownBoard);
+                // Deliberately NOT persisted. These event boards live only in the
+                // activeEvents map and are never read back by game id: nothing calls
+                // findByGameId for them, and endEvent just drops the entry. Saving them
+                // wrote ~242 unreadable rows a day (~88k a year) that nothing ever
+                // deleted, and because they carry solved=false with a recent start_time
+                // they permanently inflated countActiveUnfinishedGames and polluted
+                // findActiveUnfinishedGames / findAbandonedLowHintGames / findTimedOutGames
+                // with games no player owns. See the audit's hardening pass 9.
                 multiplayerBroadcaster.broadcastEvent("drip_showdown", "Cosmic Drip Showdown Starts", showdownBoard.getGameId());
                 logger.info("Drip showdown {} blasts off—cosmic grid ID: {}", eventId, showdownBoard.getGameId());
                 scheduleEventEnd(eventId, DRIP_SHOWDOWN_DURATION);
             } catch (Exception e) {
                 logger.error("Drip showdown failed to explode: {}", e.getMessage(), e);
-                throw e; // Trigger retry
             }
-        }, 0, DRIP_SHOWDOWN_INTERVAL_MINUTES, TimeUnit.MINUTES);
+        }
+    }
+
+    /**
+     * Wraps a recurring body so a thrown exception can never cancel the schedule.
+     * {@code ScheduledExecutorService.scheduleAtFixedRate} suppresses all subsequent
+     * executions if the task throws, and reports nothing.
+     */
+    private Runnable safeRepeat(String what, Runnable body) {
+        return () -> {
+            try {
+                body.run();
+            } catch (Throwable t) {
+                logger.error("Recurring {} task failed; schedule preserved: {}", what, t.getMessage(), t);
+            }
+        };
     }
 
     private void scheduleEventEnd(String eventId, Duration duration) {

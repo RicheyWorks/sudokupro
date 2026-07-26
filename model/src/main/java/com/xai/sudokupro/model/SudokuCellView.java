@@ -1,5 +1,6 @@
 package com.xai.sudokupro.model;
 
+import com.fasterxml.jackson.annotation.JsonIgnore;
 import com.fasterxml.jackson.annotation.JsonProperty;
 import com.fasterxml.jackson.annotation.JsonPropertyOrder;
 import org.slf4j.Logger;
@@ -13,6 +14,17 @@ import java.time.Instant;
 
 /**
  * An immutable view of a SudokuCell in SudokuPro's cosmic grid.
+ *
+ * <p>Every convenience accessor below is {@code @JsonIgnore}d. Jackson treats a public
+ * no-arg getter as a serialized property, so this record was emitting not just its eleven
+ * declared components but also {@code displayValue}, {@code timestampString},
+ * {@code hintDisplay}, {@code empty}, {@code conflicted}, {@code hasPencilMarks} and — the
+ * worst offender — the entire eight-key {@code toAnalyticsMap()} nested object, FOR EVERY
+ * ONE OF THE 81 CELLS. A single {@code BoardState} weighed 25,729 bytes, more than 3x
+ * Tomcat's default 8 KB WebSocket text buffer, and that payload is pushed to every session
+ * in the game on every sync/undo/redo, on every replica. It also put server-side analytics
+ * shape on the public wire. Keeping these helpers ignored is a wire-format contract: adding
+ * a new public getter here silently re-inflates every board broadcast.
  */
 @JsonPropertyOrder({"value", "isGiven", "lastModified", "moveSource", "pencilMarks", "conflicts", "hintStrength", "strategy", "isEditable", "playerId", "displayColor"})
 public record SudokuCellView(
@@ -79,18 +91,22 @@ public record SudokuCellView(
 
     // ---------------- UTILS ----------------
 
+    @JsonIgnore
     public boolean isEmpty() {
         return value == 0 && !isGiven;
     }
 
+    @JsonIgnore
     public boolean isConflicted() {
         return conflicts != null && !conflicts.isEmpty();
     }
 
+    @JsonIgnore
     public boolean hasPencilMarks() {
         return pencilMarks != null && !pencilMarks.isEmpty();
     }
 
+    @JsonIgnore
     public String getDisplayValue() {
         if (value != 0) return String.valueOf(value);
 
@@ -103,10 +119,12 @@ public record SudokuCellView(
         return ".";
     }
 
+    @JsonIgnore
     public String getTimestampString() {
         return Instant.ofEpochMilli(lastModified).toString();
     }
 
+    @JsonIgnore
     public String getHintDisplay() {
         if (hintStrength == 0) return "";
 
@@ -120,6 +138,7 @@ public record SudokuCellView(
         return strategy != null ? strengthLabel + " (" + strategy + ")" : strengthLabel;
     }
 
+    @JsonIgnore
     public Map<String, Object> toAnalyticsMap() {
         Map<String, Object> analytics = new HashMap<>();
 

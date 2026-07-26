@@ -52,6 +52,21 @@ public class SeasonService {
         return now.getYear() + "-Q" + ((now.getMonthValue() - 1) / 3 + 1);
     }
 
+    /**
+     * The season that just ENDED — the one whose ladder a rollover scores.
+     *
+     * <p>Rollover used to label the podium with {@link #seasonId()}, the season now
+     * STARTING, while scoring the outgoing ladder. So the Q3 winners were crowned
+     * "SeasonChampion-2026-Q4": nobody ever held a badge for the season they actually won,
+     * and the real Q4 champion could never receive that badge because the key was already
+     * taken.
+     */
+    public String previousSeasonId() {
+        LocalDate firstDayOfThisSeason = seasonEnds().minusMonths(3);
+        LocalDate inPreviousSeason = firstDayOfThisSeason.minusDays(1);
+        return inPreviousSeason.getYear() + "-Q" + ((inPreviousSeason.getMonthValue() - 1) / 3 + 1);
+    }
+
     /** First day of the next season (when the current one ends). */
     public LocalDate seasonEnds() {
         LocalDate now = LocalDate.now(clock);
@@ -74,29 +89,36 @@ public class SeasonService {
      * current one so a fresh install doesn't "roll over" nothing.
      */
     void rolloverIfDue() {
-        String season = seasonId();
-        if (!claimRollover(season)) return; // already handled (or another replica won)
+        String startingSeason = seasonId();
+        if (!claimRollover(startingSeason)) return; // already handled (or another replica won)
+
+        // The ladder being scored is LAST season's result, so the badge must carry last
+        // season's id — not the one just starting.
+        String endedSeason = previousSeasonId();
 
         // If this is the very first season this install has seen, there is no
         // previous season to score — claiming the marker is all that's needed.
-        List<User> ladder = userRepository.findDuelLadder(PageRequest.of(0, 100));
-        if (ladder.isEmpty()) return;
+        List<User> podiumPlaces = userRepository.findDuelLadder(PageRequest.of(0, 3));
+        if (podiumPlaces.isEmpty()) return;
 
-        int podium = 0;
-        for (User user : ladder) {
-            if (podium < 3) {
-                Map<String, Boolean> achievements = user.getAchievements();
-                achievements.put("SeasonChampion-" + season, true);
-                user.setAchievements(achievements);
-                notify(user.getUsername(), "New season " + season + " — you finished top-"
-                    + (podium + 1) + " on the duel ladder. Champion badge unlocked!");
-                podium++;
-            }
-            user.setDuelRating((user.getDuelRating() + 1000) / 2); // soft reset
+        int place = 0;
+        for (User user : podiumPlaces) {
+            Map<String, Boolean> achievements = user.getAchievements();
+            achievements.put("SeasonChampion-" + endedSeason, true);
+            user.setAchievements(achievements);
             userRepository.save(user);
+            notify(user.getUsername(), "Season " + endedSeason + " has ended — you finished top-"
+                + (++place) + " on the duel ladder. Champion badge unlocked!");
         }
-        logger.info("Season {} rollover complete: {} rated players reset, podium of {} crowned",
-            season, ladder.size(), Math.min(3, ladder.size()));
+
+        // Soft-reset EVERY rated player, in one statement. This used to iterate the same
+        // top-100 page as the podium query, so from player 101 down nobody was reset: the
+        // un-compressed tail kept its rating and, season after season, permanently
+        // outranked the compressed head — inverting the ladder the reset exists to refresh.
+        int reset = userRepository.softResetDuelRatings();
+
+        logger.info("Season {} rollover complete: {} rated players reset, podium of {} crowned for {}",
+            startingSeason, reset, podiumPlaces.size(), endedSeason);
     }
 
     private boolean claimRollover(String season) {

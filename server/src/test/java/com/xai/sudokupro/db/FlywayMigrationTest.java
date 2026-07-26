@@ -65,6 +65,25 @@ class FlywayMigrationTest {
             assertTrue(migrationApplied(c, "3"), "V3 (cells_json) must be recorded");
             assertEquals("integer", columnType(c, "users", "duel_rating"), "V5 adds duel_rating");
             assertEquals("character varying", columnType(c, "users", "password_hash"), "V6 adds password_hash");
+            assertEquals("boolean", columnType(c, "sudoku_boards", "rewards_granted"),
+                "V7 adds rewards_granted (idempotent completion payouts)");
+            assertTrue(migrationApplied(c, "8"), "V8 (unique game_id) must be recorded");
+
+            // V8's whole point: a second row with the same game_id must be impossible.
+            try (Statement st = c.createStatement()) {
+                st.execute("INSERT INTO sudoku_boards (game_id, player_id, chaos_mode, cosmic_drip_level, "
+                    + "cosmic_events, cosmic_mode, diagonal_rules, difficulty, hint_count, infinite_mode, "
+                    + "lives, max_lives, mirror_mode, move_count, revives, score, size, solved, tens_rule, "
+                    + "time_attack, used_undo, solve_time_seconds, time_limit_seconds) VALUES "
+                    + "('dup-guard','p1',false,0,0,false,false,1,0,false,3,3,false,0,0,0,9,false,false,false,false,0,0)");
+                assertThrows(java.sql.SQLException.class, () ->
+                    st.execute("INSERT INTO sudoku_boards (game_id, player_id, chaos_mode, cosmic_drip_level, "
+                        + "cosmic_events, cosmic_mode, diagonal_rules, difficulty, hint_count, infinite_mode, "
+                        + "lives, max_lives, mirror_mode, move_count, revives, score, size, solved, tens_rule, "
+                        + "time_attack, used_undo, solve_time_seconds, time_limit_seconds) VALUES "
+                        + "('dup-guard','p2',false,0,0,false,false,1,0,false,3,3,false,0,0,0,9,false,false,false,false,0,0)"),
+                    "a duplicate game_id must be rejected — two rows permanently break findByGameId");
+            }
             assertTrue(migrationApplied(c, "4"), "V4 (users.id identity) must be recorded");
             // users.id is generated: inserting without an id must work
             try (Statement st = c.createStatement()) {

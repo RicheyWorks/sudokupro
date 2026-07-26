@@ -67,7 +67,7 @@ public interface RetentionStatsRepository extends JpaRepository<User, Long> {
     @Transactional(readOnly = true)
     @Query(value = "SELECT u.* FROM users u " +
            "WHERE u.last_login > :since " +
-           "AND EXISTS (SELECT 1 FROM match_history mh WHERE mh.user_id = u.id AND mh.timestamp > :since) " +
+           "AND EXISTS (SELECT 1 FROM user_match_history mh WHERE mh.user_id = u.id AND mh.match_timestamp > :since) " +
            "ORDER BY u.hype_meter DESC, u.cosmic_drip DESC",
            nativeQuery = true)
     @Cacheable(value = "activeMatchPlayers", key = "#since + '-' + #pageable.pageNumber")

@@ -213,13 +213,33 @@ public class WeeklyTournamentService implements GameEndListener {
         }
     }
 
+    /**
+     * Every player's per-round times for {@code week}.
+     *
+     * <p>This used {@code redis.keys(pattern)}. {@code KEYS} is O(total keys in the
+     * database) and <b>blocks single-threaded Redis for the whole scan</b> — the pattern
+     * narrows the result, not the work. This is the same Redis instance that holds every
+     * cached board, every {@link com.xai.sudokupro.service.GameLockManager} lock, the
+     * player state store and the pub/sub relay, and {@code acquireRedis} gives up after
+     * three seconds with "busy on another server instance". So an uncached endpoint any
+     * authenticated user can poll — {@code GET /api/tournament/standings} — converted
+     * directly into failed moves for unrelated players across the whole server, and, in
+     * combination with the unguarded cache read in {@code GameService}, into 500s.
+     *
+     * <p>{@code SCAN} does the same work in bounded increments without blocking, and the
+     * {@code HGETALL}s are unchanged (still one per participant, which is fine — that N
+     * is the number of players in the week, not the size of the keyspace).
+     */
     private Map<String, Map<String, Long>> allTimes(String week) {
+        String prefix = TIMES_KEY + week + ":";
         try {
-            Set<String> keys = redis.keys(TIMES_KEY + week + ":*");
             Map<String, Map<String, Long>> out = new HashMap<>();
-            if (keys != null) {
-                for (String key : keys) {
-                    String player = key.substring((TIMES_KEY + week + ":").length());
+            var scanOptions = org.springframework.data.redis.core.ScanOptions.scanOptions()
+                .match(prefix + "*").count(256).build();
+            try (var cursor = redis.scan(scanOptions)) {
+                while (cursor.hasNext()) {
+                    String key = cursor.next();
+                    String player = key.substring(prefix.length());
                     Map<String, Long> t = new HashMap<>();
                     redis.opsForHash().entries(key)
                         .forEach((k, v) -> t.put(k.toString(), Long.parseLong(v.toString())));
@@ -230,9 +250,9 @@ public class WeeklyTournamentService implements GameEndListener {
         } catch (Exception e) {
             degraded(e);
             Map<String, Map<String, Long>> out = new HashMap<>();
-            String prefix = week + ":";
+            String localPrefix = week + ":";
             localTimes.forEach((k, v) -> {
-                if (k.startsWith(prefix)) out.put(k.substring(prefix.length()), Map.copyOf(v));
+                if (k.startsWith(localPrefix)) out.put(k.substring(localPrefix.length()), Map.copyOf(v));
             });
             return out;
         }

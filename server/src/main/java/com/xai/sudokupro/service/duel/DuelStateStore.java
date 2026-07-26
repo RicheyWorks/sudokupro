@@ -79,6 +79,24 @@ public class DuelStateStore {
         return json == null ? null : fromJson(json);
     }
 
+    /**
+     * True if these two players are currently in an ACTIVE duel with each other.
+     *
+     * <p>Added for the FREEZE power-up, which previously accepted any username and locked
+     * that player's input for ten seconds — the effect is only meaningful against a duel
+     * opponent, and letting it reach arbitrary players made it a griefing tool.
+     */
+    public boolean hasActiveDuelBetween(String a, String b) {
+        if (a == null || b == null || a.equals(b)) return false;
+        for (DuelRecord d : findForPlayer(a)) {
+            if (!"ACTIVE".equals(d.status())) continue;
+            boolean pairMatches = (a.equals(d.challenger()) && b.equals(d.opponent()))
+                               || (b.equals(d.challenger()) && a.equals(d.opponent()));
+            if (pairMatches) return true;
+        }
+        return false;
+    }
+
     public List<DuelRecord> findForPlayer(String playerId) {
         Set<String> ids;
         try {

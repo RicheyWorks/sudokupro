@@ -38,6 +38,13 @@ class FriendServiceTest {
         UserRepository repo = mock(UserRepository.class);
         lenient().when(repo.findByUsername(anyString()))
             .thenAnswer(inv -> Optional.ofNullable(byName.get(inv.<String>getArgument(0))));
+        lenient().when(repo.saveAndFlush(any(User.class))).thenAnswer(inv -> {
+            User u = inv.getArgument(0);
+            if (u.getId() == null) u.setId(ids.getAndIncrement());
+            byName.put(u.getUsername(), u);
+            byId.put(u.getId(), u);
+            return u;
+        });
         lenient().when(repo.save(any(User.class))).thenAnswer(inv -> {
             User u = inv.getArgument(0);
             if (u.getId() == null) u.setId(ids.getAndIncrement());
@@ -59,8 +66,17 @@ class FriendServiceTest {
             sessions, notificationService, downRedis);
     }
 
+    /** request() now requires a real target account, so seed one. */
+    private void givenPlayerExists(String name) {
+        User u = new User(null, name);
+        u.setId(ids.getAndIncrement());
+        byName.put(name, u);
+        byId.put(u.getId(), u);
+    }
+
     @Test
     void requestAcceptFormsAMutualFriendshipWithPresence() {
+        givenPlayerExists("ada");
         service.request("richmond", "ada");
         assertTrue(service.pendingFor("ada").contains("richmond"));
 
@@ -82,6 +98,20 @@ class FriendServiceTest {
         assertThrows(IllegalArgumentException.class, () -> service.accept("ada", "stranger"));
     }
 
+    /**
+     * Regression: a friend request to a name that does not exist returned HTTP 200 and
+     * wrote a pending entry (with a 14-day Redis key). Found by fuzzing — a request to an
+     * emoji username succeeded. That is unbounded attacker-controlled key growth, and it
+     * let a caller populate arbitrary names.
+     */
+    @Test
+    void requestToANonexistentPlayerIsRejected() {
+        assertThrows(IllegalArgumentException.class,
+            () -> service.request("richmond", "ghost-who-never-registered"));
+        assertTrue(service.pendingFor("ghost-who-never-registered").isEmpty(),
+            "a rejected request must not leave state behind");
+    }
+
     @Test
     void selfFriendshipIsRejected() {
         assertThrows(IllegalArgumentException.class, () -> service.request("richmond", "richmond"));
@@ -97,6 +127,7 @@ class FriendServiceTest {
 
     @Test
     void removeSeversBothDirections() {
+        givenPlayerExists("ada");
         service.request("richmond", "ada");
         service.accept("ada", "richmond");
 

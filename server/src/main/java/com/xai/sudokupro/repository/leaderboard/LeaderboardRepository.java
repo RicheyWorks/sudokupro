@@ -26,16 +26,29 @@ import java.util.Map;
 @NoRepositoryBean
 public interface LeaderboardRepository extends JpaRepository<User, Long> {
 
+    // Every ordering below carries `u.id ASC` as a final tie-break. Without it, rows with
+    // an equal sort key come back in whatever order Postgres produces, which is not stable
+    // between executions — so a paginated leaderboard could show the same player on two
+    // pages and skip another entirely, and consecutive refreshes reshuffled tied ranks.
+    //
+    // The @Cacheable keys are also wrong (they use only pageNumber, so a size-10 and a
+    // size-100 read of page 0 collide), but they are inert: there is no @EnableCaching
+    // anywhere in the project, so no CacheManager is created and none of these fire. Left
+    // in place rather than silently changing behaviour — see the audit's "still open" list.
+
+    // NOTE: @EntityGraph + Pageable makes Hibernate fetch the whole result set and
+    // paginate it in memory (it warns "firstResult/maxResults specified with collection
+    // fetch"). Correct today, wrong shape at scale; tracked as a known-open item.
     @EntityGraph(attributePaths = {"matchHistory"})
-    @Query("SELECT u FROM User u ORDER BY u.points DESC")
+    @Query("SELECT u FROM User u ORDER BY u.points DESC, u.id ASC")
     @Cacheable(value = "topUsersByPoints", key = "#pageable.pageNumber")
     List<User> findTopUsersByPoints(Pageable pageable);
 
-    @Query("SELECT u FROM User u ORDER BY u.duelWins DESC")
+    @Query("SELECT u FROM User u ORDER BY u.duelWins DESC, u.id ASC")
     @Cacheable(value = "topDuelists", key = "#pageable.pageNumber")
     List<User> findTopDuelists(Pageable pageable);
 
-    @Query("SELECT u FROM User u ORDER BY u.level DESC, u.points DESC")
+    @Query("SELECT u FROM User u ORDER BY u.level DESC, u.points DESC, u.id ASC")
     @Cacheable(value = "topUsersByLevel", key = "#pageable.pageNumber")
     List<User> findTopUsersByLevel(Pageable pageable);
 

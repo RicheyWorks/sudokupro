@@ -19,3 +19,6 @@ ECHO is on.
 # Logs
 *.log
 logs/
+
+# Claude Code local session config
+.claude/

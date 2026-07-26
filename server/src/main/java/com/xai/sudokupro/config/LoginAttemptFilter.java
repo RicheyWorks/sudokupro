@@ -42,7 +42,11 @@ public class LoginAttemptFilter extends OncePerRequestFilter {
         String auth = request.getHeader("Authorization");
         if (auth != null && auth.regionMatches(true, 0, "Basic ", 0, 6)) {
             String remoteAddress = request.getRemoteAddr();
-            if (limiter.isBlocked(remoteAddress)) {
+            // Scope the check to the account being attempted, matching how the counter is
+            // now recorded. Keyed on the address alone, one successful login to any
+            // account cleared the counter for every account at that address.
+            String username = basicAuthUsername(auth);
+            if (limiter.isBlocked(remoteAddress, username)) {
                 logger.warn("Rejecting login attempt from {}: too many recent failures", remoteAddress);
                 response.setStatus(429);
                 response.setContentType("application/json");
@@ -52,5 +56,17 @@ public class LoginAttemptFilter extends OncePerRequestFilter {
             }
         }
         chain.doFilter(request, response);
+    }
+
+    /** The username half of a Basic credential, or null if it cannot be read. */
+    private static String basicAuthUsername(String header) {
+        try {
+            String decoded = new String(java.util.Base64.getDecoder().decode(header.substring(6).trim()),
+                java.nio.charset.StandardCharsets.UTF_8);
+            int colon = decoded.indexOf(':');
+            return colon < 0 ? decoded : decoded.substring(0, colon);
+        } catch (Exception e) {
+            return null;   // malformed header: authentication will reject it anyway
+        }
     }
 }

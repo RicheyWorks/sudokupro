@@ -60,7 +60,12 @@ public class SudokuGameController {
     })
     @PostMapping("/new")
     public ResponseEntity<Object> createGame(
-            @RequestParam @Min(1) @Max(4) int difficulty,
+            // 1..5, matching GameService.validateDifficulty, SudokuBoard.generateBoard
+            // and Constants. The controller capped at 4, so the platform's hardest
+            // difficulty was unreachable through the API — and asking for it produced a
+            // ConstraintViolationException that escaped as a 500 with no useful body,
+            // rather than a 400 explaining the range. Found by the live engine.
+            @RequestParam @Min(1) @Max(5) int difficulty,
             @RequestParam(defaultValue = "false") boolean chaos,
             @RequestParam(defaultValue = "false") boolean mirror) {
         try {
@@ -89,7 +94,12 @@ public class SudokuGameController {
     @GetMapping("/{gameId}")
     public ResponseEntity<Object> getGame(@PathVariable String gameId) {
         try {
-            return ResponseEntity.ok(BoardState.from(gameService.getGame(gameId)));
+            return ResponseEntity.ok(BoardState.from(
+                gameService.getGameForReader(gameId, authService.getCurrentPlayerId())));
+        } catch (SecurityException e) {
+            return ResponseEntity.status(HttpStatus.FORBIDDEN)
+                .contentType(MediaType.APPLICATION_PROBLEM_JSON)
+                .body(buildProblem(GAME_CREATION_ERROR, "Forbidden", e.getMessage()));
         } catch (IllegalArgumentException e) {
             return ResponseEntity.status(HttpStatus.NOT_FOUND)
                 .contentType(MediaType.APPLICATION_PROBLEM_JSON)
@@ -101,8 +111,13 @@ public class SudokuGameController {
     @PostMapping("/{gameId}/solve")
     public ResponseEntity<Object> solve(@PathVariable String gameId) {
         try {
-            gameService.solveSudoku(gameId);
+            // Owner-only: without this, one request could auto-solve any player's duel,
+            // daily or tournament board — or a shared daily/weekly template, wrecking the
+            // puzzle for everyone — and the response handed back the full solution.
+            gameService.solveSudoku(gameId, authService.getCurrentPlayerId());
             return ResponseEntity.ok(BoardState.from(gameService.getGame(gameId)));
+        } catch (SecurityException e) {
+            return problemResponse(HttpStatus.FORBIDDEN, "Not Your Game", e.getMessage());
         } catch (IllegalArgumentException e) {
             return ResponseEntity.status(HttpStatus.NOT_FOUND)
                 .contentType(MediaType.APPLICATION_PROBLEM_JSON)
@@ -203,7 +218,10 @@ public class SudokuGameController {
     @GetMapping("/{gameId}/share")
     public ResponseEntity<Object> share(@PathVariable String gameId) {
         try {
-            return ResponseEntity.ok(Map.of("code", gameService.exportShareCode(gameId)));
+            return ResponseEntity.ok(Map.of("code",
+                gameService.exportShareCode(gameId, authService.getCurrentPlayerId())));
+        } catch (SecurityException e) {
+            return problemResponse(HttpStatus.FORBIDDEN, "Forbidden", e.getMessage());
         } catch (IllegalArgumentException e) {
             return problemResponse(HttpStatus.NOT_FOUND, "Unknown Game", e.getMessage());
         }
@@ -235,7 +253,9 @@ public class SudokuGameController {
         try {
             String hint;
             if (gameId != null && !gameId.isBlank()) {
-                hint = gameService.getHint(gameId);
+                // Pass the caller so the charge lands on them and a non-owner is refused;
+                // without this a spectator could drain the board owner's wallet.
+                hint = gameService.getHint(gameId, authService.getCurrentPlayerId());
             } else {
                 String playerId = authService.getCurrentPlayerId();
                 hint = gameService.getHintForPlayer(playerId);
@@ -252,6 +272,17 @@ public class SudokuGameController {
                 .body(buildProblem(HINT_FAILURE_ERROR, "Not Enough Gems",
                     "Hints cost " + e.cost() + " gems; you have " + e.balance()
                     + ". Solve puzzles to earn more."));
+        } catch (SecurityException e) {
+            // Asking for a hint on somebody else's board (would have charged them).
+            return problemResponse(HttpStatus.FORBIDDEN, "Not Your Game", e.getMessage());
+        } catch (IllegalArgumentException e) {
+            // getGame throws this for an unknown id. It used to fall through to the
+            // generic handler below and return 500 with the raw internal message, while
+            // every sibling endpoint (/{id}, /solve, /save, /resume) mapped it to 404.
+            return problemResponse(HttpStatus.NOT_FOUND, "Unknown Game", e.getMessage());
+        } catch (IllegalStateException e) {
+            // GameLockManager: the game is held on another replica. 409, not 500.
+            return problemResponse(HttpStatus.CONFLICT, "Game Busy", e.getMessage());
         } catch (Exception e) {
             logger.error("Failed to retrieve hint: {}", e.getMessage());
             return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
@@ -262,6 +293,25 @@ public class SudokuGameController {
                     "Unable to fetch hint: " + e.getMessage()
                 ));
         }
+    }
+
+    /**
+     * Parameter-validation failures are the caller's fault, not the server's.
+     *
+     * <p>{@code @Min}/{@code @Max} on a controller parameter raise
+     * {@code ConstraintViolationException}, which has no default Spring MVC mapping — so
+     * every out-of-range parameter surfaced as a 500 with an empty problem body and a
+     * stack trace in the log. A client cannot tell "you asked for something impossible"
+     * from "the server is broken", and a 500 is what monitoring pages on.
+     */
+    @ExceptionHandler(jakarta.validation.ConstraintViolationException.class)
+    public ResponseEntity<Object> handleConstraintViolation(
+            jakarta.validation.ConstraintViolationException e) {
+        String detail = e.getConstraintViolations().stream()
+            .map(v -> v.getPropertyPath() + " " + v.getMessage())
+            .reduce((a2, b2) -> a2 + "; " + b2)
+            .orElse("invalid request parameter");
+        return problemResponse(HttpStatus.BAD_REQUEST, "Invalid Parameter", detail);
     }
 
     private Map<String, String> buildProblem(String type, String title, String detail) {

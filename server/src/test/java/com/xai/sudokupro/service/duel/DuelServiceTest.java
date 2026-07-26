@@ -48,6 +48,16 @@ class DuelServiceTest {
             users.put(u.getUsername(), u);
             return u;
         });
+        lenient().when(userRepository.saveAndFlush(any(User.class))).thenAnswer(inv -> {
+            User u = inv.getArgument(0);
+            users.put(u.getUsername(), u);
+            return u;
+        });
+
+        // challenge() now rejects an opponent who does not exist — the same guard
+        // FriendService.request already carried. Both duellists must be real accounts.
+        users.put("richmond", new User(null, "richmond"));
+        users.put("rival", new User(null, "rival"));
 
         StringRedisTemplate downRedis = mock(StringRedisTemplate.class,
             inv -> { throw new RedisConnectionFailureException("down (test)"); });

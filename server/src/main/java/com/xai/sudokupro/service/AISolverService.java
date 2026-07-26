@@ -30,6 +30,10 @@ public class AISolverService {
     private static final int HINT_CACHE_SIZE  = 10;
     private static final int COSMIC_THRESHOLD = 3;
     private static final int COSMIC_BOOST     = 2;
+    /** Ceiling on the hotspot bonus, so it can never outweigh the naked-single preference. */
+    private static final int MAX_COSMIC_BOOST = 20;
+    /** Cap on distinct coordinates tracked, so the global hotspot map cannot grow forever. */
+    private static final int MAX_HOTSPOTS     = 512;
 
     private final SecureRandomGenerator chaosRand;
 
@@ -98,6 +102,9 @@ public class AISolverService {
                 board.incrementHintCount();
                 if (h.value() instanceof Integer) {
                     cosmicHotspots.merge(h.row() + "," + h.col(), COSMIC_BOOST, Integer::sum);
+                    // 81 coordinates on a 9x9, but the map is keyed by string and shared
+                    // process-wide; bound it rather than trust that invariant forever.
+                    if (cosmicHotspots.size() > MAX_HOTSPOTS) cosmicHotspots.clear();
                 }
                 hintStreak++;  // track consecutive hint usage for scoring
                 return formatHint(h);
@@ -156,27 +163,120 @@ public class AISolverService {
 
     // ── Private helpers ────────────────────────────────────────────────────────
 
+    /**
+     * Every empty cell, hinted with its <em>true</em> value.
+     *
+     * <p>This used to emit {@code candidates.get(0)} — the smallest locally legal digit —
+     * for any cell that was not a naked single, and label it "Candidate". That is a guess,
+     * not a deduction, and it was frequently wrong: over 25 boards with no naked single
+     * available, <b>16 of the hints named a digit that was not the answer</b>. Players paid
+     * 5 gems each time. Worse, {@code PowerUpService}'s REVEAL_CELL runs through
+     * {@link #getNextLogicalMoveAsEnhancedMove} and <em>writes the value into the board</em>
+     * with {@code applyExternalMove}; the wrong digit is locally legal so the board accepts
+     * it, and measured across difficulty-4 and -5 boards it rendered the puzzle
+     * <b>unsolvable</b> in every case where it fired. The player spent an item to have their
+     * game silently destroyed, with the hint counter incremented for the privilege.
+     *
+     * <p>Solving the grid once up front and reading the answer out of the solution costs one
+     * backtrack per hint request and makes every hint correct by construction. The
+     * naked-single label is preserved, because it still expresses "you could have deduced
+     * this one" and the scorer prefers those.
+     *
+     * <p>An unsolvable board yields no hints at all, rather than a confident guess on a
+     * position that has no answer — {@code getHint} charges only for a non-empty hint, so
+     * the player is no longer billed for nonsense.
+     */
     private List<Hint> collectAllHints(SudokuBoard board, SudokuCell[][] snapshot) {
         List<Hint> hints = new ArrayList<>();
         int size = snapshot.length;
+
+        int[][] solution = solveToGrid(snapshot);
+        if (solution == null) {
+            logger.debug("No hints: board {} has no completion from its current state",
+                board.getGameId());
+            return hints;
+        }
+
         for (int r = 0; r < size; r++) {
             for (int c = 0; c < size; c++) {
-                if (snapshot[r][c].getValue() == 0) {
-                    List<Integer> candidates = new ArrayList<>();
-                    for (int v = 1; v <= 9; v++) {
-                        if (isValidTempMove(snapshot, r, c, v)) candidates.add(v);
-                    }
-                    if (candidates.size() == 1) {
-                        // Naked single: only one value can go here
-                        hints.add(new Hint(r, c, candidates.get(0), "Naked single", SudokuCell.Strategy.NAKED_SINGLE));
-                    } else if (!candidates.isEmpty()) {
-                        // Add as a candidate hint with the first possible value
-                        hints.add(new Hint(r, c, candidates.get(0), "Candidate", SudokuCell.Strategy.UNKNOWN));
-                    }
+                if (snapshot[r][c].getValue() != 0) continue;
+                int truth = solution[r][c];
+                int candidates = 0;
+                for (int v = 1; v <= 9; v++) {
+                    if (isValidTempMove(snapshot, r, c, v)) candidates++;
+                }
+                if (candidates == 1) {
+                    hints.add(new Hint(r, c, truth, "Naked single", SudokuCell.Strategy.NAKED_SINGLE));
+                } else {
+                    hints.add(new Hint(r, c, truth, "Candidate", SudokuCell.Strategy.UNKNOWN));
                 }
             }
         }
         return hints;
+    }
+
+    /**
+     * Completes a copy of {@code snapshot} by backtracking; null if it cannot be completed.
+     *
+     * <p>The pre-check matters. {@code fillGrid} only validates the digits it places, so a
+     * grid whose EXISTING values already conflict — three 5s in one row, say — can still be
+     * "completed" by filling the remaining cells with digits that happen not to clash, and
+     * the solver would then hand out hints for a position that has no answer. Normal play
+     * cannot reach such a state ({@code applyExternalMove} validates every move), but a
+     * corrupt cache entry, a hand-edited row or a future bulk-import path could, and
+     * confidently charging a player for a hint on an impossible board is the worst way to
+     * find out.
+     */
+    private int[][] solveToGrid(SudokuCell[][] snapshot) {
+        int size = snapshot.length;
+        int[][] grid = new int[size][size];
+        for (int r = 0; r < size; r++)
+            for (int c = 0; c < size; c++)
+                grid[r][c] = snapshot[r][c].getValue();
+        if (!isConsistent(grid)) return null;
+        return fillGrid(grid, 0) ? grid : null;
+    }
+
+    /** True when no filled cell duplicates another in its row, column or box. */
+    private static boolean isConsistent(int[][] g) {
+        int size = g.length;
+        for (int r = 0; r < size; r++) {
+            for (int c = 0; c < size; c++) {
+                int v = g[r][c];
+                if (v == 0) continue;
+                g[r][c] = 0;                       // ignore the cell itself
+                boolean ok = legalInGrid(g, r, c, v);
+                g[r][c] = v;
+                if (!ok) return false;
+            }
+        }
+        return true;
+    }
+
+    private boolean fillGrid(int[][] g, int idx) {
+        int size = g.length;
+        if (idx == size * size) return true;
+        int r = idx / size, c = idx % size;
+        if (g[r][c] != 0) return fillGrid(g, idx + 1);
+        for (int v = 1; v <= 9; v++) {
+            if (!legalInGrid(g, r, c, v)) continue;
+            g[r][c] = v;
+            if (fillGrid(g, idx + 1)) return true;
+            g[r][c] = 0;
+        }
+        return false;
+    }
+
+    private static boolean legalInGrid(int[][] g, int row, int col, int v) {
+        int size = g.length;
+        for (int i = 0; i < size; i++) {
+            if (g[row][i] == v || g[i][col] == v) return false;
+        }
+        int br = row - row % 3, bc = col - col % 3;
+        for (int i = 0; i < 3; i++)
+            for (int j = 0; j < 3; j++)
+                if (g[br + i][bc + j] == v) return false;
+        return true;
     }
 
     private boolean backtrack(SudokuCell[][] snapshot, int row, int col, SudokuBoard board) {
@@ -218,14 +318,32 @@ public class AISolverService {
         return true;
     }
 
+    /**
+     * Ranks candidate hints. A naked single always outranks a non-deducible cell.
+     *
+     * <p>The cosmic boost is now capped. {@code cosmicHotspots} is keyed by coordinate
+     * only — no game id, no player — so it is a single global map shared by every board in
+     * the JVM, and every hint issued added to it while only {@code solveSudoku} decayed it.
+     * With the boost uncapped it grew without bound, and after roughly 23 hints ever taken
+     * at a coordinate the +2-per-hit bonus overtook the 90-point gap between a naked single
+     * and a mere candidate. Measured with one long-lived solver and a fresh board per
+     * request: correct hints only up to request 40, then a steadily rising share of hints
+     * on cells that could not be deduced — hint quality degrading purely as a function of
+     * server uptime, resetting only on restart.
+     *
+     * <p>Capping keeps the boost as the tie-breaker it was meant to be. (Since the hints
+     * themselves are now always correct, the failure mode is no longer a wrong answer —
+     * but a hint you could not have deduced is still a worse hint.)
+     */
     private int scoreHint(Hint h) {
         int base = switch (h.strategy()) {
             case NAKED_SINGLE -> 100;
             default           -> 10;
         };
-        int cosmicBoost = cosmicHotspots.getOrDefault(h.row() + "," + h.col(), 0);
+        int cosmicBoost = Math.min(MAX_COSMIC_BOOST,
+            cosmicHotspots.getOrDefault(h.row() + "," + h.col(), 0) * COSMIC_BOOST);
         boolean recentlyUsed = hintFeedback.getOrDefault(hintKey(h), Boolean.FALSE);
-        return base + cosmicBoost * COSMIC_BOOST - (recentlyUsed ? 20 : 0);
+        return base + cosmicBoost - (recentlyUsed ? 20 : 0);
     }
 
     private String hintKey(Hint h) {

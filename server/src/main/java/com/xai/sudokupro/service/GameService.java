@@ -43,6 +43,13 @@ public class GameService {
     // cosmic points, and input locks live in PlayerStateStore; per-game mutual
     // exclusion (across replicas) in GameLockManager. (Phase 5 / AUDIT P1-7)
     private final Map<String, SudokuBoard> activeGames = new ConcurrentHashMap<>();
+    // Last time each cached board was created or read. ConcurrentHashMap has no ordering,
+    // so trimActiveGames() used to evict an arbitrary (hash-order) entry while calling it
+    // "oldest" — it could throw out the game someone is actively playing and keep a stale
+    // one. This gives eviction a real LRU signal.
+    private final Map<String, Long> lastAccess = new ConcurrentHashMap<>();
+    // Games this pod has actually WRITTEN. Shutdown flushes only these — see shutdown().
+    private final Set<String> locallyMutated = ConcurrentHashMap.newKeySet();
     private final PlayerStateStore playerState;
     private final GameLockManager  gameLocks;
     private final Object           creationLock = new Object();
@@ -126,6 +133,7 @@ public class GameService {
         // Register and trim under a narrow creation lock so MAX_ACTIVE_GAMES is enforced atomically.
         synchronized (creationLock) {
             activeGames.put(gameId, board);
+            touch(gameId);
             trimActiveGames();
         }
         saveToRedis(gameId, board);
@@ -147,6 +155,7 @@ public class GameService {
         validateGameId(gameId);
         synchronized (creationLock) {
             activeGames.put(gameId, board);
+            touch(gameId);
             trimActiveGames();
         }
         saveToRedis(gameId, board);
@@ -165,7 +174,7 @@ public class GameService {
         try (var lock = gameLocks.lock(gameId)) {
             SudokuBoard board = activeGames.get(gameId);
             if (board == null) {
-                board = redisTemplate.opsForValue().get(redisKey(gameId));
+                board = readFromRedis(gameId);
                 if (board == null) {
                     board = gameRepository.findByGameId(gameId);
                     if (board == null) {
@@ -174,7 +183,14 @@ public class GameService {
                 }
                 activeGames.put(gameId, board);
                 saveToRedis(gameId, board);
+                // The READ path populates the cache too, and used to do so without any
+                // cap: only createNewGame/adoptGame trimmed. Abandoned games are never
+                // evicted either, so a pod that merely read boards grew activeGames (and
+                // GameLockManager's per-game monitors alongside it) until it ran out of
+                // memory.
+                trimActiveGames();
             }
+            touch(gameId);
             return board;
         }
     }
@@ -200,10 +216,31 @@ public class GameService {
             .orElse(null);
     }
 
+    /** Hint for a board the caller owns. Prefer {@link #getHint(String, String)}. */
     public String getHint(String gameId) {
+        return getHint(gameId, null);
+    }
+
+    /**
+     * Hint for {@code gameId}, charged to {@code requesterId}.
+     *
+     * <p>The requester must own the board. Previously this charged
+     * {@code board.getPlayerId()} with no caller check, so passing someone else's active
+     * gameId drained THEIR wallet 5 gems per call and inflated their hintCount (costing
+     * them the clean-solve bonus), while the attacker got the hint for free. Verified
+     * live: attacker's balance unchanged, victim's went 15 -> 10.
+     *
+     * @throws SecurityException if the requester does not own the board (mapped to 403)
+     */
+    public String getHint(String gameId, String requesterId) {
         validateGameId(gameId);
         try (var lock = gameLocks.lock(gameId)) {
             SudokuBoard board = getGame(gameId);
+            if (requesterId != null && board.getPlayerId() != null
+                    && !requesterId.equals(board.getPlayerId())) {
+                throw new SecurityException(
+                    "Game " + gameId + " belongs to " + board.getPlayerId() + " — hints are for its owner");
+            }
             String hint = aiSolverService.getNextLogicalMove(board);
             // Hint economy: charge AFTER computing but BEFORE revealing — a
             // throw here (InsufficientGemsException) means the player pays
@@ -213,6 +250,18 @@ public class GameService {
             }
             analyticsService.recordEvent(new GameEvent(GameEvent.EventType.HINT, board.getPlayerId(),
                 Map.of("hint", hint, "gameId", gameId)));
+            // Persist the hint. This was the ONLY mutating method in the class that
+            // omitted the saveToRedis/persistBoard pair that applyMove, solveSudoku, undo
+            // and redo all perform. AISolverService.getNextLogicalMove calls
+            // board.incrementHintCount(), so the charge landed in the database while the
+            // count it paid for lived only in this pod's activeGames map. Evict the board
+            // (trimActiveGames) or restart the pod before the next move and the hint was
+            // forgotten: the board reloaded with hintCount == 0, so EconomyService granted
+            // the +5 clean-solve bonus and AchievementService unlocked CleanSolver on a
+            // solve that had in fact been hinted — the player was charged for the hint and
+            // then rewarded as though they had never taken one.
+            saveToRedis(gameId, board);
+            persistBoard(board);
             return hint;
         }
     }
@@ -221,18 +270,28 @@ public class GameService {
     // applyMove
     // =====================================================================
 
-    public void applyMove(String gameId, EnhancedMove move, String playerId) {
+    /**
+     * Applies a player's move.
+     *
+     * @return true if the board actually changed. This used to be void, so the WebSocket
+     *         handler had no success signal and broadcast the move regardless — including
+     *         when this method dropped it silently because the player was FREEZE-locked.
+     *         The victim's client and every peer then held a value the authoritative board
+     *         never recorded, with nothing to trigger a resync.
+     */
+    public boolean applyMove(String gameId, EnhancedMove move, String playerId) {
         validateGameId(gameId); validateMove(move); validatePlayerId(playerId);
         if (isPlayerLocked(playerId)) {
             logger.warn("Player {} is locked, rejecting move", playerId);
-            return;
+            return false;
         }
+        boolean applied;
         try (var lock = gameLocks.lock(gameId)) {
             SudokuBoard board = getGame(gameId);
 
             if (board.isChaosMode() && randomGenerator.chance(0.1)) triggerChaosSwap(board);
 
-            board.applyMove(move, multiplayerBroadcaster);
+            applied = board.applyMove(move, multiplayerBroadcaster);
             antiCheatEngine.recordMove(playerId, false);
 
             analyticsService.recordEvent(new GameEvent(GameEvent.EventType.MOVE, playerId,
@@ -252,6 +311,14 @@ public class GameService {
                     antiCheatEngine.flagPlayer(playerId);
                     chaosEngine.onGameEvent("RAGE", playerId);
                 }
+                // Feed the running suspicion score the AntiCheatScheduler enforces on.
+                // Nothing in the application did this: the score's only writer was
+                // reachable exclusively through EventEngine.submitEventScore, which has
+                // no callers, so every scheduler detector compared 0.0 against the
+                // threshold of 75 forever. Scoring here does not itself punish anyone —
+                // the immediate flag above is unchanged, and enforcement stays with the
+                // scheduler's threshold — it just makes the signal real.
+                antiCheatEngine.scoreCompletedGame(board, playerId);
                 playerState.incrementStreak(playerId);
                 chaosEngine.onGameEvent("STREAK", playerId);
                 endGame(gameId, playerId);
@@ -259,6 +326,7 @@ public class GameService {
                 endGame(gameId, playerId);
             }
         }
+        return applied;
     }
 
     // =====================================================================
@@ -267,10 +335,13 @@ public class GameService {
 
     public void endGame(String gameId, String playerId) {
         validateGameId(gameId);
+        boolean wasActive = false;
         try (var lock = gameLocks.lock(gameId)) {
             SudokuBoard board = activeGames.remove(gameId);
+            lastAccess.remove(gameId);
+            locallyMutated.remove(gameId);
             if (board != null) {
-                gameLocks.releaseGame(gameId);   // drop the per-game local lock entry
+                wasActive = true;
                 redisTemplate.delete(redisKey(gameId));
                 persistBoard(board);
                 GameEvent.EventType type = board.isSolved()
@@ -281,6 +352,15 @@ public class GameService {
                 notifyGameEndListeners(board, playerId);
                 logger.info("Game {} ended for player {}", gameId, playerId);
             }
+        }
+        // Reclaim the per-game monitor only AFTER releasing it. Doing this inside the
+        // try-block (as before) removed the map entry while this thread still held the
+        // lock, so a concurrent caller minted a fresh ReentrantLock for the same game and
+        // two threads could sit in the critical section at once. releaseGame is now a
+        // no-op while the lock is in use, so a game that is still busy simply keeps its
+        // monitor until the next idle release.
+        if (wasActive) {
+            gameLocks.releaseGame(gameId);
         }
     }
 
@@ -355,7 +435,23 @@ public class GameService {
      * never the solution, which exists only in the solver.
      */
     public String exportShareCode(String gameId) {
+        return exportShareCode(gameId, null);
+    }
+
+    /**
+     * Share code for a game the caller owns.
+     *
+     * <p>This took no requester at all, unlike its siblings {@link #getHint(String, String)}
+     * and {@link #solveSudoku(String, String)}, which were both given ownership checks. So
+     * it was a second, independent read path onto any player's live grid: competitive game
+     * ids are deterministic and usernames are public from the leaderboards, so
+     * {@code GET /api/game/duel-<id>:<victim>/share} returned the victim's current cells —
+     * including their pencil marks, which are their deduction notes and a direct strategic
+     * tell. Verified live against a daily board before the fix.
+     */
+    public String exportShareCode(String gameId, String requesterId) {
         SudokuBoard board = getGame(gameId);
+        if (requesterId != null) requireOwner(board, requesterId);
         try {
             var bytes = new java.io.ByteArrayOutputStream();
             try (var gzip = new java.util.zip.GZIPOutputStream(bytes)) {
@@ -367,15 +463,58 @@ public class GameService {
         }
     }
 
-    /** Imports a shared puzzle as a fresh game owned by the caller. */
+    /** Hard ceiling on the decompressed share payload; a full 81-cell snapshot is ~8KB. */
+    private static final int MAX_SHARE_BYTES = 64 * 1024;
+
+    /**
+     * A 9x9 Sudoku with a unique solution needs at least 17 clues, so a legitimate shared
+     * puzzle has at most 64 givens. Anything above that is not a puzzle.
+     */
+    private static final int MAX_IMPORTED_GIVENS = 64;
+
+    /**
+     * Imports a shared puzzle as a fresh game owned by the caller.
+     *
+     * <p><b>This was an unlimited currency mint.</b> The share code is attacker-authored:
+     * unsigned, unauthenticated, and never checked against anything the server issued.
+     * {@code restoreCells} validates only <em>shape</em> — 9x9, values in range — so an
+     * attacker could submit a fully completed grid with every cell marked
+     * {@code "ms":"PLAYER"}. {@code SudokuBoard.isSolved()} is computed from the grid
+     * rather than stored, so the imported board was solved the instant it existed, and
+     * {@code POST /{gameId}/end} then paid out in full: the caller genuinely owns the
+     * board so the ownership check passes, {@code hasAutosolvedCells()} sees no AUTOSOLVE
+     * source because the attacker wrote PLAYER, and the {@code rewardsGranted} replay
+     * guard never fires because each import mints a brand-new {@code shared-<uuid>} id.
+     * Every reward guard added in passes 1-8 was bypassed at once, from a direction none
+     * of them faced. Measured live before the fix: <b>15 to 140 gems in five request
+     * pairs</b>, with no race, no timing and no second player involved.
+     *
+     * <p>Two changes close it. An import now yields the <em>puzzle</em>, not the sender's
+     * progress: every non-given cell is cleared, so a grid of 81 non-given values imports
+     * as an empty board and earns nothing until the importer actually solves it. And a
+     * board claiming more than {@link #MAX_IMPORTED_GIVENS} clues is rejected outright,
+     * which blocks the obvious follow-up of marking all 81 cells {@code "g":true}. As a
+     * side effect this also stops an import from carrying the sender's pencil marks and
+     * partial work, which is what the endpoint's own summary always said it did.
+     */
     public SudokuBoard importShareCode(String code, String playerId) {
         validatePlayerId(playerId);
         String cellsJson;
         try {
             byte[] compressed = java.util.Base64.getUrlDecoder().decode(code.trim());
             try (var gzip = new java.util.zip.GZIPInputStream(new java.io.ByteArrayInputStream(compressed))) {
-                cellsJson = new String(gzip.readAllBytes(), java.nio.charset.StandardCharsets.UTF_8);
+                // Bounded read: the 16KB cap on the encoded field says nothing about the
+                // decompressed size, and gzip reaches ~1000:1, so readAllBytes() let 12KB
+                // of request body expand into ~12MB of String plus a multiple of that to
+                // parse. Fifty concurrent requests OOM'd a single-replica pod.
+                byte[] raw = gzip.readNBytes(MAX_SHARE_BYTES + 1);
+                if (raw.length > MAX_SHARE_BYTES) {
+                    throw new IllegalArgumentException("Share code expands beyond the allowed size");
+                }
+                cellsJson = new String(raw, java.nio.charset.StandardCharsets.UTF_8);
             }
+        } catch (IllegalArgumentException e) {
+            throw e;
         } catch (Exception e) {
             throw new IllegalArgumentException("Malformed share code", e);
         }
@@ -384,9 +523,74 @@ public class GameService {
         SudokuBoard board = new SudokuBoard(blank, false, false, 0,
             "shared-" + UUID.randomUUID().toString().substring(0, 8));
         board.restoreCells(cellsJson); // validates shape; throws on garbage
+
+        int givens = 0;
+        SudokuCell[][] grid = board.getBoard();
+        for (int r = 0; r < 9; r++) {
+            for (int c = 0; c < 9; c++) {
+                if (grid[r][c].isGiven() && grid[r][c].getValue() != 0) givens++;
+            }
+        }
+        if (givens > MAX_IMPORTED_GIVENS) {
+            throw new IllegalArgumentException(
+                "Share code is not a playable puzzle: " + givens + " clues");
+        }
+        // Import the puzzle, not the sender's progress. This is what makes an
+        // attacker-authored "already solved" grid worthless.
+        for (int r = 0; r < 9; r++) {
+            for (int c = 0; c < 9; c++) {
+                SudokuCell cell = grid[r][c];
+                if (cell.isGiven()) continue;
+                cell.setValue(0, SudokuCell.MoveSource.INITIAL);
+                cell.clearPencilMarks();
+                cell.clearConflicts();
+            }
+        }
+        if (board.isSolved()) {
+            throw new IllegalArgumentException("Share code is already solved");
+        }
         board.setPlayerId(playerId);
         board.setDifficulty(2);
         return adoptGame(board);
+    }
+
+    /**
+     * True for the competitive game-id namespaces, whose boards are private to one player.
+     *
+     * <p>Mirrors {@code WebSocketController.isSharedPuzzle}. These ids are deterministic
+     * ({@code daily-<date>:<player>}, {@code week-<year-Www>-p<n>:<player>},
+     * {@code duel-<id>:<player>}) and usernames are public from the leaderboards and the
+     * duel list, so anyone can construct another player's competitive game id exactly.
+     */
+    public static boolean isCompetitiveGameId(String gameId) {
+        return gameId != null
+            && (gameId.startsWith("daily-") || gameId.startsWith("week-") || gameId.startsWith("duel-"));
+    }
+
+    /**
+     * Reads a board on behalf of {@code requesterId}, refusing a competitive board the
+     * requester does not own.
+     *
+     * <p>The WebSocket layer was hardened against exactly this — {@code isSharedPuzzle}
+     * closes the spectate channel for the three competitive prefixes, and its comment
+     * records a verified live exploit where an attacker watched a victim's 53/81 daily
+     * board. The REST read was never given the equivalent check, so a single
+     * {@code GET /api/game/daily-<date>:<victim>} bypassed the whole mitigation and
+     * returned all 81 cells. Duel boards make it worse than surveillance: both players
+     * race copies of the <em>same</em> puzzle, so every value the opponent has entered is
+     * a correct answer to copy. Verified live before the fix.
+     *
+     * @throws SecurityException if the requester does not own a competitive board
+     */
+    public SudokuBoard getGameForReader(String gameId, String requesterId) {
+        SudokuBoard board = getGame(gameId);
+        if (requesterId != null
+                && isCompetitiveGameId(board.getGameId())
+                && !requesterId.equals(board.getPlayerId())) {
+            logger.warn("Blocked read of competitive game {} by {}", gameId, requesterId);
+            throw new SecurityException("Competitive games are private to their player");
+        }
+        return board;
     }
 
     private void requireOwner(SudokuBoard board, String playerId) {
@@ -401,9 +605,14 @@ public class GameService {
      * where only persistent fields reach the row — the transient grid does not
      * (see SudokuBoard#syncCellsJson for why a @PreUpdate callback can't do this).
      */
+    /**
+     * The single write choke point for boards. Also records that THIS pod mutated the
+     * game, which {@link #shutdown()} uses to avoid flushing boards it merely read.
+     */
     private void persistBoard(SudokuBoard board) {
         board.syncCellsJson();
         gameRepository.save(board);
+        if (board.getGameId() != null) locallyMutated.add(board.getGameId());
     }
 
     /** Fans finished games out to feature listeners (daily puzzle, duels, ...). */
@@ -417,6 +626,15 @@ public class GameService {
             logger.info("Game {} solved with AI assistance — reward listeners skipped", board.getGameId());
             return;
         }
+        // Replay guard: /end re-hydrates a finished board into the active set (its own
+        // ownership check calls getGame), so the `activeGames.remove() != null` test in
+        // endGame does NOT make this idempotent. Without the flag below, replaying one
+        // HTTP request minted currency without limit — measured live at +15 gems and
+        // +15 XP per call, 15 -> 135 gems in seven requests.
+        if (board.isSolved() && board.isRewardsGranted()) {
+            logger.debug("Game {} already paid out — reward listeners skipped", board.getGameId());
+            return;
+        }
         gameEndListeners.stream().forEach(listener -> {
             try {
                 listener.onGameEnded(board, playerId);
@@ -425,12 +643,45 @@ public class GameService {
                     listener.getClass().getSimpleName(), board.getGameId(), e.getMessage());
             }
         });
+        // Mark only SOLVED boards. An abandoned game must stay eligible: the player can
+        // resume it and finish it properly later, and that completion should still pay.
+        if (board.isSolved()) {
+            board.setRewardsGranted(true);
+            persistBoard(board);
+        }
     }
 
+    /** Auto-solve a board the caller owns. Prefer {@link #solveSudoku(String, String)}. */
     public void solveSudoku(String gameId) {
+        solveSudoku(gameId, null);
+    }
+
+    /**
+     * AI-solves {@code gameId} on behalf of {@code requesterId}, who must own the board.
+     *
+     * <p>This had NO caller check at all, which made it the most damaging endpoint in the
+     * API. Competitive game ids are deterministic and usernames are public from the
+     * leaderboards ({@code duel-<id>:<player>}, {@code daily-<date>:<player>},
+     * {@code week-<year-Www>-p<n>:<player>}), so one request could fill in any player's
+     * board — persisted, not just cached. The victim then cannot move (grid full), cannot
+     * resume (409), and can never claim the win, because the auto-solve reward guard
+     * suppresses their completion. Worse, the shared daily/weekly TEMPLATE rows are
+     * ordinary boards too: solving {@code daily-<date>} poisons the puzzle for the entire
+     * player base. Verified live — after one attacker request, a brand-new player joining
+     * the daily received an 81/81 pre-solved, unwinnable board. The response also returns
+     * the completed grid, so it doubled as a solution oracle.
+     *
+     * @throws SecurityException if the requester does not own the board (mapped to 403)
+     */
+    public void solveSudoku(String gameId, String requesterId) {
         validateGameId(gameId);
         try (var lock = gameLocks.lock(gameId)) {
             SudokuBoard board = getGame(gameId);
+            if (requesterId != null && board.getPlayerId() != null
+                    && !requesterId.equals(board.getPlayerId())) {
+                throw new SecurityException(
+                    "Game " + gameId + " belongs to " + board.getPlayerId() + " — you cannot solve it");
+            }
             aiSolverService.solveSudoku(board);
             saveToRedis(gameId, board);
             // Persist like every other mutation — previously the auto-solve
@@ -547,6 +798,16 @@ public class GameService {
     @PreDestroy
     public void shutdown() {
         activeGames.forEach((id, board) -> {
+            // Only flush games this pod actually wrote. activeGames is a read-through
+            // CACHE, so it also holds boards this pod merely looked at (a spectator view,
+            // an ownership check, an /api/game/{id} read). Persisting those on shutdown
+            // wrote a possibly-stale copy over whatever another replica had since saved —
+            // silently rolling a game back. Every mutation already persists inline, so
+            // this loop is a safety net for owned boards, not a general flush.
+            if (!locallyMutated.contains(id)) {
+                logger.debug("Shutdown: skipping read-only cached board {}", id);
+                return;
+            }
             try {
                 persistBoard(board);
             } catch (Exception e) {
@@ -580,36 +841,134 @@ public class GameService {
         }
     }
 
+    /**
+     * Reads a cached board, treating any Redis failure as a cache miss.
+     *
+     * <p>This read was the single Redis touch in the codebase with no try/catch — every
+     * other one degrades ({@code saveToRedis}, {@code GameLockManager.acquireRedis},
+     * {@code PlayerStateStore}, {@code DailyStateStore}, {@code DuelStateStore},
+     * {@code RedisBroadcastRelay} all catch and fall back). So a
+     * {@code RedisConnectionFailureException}, a {@code QueryTimeoutException} past the
+     * 2s budget, or a {@code SerializationException} on one poisoned entry propagated out
+     * of {@code getGame} instead of falling through to the database row sitting right
+     * behind it. The controller catches only {@code IllegalArgumentException}, so it
+     * surfaced as a 500 — and because Redis was still technically <em>up</em>, the
+     * readiness probe passed and the pod kept serving 500s for reads, moves, hints, saves,
+     * resumes and ends. A cache is not supposed to be a single point of failure in front
+     * of a database that has the answer.
+     */
+    private SudokuBoard readFromRedis(String gameId) {
+        try {
+            return redisTemplate.opsForValue().get(redisKey(gameId));
+        } catch (Exception e) {
+            logger.warn("Redis cache read failed for game {} — falling back to the database: {}",
+                gameId, e.getMessage());
+            return null;
+        }
+    }
+
     private String redisKey(String gameId) {
         return "game:" + gameId;
     }
 
+    /** Marks a cached board as just used, for LRU eviction. */
+    private void touch(String gameId) {
+        lastAccess.put(gameId, System.nanoTime());
+    }
+
+    /** Forgets a board's cache bookkeeping and its per-game monitor (if idle). */
+    private void forget(String gameId) {
+        activeGames.remove(gameId);
+        lastAccess.remove(gameId);
+        gameLocks.releaseGame(gameId);
+    }
+
     private void trimActiveGames() {
-        // Called under creationLock. Remove oldest entries when over limit.
         while (activeGames.size() > MAX_ACTIVE_GAMES) {
-            String oldest = activeGames.keySet().iterator().next();
-            activeGames.remove(oldest);
-            gameLocks.releaseGame(oldest);
-            logger.warn("Active games limit reached; evicted game {}", oldest);
+            // Genuinely least-recently-used, not "whatever the hash iterator yields first".
+            String victim = lastAccess.entrySet().stream()
+                .min(Map.Entry.comparingByValue())
+                .map(Map.Entry::getKey)
+                .orElseGet(() -> activeGames.keySet().stream().findAny().orElse(null));
+            if (victim == null) return;
+            activeGames.remove(victim);
+            lastAccess.remove(victim);
+            locallyMutated.remove(victim);
+            // Only drops the monitor if nobody holds it — evicting a busy game's lock
+            // would let two threads into the same critical section.
+            gameLocks.releaseGame(victim);
+            logger.warn("Active games limit reached; evicted least-recently-used game {}", victim);
         }
     }
 
+    /**
+     * Chaos mode: shuffles two of the player's own entries.
+     *
+     * <p>This used to swap two arbitrary non-given cells with <b>no legality check</b>,
+     * and swapping two different values across a Sudoku almost always creates a duplicate
+     * — moving a 5 into a row that already holds one. The result is a board that is no
+     * longer a legal Sudoku, and the damage compounds: {@code isValidMove} then rejects
+     * the player's own CORRECT moves, because the stray duplicate blocks the value that
+     * genuinely belongs there. The player is left unable to finish a game they were
+     * playing correctly, with no message explaining why. Found by the live engine, which
+     * played chaos games and checked the board's consistency afterwards.
+     *
+     * <p>Chaos is supposed to disrupt the player, not corrupt the puzzle. A swap is now
+     * applied only if the board stays a legal Sudoku afterwards; the candidate pairs are
+     * sampled a bounded number of times and, if none is legal, the tick simply does
+     * nothing.
+     */
     private void triggerChaosSwap(SudokuBoard board) {
-        // Pick two random non-given cells and swap their values.
         SudokuCell[][] cells = board.getBoard();
         java.util.List<int[]> editable = new java.util.ArrayList<>();
         for (int r = 0; r < 9; r++)
             for (int c = 0; c < 9; c++)
-                if (!cells[r][c].isGiven()) editable.add(new int[]{r, c});
+                if (!cells[r][c].isGiven() && cells[r][c].getValue() != 0)
+                    editable.add(new int[]{r, c});
         if (editable.size() < 2) return;
-        int i1 = randomGenerator.nextInt(editable.size());
-        int i2 = randomGenerator.nextInt(editable.size());
-        if (i1 == i2) return;
-        int[] a = editable.get(i1), b = editable.get(i2);
-        int tmp = cells[a[0]][a[1]].getValue();
-        cells[a[0]][a[1]].setValue(cells[b[0]][b[1]].getValue(), SudokuCell.MoveSource.CHAOS);
-        cells[b[0]][b[1]].setValue(tmp, SudokuCell.MoveSource.CHAOS);
-        logger.debug("Chaos swap ({},{}) <-> ({},{}) in game {}", a[0], a[1], b[0], b[1], board.getGameId());
+
+        for (int attempt = 0; attempt < CHAOS_SWAP_ATTEMPTS; attempt++) {
+            int i1 = randomGenerator.nextInt(editable.size());
+            int i2 = randomGenerator.nextInt(editable.size());
+            if (i1 == i2) continue;
+            int[] a = editable.get(i1), b = editable.get(i2);
+            int va = cells[a[0]][a[1]].getValue();
+            int vb = cells[b[0]][b[1]].getValue();
+            if (va == vb) continue;                        // a visible no-op
+
+            if (!swapKeepsBoardLegal(cells, a, b, va, vb)) continue;
+
+            cells[a[0]][a[1]].setValue(vb, SudokuCell.MoveSource.CHAOS);
+            cells[b[0]][b[1]].setValue(va, SudokuCell.MoveSource.CHAOS);
+            logger.debug("Chaos swap ({},{}) <-> ({},{}) in game {}",
+                a[0], a[1], b[0], b[1], board.getGameId());
+            return;
+        }
+        logger.debug("Chaos tick found no legal swap in game {}", board.getGameId());
+    }
+
+    private static final int CHAOS_SWAP_ATTEMPTS = 24;
+
+    /** True if putting {@code vb} at {@code a} and {@code va} at {@code b} keeps the grid legal. */
+    private boolean swapKeepsBoardLegal(SudokuCell[][] cells, int[] a, int[] b, int va, int vb) {
+        int[][] grid = new int[9][9];
+        for (int r = 0; r < 9; r++)
+            for (int c = 0; c < 9; c++)
+                grid[r][c] = cells[r][c].getValue();
+        grid[a[0]][a[1]] = 0;
+        grid[b[0]][b[1]] = 0;
+        return legalAt(grid, a[0], a[1], vb) && legalAt(grid, b[0], b[1], va);
+    }
+
+    private static boolean legalAt(int[][] grid, int row, int col, int value) {
+        for (int i = 0; i < 9; i++) {
+            if (grid[row][i] == value || grid[i][col] == value) return false;
+        }
+        int br = row - row % 3, bc = col - col % 3;
+        for (int i = 0; i < 3; i++)
+            for (int j = 0; j < 3; j++)
+                if (grid[br + i][bc + j] == value) return false;
+        return true;
     }
 
     private void validateDifficulty(int difficulty) {

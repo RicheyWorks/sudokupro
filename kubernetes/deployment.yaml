@@ -78,15 +78,20 @@ spec:
                 secretKeyRef:
                   name: sudokupro-secrets
                   key: ADMIN_PASSWORD
+          # Readiness may depend on Redis/DB: an unready pod is removed from the
+          # Service but left running.
           readinessProbe:
             httpGet:
-              path: /actuator/health
+              path: /actuator/health/readiness
               port: 8080
             initialDelaySeconds: 30
             periodSeconds: 10
+          # Liveness must NOT depend on Redis/DB — restarting the pod cannot fix an
+          # external outage, and pointing this at the aggregate health endpoint
+          # crash-looped every replica on a transient Redis blip.
           livenessProbe:
             httpGet:
-              path: /actuator/health
+              path: /actuator/health/liveness
               port: 8080
             initialDelaySeconds: 60
             periodSeconds: 20

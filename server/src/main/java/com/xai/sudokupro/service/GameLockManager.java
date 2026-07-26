@@ -67,6 +67,17 @@ public class GameLockManager {
     public LockHandle lock(String gameId) {
         ReentrantLock local = localLocks.computeIfAbsent(gameId, k -> new ReentrantLock());
         local.lock();
+        // Re-entrant acquisition by the SAME thread (e.g. GameService.applyMove ->
+        // getGame, or applyMove -> endGame, both of which lock the same game).
+        // The local monitor is reentrant, but the Redis SET NX lock is NOT: the
+        // outer acquisition already holds the key, so asking again would spin the
+        // whole wait budget and then throw "busy on another server instance" —
+        // breaking every move/hint/undo/redo/save/resume whenever Redis is up.
+        // The outer frame already provides cross-replica exclusion for this game,
+        // so the nested frame reuses it and releases nothing (null token).
+        if (local.getHoldCount() > 1) {
+            return new LockHandle(gameId, local, null);
+        }
         try {
             String token = acquireRedis(gameId);
             return new LockHandle(gameId, local, token);
@@ -76,9 +87,35 @@ public class GameLockManager {
         }
     }
 
-    /** Drops the local lock entry when a game ends (Redis keys expire via TTL). */
-    public void releaseGame(String gameId) {
-        localLocks.remove(gameId);
+    /**
+     * Drops the local lock entry for a finished game — ONLY if nobody is using it.
+     *
+     * <p>Removing the entry while a thread still holds the monitor breaks mutual exclusion:
+     * the next caller of {@link #lock} finds no entry, {@code computeIfAbsent} mints a
+     * BRAND NEW {@code ReentrantLock}, and two threads end up inside the same critical
+     * section for the same game. {@code endGame} did exactly that — it called this from
+     * inside its own {@code try (var lock = ...)} block — and {@code trimActiveGames} did
+     * the same for evicted games. Checking {@code isLocked}/{@code hasQueuedThreads} makes
+     * the drop safe; if the game is busy we simply keep the entry, and the next idle
+     * release reclaims it.
+     *
+     * @return true if the entry was removed
+     */
+    public boolean releaseGame(String gameId) {
+        boolean[] removed = {false};
+        localLocks.computeIfPresent(gameId, (key, lock) -> {
+            if (lock.isLocked() || lock.hasQueuedThreads()) {
+                return lock;      // still in use — keep it
+            }
+            removed[0] = true;
+            return null;          // idle — drop it
+        });
+        return removed[0];
+    }
+
+    /** Number of per-game monitors currently retained (for leak assertions / metrics). */
+    public int trackedGameCount() {
+        return localLocks.size();
     }
 
     private String acquireRedis(String gameId) {

@@ -35,8 +35,27 @@ public interface GameRepository extends JpaRepository<SudokuBoard, Long> {
     @Cacheable(value = "gameById", key = "#gameId")
     SudokuBoard findByGameId(@Param("gameId") String gameId);
 
-    @Query("SELECT b FROM SudokuBoard b WHERE b.playerId = :playerId ORDER BY b.startTime DESC")
+    @Query("SELECT b FROM SudokuBoard b WHERE b.playerId = :playerId ORDER BY b.startTime DESC, b.id DESC")
     List<SudokuBoard> findByPlayerId(@Param("playerId") String playerId, Pageable pageable);
+
+    /**
+     * Boards for {@code playerId} whose game id starts with {@code prefix}, newest first.
+     *
+     * <p>Needed because daily and weekly-tournament templates share one synthetic owner
+     * ({@code DailyPuzzleService.TEMPLATE_PLAYER}). {@code archiveDates} paged that owner
+     * and filtered by the {@code daily-} prefix <em>afterwards</em>, so the SQL LIMIT was
+     * spent on rows the Java then discarded: in a steady week of 7 daily and 5 weekly
+     * templates, a request for 14 archive dates returned about 8, and at the maximum
+     * limit of 60 nothing older than roughly five weeks could ever appear — even though
+     * {@code joinArchive} would happily serve those dates. The returned count also drifted
+     * day to day with when the week's templates were first created, so the archive list
+     * visibly shrank and grew. Filtering in SQL makes the limit mean what it says.
+     */
+    @Query("SELECT b FROM SudokuBoard b WHERE b.playerId = :playerId "
+         + "AND b.gameId LIKE CONCAT(:prefix, '%') ORDER BY b.startTime DESC, b.id DESC")
+    List<SudokuBoard> findByPlayerIdAndGameIdPrefix(@Param("playerId") String playerId,
+                                                    @Param("prefix") String prefix,
+                                                    Pageable pageable);
 
     /**
      * Unfinished games a player can resume, newest first. Only rows with a

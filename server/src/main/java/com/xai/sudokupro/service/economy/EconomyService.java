@@ -46,16 +46,37 @@ public class EconomyService implements GameEndListener {
         return hintCost;
     }
 
-    /** The player's wallet, provisioned with the signing bonus on first touch. */
+    /**
+     * The player's wallet, provisioned with the signing bonus on first touch.
+     *
+     * <p>This is a check-then-insert with nothing serializing it, and the callers are
+     * genuinely concurrent: two hint requests on two different games take two DIFFERENT
+     * per-game locks, so both can miss the lookup and both insert. Before Flyway V9 there
+     * was no unique index to stop the second one, and the resulting duplicate rows made
+     * every later {@code findByUsername} — a single-result query — throw
+     * {@code IncorrectResultSizeDataAccessException} permanently, login included.
+     *
+     * <p>V9 now rejects the losing insert, which turns silent corruption into a loud
+     * {@code DataIntegrityViolationException}. That is strictly better but still a 500 for
+     * a request that should simply have succeeded, so the loser re-reads the winner's row.
+     * The retry is bounded and the second lookup cannot miss: the constraint firing is
+     * proof the row is there.
+     */
     @Transactional
     public User walletFor(String playerId) {
-        return userRepository.findByUsername(playerId).orElseGet(() -> {
+        var existing = userRepository.findByUsername(playerId);
+        if (existing.isPresent()) return existing.get();
+        try {
             User fresh = new User(null, playerId);
             fresh.setGems(startingGems);
-            User saved = userRepository.save(fresh);
+            User saved = userRepository.saveAndFlush(fresh);
             logger.info("Provisioned wallet for {} with {} starting gems", playerId, startingGems);
             return saved;
-        });
+        } catch (org.springframework.dao.DataIntegrityViolationException e) {
+            // Lost the provisioning race; the winner's row is committed by definition.
+            return userRepository.findByUsername(playerId).orElseThrow(() ->
+                new IllegalStateException("Wallet for " + playerId + " vanished after a unique-constraint conflict", e));
+        }
     }
 
     /**
@@ -66,14 +87,22 @@ public class EconomyService implements GameEndListener {
      */
     @Transactional
     public int chargeForHint(String playerId) {
-        User wallet = walletFor(playerId);
-        if (wallet.getGems() < hintCost) {
-            throw new InsufficientGemsException(playerId, wallet.getGems(), hintCost);
+        User wallet = walletFor(playerId);   // provisions the row on first touch
+        // Atomic compare-and-decrement. The previous read-modify-write lost updates:
+        // hint charging is serialized only by the PER-GAME lock, so concurrent requests
+        // against DIFFERENT games all read the same balance and wrote back the same
+        // decremented value. Measured live: six concurrent hints across six games cost a
+        // total of 15 gems instead of 30 — six hints for the price of three, and the
+        // balance could be driven to 0 while still serving every request.
+        if (userRepository.deductGemsIfAffordable(playerId, hintCost) == 0) {
+            int balance = userRepository.findByUsername(playerId)
+                .map(User::getGems).orElse(wallet.getGems());
+            throw new InsufficientGemsException(playerId, balance, hintCost);
         }
-        wallet.setGems(wallet.getGems() - hintCost);
-        userRepository.save(wallet);
-        logger.debug("Charged {} gems to {} for a hint — {} left", hintCost, playerId, wallet.getGems());
-        return wallet.getGems();
+        int remaining = userRepository.findByUsername(playerId)
+            .map(User::getGems).orElse(Math.max(0, wallet.getGems() - hintCost));
+        logger.debug("Charged {} gems to {} for a hint — {} left", hintCost, playerId, remaining);
+        return remaining;
     }
 
     /** Solving pays: difficulty-scaled gems, clean-solve bonus, and XP. */
@@ -88,12 +117,30 @@ public class EconomyService implements GameEndListener {
         try {
             int earned = Math.max(1, board.getDifficulty()) * 10
                 + (board.getHintCount() == 0 ? cleanSolveBonus : 0);
-            User wallet = walletFor(playerId);
-            wallet.setGems(wallet.getGems() + earned);
-            wallet.addXp(earned);
-            userRepository.save(wallet);
-            logger.info("Player {} earned {} gems for solving {} (balance {})",
-                playerId, earned, board.getGameId(), wallet.getGems());
+            walletFor(playerId);   // provision on first solve
+
+            // Credit atomically in the database rather than read-modify-write. The old
+            // form — setGems(getGems() + earned) then save(wallet) — flushes a full-row
+            // UPDATE built from a snapshot read earlier in the transaction, which silently
+            // reverts any concurrent charge that committed in between. deductGemsIfAffordable
+            // was introduced precisely because read-modify-write loses gem updates; the
+            // reward side was still doing it. Measured shape: 15 gems, a payout computing
+            // 45 from the stale read, a hint charge taking the balance to 10, then the
+            // payout writing 45 — the hint came out free.
+            int rows = userRepository.creditGemsAndXp(playerId, earned, earned);
+            if (rows == 0) {
+                logger.warn("Solve credit for {} matched no wallet row", playerId);
+                return;
+            }
+            // level is a pure function of xp (1 + xp/100), so recomputing it from a fresh
+            // read is safe and self-healing: a concurrent credit can only make it briefly
+            // stale, and the next credit corrects it.
+            userRepository.findByUsername(playerId).ifPresent(fresh -> {
+                int derived = 1 + (fresh.getXp() / 100);
+                if (derived > fresh.getLevel()) userRepository.updateLevel(playerId, derived);
+            });
+            logger.info("Player {} earned {} gems for solving {}",
+                playerId, earned, board.getGameId());
         } catch (Exception e) {
             logger.warn("Failed to award solve gems to {}: {}", playerId, e.getMessage());
         }

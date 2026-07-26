@@ -43,13 +43,16 @@ public class PowerUpService {
     private final UserRepository userRepository;
     private final GameService gameService;
     private final AISolverService solver;
+    private final com.xai.sudokupro.service.duel.DuelStateStore duels;
 
     public PowerUpService(EconomyService economyService, UserRepository userRepository,
-                          GameService gameService, AISolverService solver) {
+                          GameService gameService, AISolverService solver,
+                          com.xai.sudokupro.service.duel.DuelStateStore duels) {
         this.economyService = economyService;
         this.userRepository = userRepository;
         this.gameService = gameService;
         this.solver = solver;
+        this.duels = duels;
     }
 
     /** Buys one unit of {@code type} with gems. Returns the new inventory count. */
@@ -58,15 +61,19 @@ public class PowerUpService {
         Integer price = CATALOG.get(type);
         if (price == null) throw new IllegalArgumentException("Unknown power-up: " + type);
         User wallet = economyService.walletFor(playerId);
-        if (wallet.getGems() < price) {
+        // Charge atomically and conditionally, the same way a hint is charged. This read
+        // the balance, subtracted in Java and saved the whole row, so two concurrent buys
+        // both saw the same starting balance and the loser's charge vanished — and a
+        // concurrent hint charge was reverted wholesale by the full-row write.
+        if (userRepository.deductGemsIfAffordable(playerId, price) == 0) {
             throw new InsufficientGemsException(playerId, wallet.getGems(), price);
         }
-        wallet.setGems(wallet.getGems() - price);
-        Map<String, Integer> inventory = wallet.getPowerUps();
+        User fresh = economyService.walletFor(playerId);
+        Map<String, Integer> inventory = fresh.getPowerUps();
         int count = inventory.getOrDefault(type, 0) + 1;
         inventory.put(type, count);
-        wallet.setPowerUps(inventory);
-        userRepository.save(wallet);
+        fresh.setPowerUps(inventory);
+        userRepository.save(fresh);
         logger.info("{} bought {} for {} gems ({} held)", playerId, type, price, count);
         return count;
     }
@@ -102,6 +109,18 @@ public class PowerUpService {
             case "FREEZE" -> {
                 if (target == null || target.isBlank() || target.equals(playerId)) {
                     throw new IllegalArgumentException("FREEZE needs an opposing player");
+                }
+                // This checked only "not blank, not me", so it froze ANY player on the
+                // platform — pick a name off the public leaderboard and lock their input
+                // for ten seconds. The class javadoc says FREEZE "locks a duel opponent's
+                // input"; its two siblings both go through requireOwnGame, and this had
+                // nothing. It is also silent to the victim: GameService.applyMove drops a
+                // locked player's move with a log line and no error, while the WebSocket
+                // layer has already broadcast the move envelope, so their client shows a
+                // move the authoritative board never recorded. Verified live before the
+                // fix against an unrelated account.
+                if (!duels.hasActiveDuelBetween(playerId, target)) {
+                    throw new SecurityException("FREEZE can only target an opponent in an active duel");
                 }
                 gameService.lockPlayerInput(target, FREEZE_MS);
             }

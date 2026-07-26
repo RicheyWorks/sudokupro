@@ -30,7 +30,7 @@ sudokupro/
 
 ## Features
 
-- **Puzzle engine** — backtracking generator with a verified unique solution at every difficulty
+- **Puzzle engine** — backtracking generator with a verified unique solution at every difficulty; clue counts are tuned to what single-cell digging can actually reach (a full shuffled sweep tops out near 55-58 removals)
 - **Real-time multiplayer** — raw-WebSocket duels, drip showdowns, and daily challenges; broadcasts fan out across server replicas via Redis pub/sub
 - **Daily puzzle & streaks** — one shared puzzle per UTC day (identical on every replica), per-player copies played through the normal game flow, consecutive-day streaks, and a fastest-solve daily leaderboard
 - **Head-to-head duels** — challenge any player, both race on identical copies of one puzzle, first correct solve wins; ELO ratings, a duel ladder, and one-tap rematches
@@ -39,7 +39,7 @@ sudokupro/
 - **Weekly tournament** — five puzzles per ISO week with ramping difficulty; only players who finish all five are ranked, by cumulative solve time
 - **Seasons** — quarterly duel seasons with lazy exactly-once rollover: the ladder podium earns a SeasonChampion badge and ratings soft-reset toward 1000
 - **Power-up shop** — spend gems on EXTRA_LIFE, REVEAL_CELL, or FREEZE (locks a duel opponent for 10s); inventory lives on the player profile
-- **Friends & presence** — request/accept friendships, live online flags from the gameplay channel; spectate any game read-only (the server rejects spectator mutations)
+- **Friends & presence** — request/accept friendships (the target must be a real account), live online flags from the gameplay channel; spectate a friend's free-play game read-only (the server rejects spectator mutations, and competitive boards — daily, weekly, duel — cannot be watched at all, since every player is racing on the same grid)
 - **Puzzle sharing** — export any board as a compact share code (never the solution); friends import it as their own game
 - **Achievements & archive** — unlocks fire on real play (clean solves, speed, streaks, duel wins); past dailies stay playable from the archive (gems yes, streak credit no)
 - **Hint economy** — hints cost gems, solving earns them (difficulty-scaled, clean-solve bonus); wallets auto-provision with a starting balance
@@ -105,8 +105,21 @@ defaults (Hibernate `ddl-auto=update`, Flyway off). Production must set
 ### 2. Play in the browser
 
 Open `http://localhost:8080/play/` — a zero-install web client served by the
-server itself. Register or log in, then play: new games, the daily puzzle,
-hints, and live WebSocket sync all work from the page.
+server itself. Register or log in and play.
+
+What the page gives you:
+
+| | |
+|---|---|
+| **Board** | Peer/row/column/box highlighting, same-number highlighting, live duplicate detection, pencil notes |
+| **Input** | Click or full keyboard — `1`-`9` to place, `0`/`Backspace` to erase, arrow keys to move, `N` for notes |
+| **Play** | New game at any difficulty, the daily puzzle, hints, undo/redo (`Ctrl+Z` / `Ctrl+Y`), save and resume |
+| **Progress** | Gems, level, move count and streak in the HUD; a timer; per-digit "remaining" counts on the number pad |
+| **Stats** | Points leaderboard, today's fastest solvers, and your achievement badges |
+
+The difficulty selector is pre-set from the adaptive model's recommendation for
+your account. Everything runs over the same REST + WebSocket API the desktop
+client uses — there is no browser-only code path on the server.
 
 ### 3. Start the desktop client
 
@@ -206,12 +219,12 @@ Cross-pod delivery is verified by a two-pod integration test on real Redis in CI
 |---|---|---|
 | `POST` | `/api/game/new?difficulty=1..4&chaos=&mirror=` | Create a new game for the authenticated player |
 | `GET` | `/api/game/{gameId}` | Current board state (player-visible projection — never the solution) |
-| `POST` | `/api/game/{gameId}/solve` | AI auto-solve |
+| `POST` | `/api/game/{gameId}/solve` | AI auto-solve (owner only) |
 | `POST` | `/api/game/{gameId}/end` | End/leave a game (state persisted server-side) |
 | `POST` | `/api/game/{gameId}/save` | Explicitly save a game (full grid persisted to Postgres) |
 | `GET` | `/api/game/saved?limit=` | The caller's unfinished, resumable games, newest first |
 | `POST` | `/api/game/{gameId}/resume` | Resume a saved game (survives restarts and cache expiry) |
-| `GET` | `/api/game/hint` | AI hint for the player's active game |
+| `GET` | `/api/game/hint` | AI hint for the caller's active game (charged to the caller) |
 | `GET` | `/api/daily` | Caller's daily-puzzle status: joined, completed, streak |
 | `POST` | `/api/daily/join` | Join today's shared puzzle (idempotent, returns the caller's copy) |
 | `GET` | `/api/daily/leaderboard?limit=` | Today's fastest solvers |
@@ -222,7 +235,7 @@ Cross-pod delivery is verified by a two-pod integration test on real Redis in CI
 | `POST` | `/api/duel/{id}/rematch` | Rematch a finished duel (fresh challenge, same difficulty) |
 | `GET` | `/api/duel/leaderboard?limit=` | Duel ladder by ELO rating |
 | `GET` | `/api/daily/archive?limit=` | Dates with playable archived dailies |
-| `POST` | `/api/daily/archive/{date}/join` | Play a past daily (no streak credit) |
+| `POST` | `/api/daily/archive/{date}/join` | Play a past daily — strictly past dates (no streak credit) |
 | `POST` | `/api/auth/register` | Create a player account (no auth required) |
 | `POST` | `/api/auth/password` | Change the caller's password |
 | `GET` | `/api/game/recommended-difficulty` | The adaptive model's difficulty for the caller |
@@ -267,11 +280,40 @@ Full interactive docs at `/swagger-ui.html` when running locally.
 mvn test
 ```
 
-Unit and context tests run anywhere (H2-backed, no local services needed).
-Four integration tests are Docker-gated and skip automatically without Docker:
-Flyway migrations on real PostgreSQL and cross-replica broadcast on real Redis.
-CI (GitHub Actions) runs the full suite including the Docker-gated tests, then
-builds the server Docker image.
+204 tests. Unit and context tests run anywhere (H2-backed, no local services
+needed). Four integration tests are Docker-gated and skip automatically without
+Docker: Flyway migrations on real PostgreSQL and cross-replica broadcast on real
+Redis. CI (GitHub Actions) runs the full suite including the Docker-gated tests,
+then builds the server Docker image.
+
+`SecurityRulesTest` deliberately runs under the `dev` profile rather than `test`,
+because `SecurityConfig` is annotated `@Profile("!test")` — under the test profile
+it is switched off and Boot's default chain runs instead, so nothing would be
+verifying the real `permitAll` matchers, CSRF rules, or admin role.
+
+### Beyond the unit suite
+
+Some classes of bug only appear with a real Redis, a real servlet chain, or a real
+browser. Three harnesses cover those; all need a running server (see
+`testing/README.md` for the exact command).
+
+```bash
+python3 testing/adversarial_api_test.py   # 27 black-box authz / validation checks
+python3 testing/fuzz_edge_cases.py        # 28 hostile-input checks (HTTP + WebSocket)
+python3 testing/reward_replay_probe.py    # replays /end on a solved board
+```
+
+`engine/Engine.java` is a game-playing harness that drives the real model classes —
+it generates boards, solves them with an independent backtracker, plays the winning
+moves, and asserts 20 invariants across generation, undo/redo, snapshots, mirror
+mode, concurrency (8 threads × 400 ops) and property fuzzing:
+
+```bash
+javac -cp model/target/classes:<jackson+slf4j jars> engine/Engine.java && java ... Engine
+```
+
+`AUDIT.md` and `BUG_AUDIT_2026-07-24.md` record what these found, including the
+reproduction for every fixed bug.
 
 ---
 
@@ -292,4 +334,32 @@ builds the server Docker image.
 - The Kubernetes deployment runs as the same non-root user as the container image
   (`securityContext`: `runAsNonRoot`, `readOnlyRootFilesystem`, all capabilities dropped)
 
-See `AUDIT.md` for the full code-health audit and its resolution history.
+### Per-player isolation
+
+Game ids are deterministic and usernames are public from the leaderboards, so every
+endpoint that touches a specific board checks the caller:
+
+| Action | Rule |
+|---|---|
+| `POST /{id}/solve`, `/save`, `/resume`, `/end` | Owner only (403 otherwise) |
+| `GET /api/game/hint` | Owner only; the charge lands on the caller, never the board owner |
+| `GET /api/game/{id}` | Readable — spectating a free-play game is a feature |
+| WebSocket `move` / `undo` / `redo` | Owner only |
+| WebSocket connect to a **daily, weekly or duel** game | Owner only — these are per-player copies of one shared grid, so another player's copy is an answer key |
+| `POST /api/daily/archive/{date}/join` | Strictly past dates — an archive copy of *today* would be a solution oracle |
+
+Completion payouts are idempotent (`rewards_granted`, Flyway `V7`): a solved board pays
+gems, XP, achievements, streaks and duel results exactly once no matter how often `/end`
+is replayed.
+
+The server always stamps a move's `MoveSource` itself and ignores any client-supplied
+value, so a client cannot label its own move `HINT` or `AUTOSOLVE` — both of which the
+reward guards key on.
+
+WebSocket sessions are rate-limited with a token bucket (40 burst, 20/s sustained), chat
+is truncated at 500 characters, and frame limits are set per session; without the limit an
+unthrottled client could hold the cross-replica game lock in a loop and starve the board's
+real owner.
+
+See `AUDIT.md` for the original code-health audit, and `BUG_AUDIT_2026-07-24.md` for the
+current audit — every finding there is recorded with its reproduction and its fix.

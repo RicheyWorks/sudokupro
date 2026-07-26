@@ -63,6 +63,7 @@ public class MetricsScheduler {
     private final AtomicLong cosmicDripGauge = new AtomicLong(0);
     private final AtomicLong duelWinRateGauge = new AtomicLong(0);
     private final AtomicLong dailyActiveGauge = new AtomicLong(0);
+    private final AtomicLong activeUsersGauge = new AtomicLong(0);
     private final AtomicLong solveTimeGauge = new AtomicLong(0);
     private final Map<String, AtomicLong> themePointsGauges = new HashMap<>();
 
@@ -107,6 +108,8 @@ public class MetricsScheduler {
         meterRegistry.gauge("sudokupro.cosmic.drip.average", GLOBAL_TAGS, cosmicDripGauge, AtomicLong::doubleValue);
         meterRegistry.gauge("sudokupro.duel.win.rate.average", GLOBAL_TAGS, duelWinRateGauge, AtomicLong::doubleValue);
         meterRegistry.gauge("sudokupro.daily.active.users", GLOBAL_TAGS, dailyActiveGauge, AtomicLong::get);
+        meterRegistry.gauge("sudokupro.active.users",
+            Tags.concat(GLOBAL_TAGS, Tags.of("period", "24h")), activeUsersGauge, AtomicLong::get);
         meterRegistry.gauge("sudokupro.solve.time.average", GLOBAL_TAGS, solveTimeGauge, AtomicLong::doubleValue);
     }
 
@@ -123,7 +126,12 @@ public class MetricsScheduler {
         try {
             // Active Users (last 24 hours)
             long activeUsers = userRepository.countActiveUsersSince(LocalDateTime.now().minusDays(1));
-            meterRegistry.counter("sudokupro.active.users", Tags.concat(GLOBAL_TAGS, Tags.of("period", "24h"))).increment(activeUsers);
+            // Gauge, not counter. This was a Micrometer Counter incremented BY the
+            // absolute head-count each cycle, so a steady 40 active users reported 40,
+            // then 80, then 120 — the series measured how long the pod had been up, and
+            // any rate() over it was pure noise. "Users active in the last 24h" is a
+            // level, and a level belongs in a gauge.
+            activeUsersGauge.set(activeUsers);
             logger.debug("Reported active users: {}", activeUsers);
 
             // Total Gems in System — aggregate query avoids loading all rows into heap

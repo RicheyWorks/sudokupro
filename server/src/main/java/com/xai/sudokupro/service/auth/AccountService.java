@@ -36,11 +36,14 @@ public class AccountService implements UserDetailsService {
     private final UserRepository userRepository;
     private final PasswordEncoder encoder = new BCryptPasswordEncoder();
     private final String adminUsername;
+    private final int startingGems;
 
     public AccountService(UserRepository userRepository,
-                          @Value("${spring.security.user.name:admin}") String adminUsername) {
+                          @Value("${spring.security.user.name:admin}") String adminUsername,
+                          @Value("${sudokupro.economy.starting-gems:15}") int startingGems) {
         this.userRepository = userRepository;
         this.adminUsername = adminUsername;
+        this.startingGems = startingGems;
     }
 
     /**
@@ -64,11 +67,22 @@ public class AccountService implements UserDetailsService {
         if (existing.isPresent() && existing.get().getPasswordHash() != null) {
             throw new IllegalStateException("Username already taken: " + username);
         }
-        User user = existing.orElseGet(() -> new User(null, username));
+        // A brand-new account must get the signing bonus here. EconomyService.walletFor
+        // only grants it when it has to CREATE the row (orElseGet), but registration
+        // creates the row first — so every registered player used to start on 0 gems
+        // and could never afford a hint (they cost 5), making the documented bonus
+        // dead code for real accounts. Claiming a pre-existing wallet row deliberately
+        // keeps whatever gems that row already had.
+        User user = existing.orElseGet(() -> {
+            User fresh = new User(null, username);
+            fresh.setGems(startingGems);
+            return fresh;
+        });
         user.setPasswordHash(encoder.encode(password));
         userRepository.save(user);
         logger.info("Registered player account {}{}", username,
-            existing.isPresent() ? " (claimed existing wallet row)" : "");
+            existing.isPresent() ? " (claimed existing wallet row)"
+                                 : " with " + startingGems + " starting gems");
     }
 
     /** Changes the caller's password after verifying the current one. */

@@ -118,7 +118,13 @@ public class BoardView {
         int value = sudokuCell.getValue();
         if (value != 0) {
             cell.setText(String.valueOf(value));
-            cell.setEditable(false);
+        }
+        // Editability follows isGiven(), NOT "has a value". Keying on value != 0
+        // permanently locked the player's OWN entries as if they were clues on
+        // every board rebuild (resume, duel rejoin, daily join, swapInBoard),
+        // making a resumed game unplayable in any cell already filled in.
+        cell.setEditable(!sudokuCell.isGiven());
+        if (sudokuCell.isGiven()) {
             cell.setStyle(cell.getStyle() + "-fx-background-color: #4B4B4B;");
         }
 
@@ -143,7 +149,18 @@ public class BoardView {
             } catch (Exception e) {
                 logger.error("Move failed at ({},{}): {}", row, col, e.getMessage());
                 notifier.notify("error", "Invalid move: " + e.getMessage());
-                Platform.runLater(() -> cell.setText(oldVal));
+                // The revert is programmatic, so it must carry the same guard
+                // refreshCell() uses — otherwise setText re-enters this listener
+                // and attempts a second (also failing) move, double-reporting
+                // the error and firing a redundant server round-trip.
+                Platform.runLater(() -> {
+                    updatingCell.set(true);
+                    try {
+                        cell.setText(oldVal);
+                    } finally {
+                        updatingCell.set(false);
+                    }
+                });
             }
         });
 
@@ -335,6 +352,10 @@ public class BoardView {
                     updatingCell.set(false);
                 }
             }
+            // Re-assert editability on every refresh: a server resync can change
+            // which cells are clues (resume, spectate, imported puzzle), and a
+            // cell cleared by undo must become editable again.
+            cell.setEditable(!sc.isGiven());
             updateCellStyle(cell, row, col);
         });
     }

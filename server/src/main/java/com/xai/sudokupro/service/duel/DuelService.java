@@ -31,6 +31,8 @@ import java.util.UUID;
 public class DuelService implements GameEndListener {
 
     private static final Logger logger = LoggerFactory.getLogger(DuelService.class);
+    /** Cap on simultaneous unanswered challenges from one player to another. */
+    static final int MAX_OUTSTANDING_CHALLENGES = 3;
     static final String DUEL_PREFIX = "duel-";
 
     private final GameService gameService;
@@ -60,6 +62,23 @@ public class DuelService implements GameEndListener {
         }
         if (challenger.equals(opponent)) {
             throw new IllegalArgumentException("You cannot duel yourself");
+        }
+        // The opponent must exist — the same guard FriendService.request already carries.
+        // Without it, challenging a nonexistent name wrote a duel record plus a
+        // per-player Redis set member (24h TTL) for an account that can never accept,
+        // and repeating the call against a REAL player grew their duel set without bound.
+        // Their GET /api/duel does one Redis round trip per member, so their own duel
+        // list degraded into an N-round-trip request that only they paid for.
+        if (userRepository.findByUsername(opponent).isEmpty()) {
+            throw new IllegalArgumentException("No such player: " + opponent);
+        }
+        int outstanding = 0;
+        for (DuelRecord d : duels.findForPlayer(opponent)) {
+            if ("PENDING".equals(d.status()) && challenger.equals(d.challenger())) outstanding++;
+        }
+        if (outstanding >= MAX_OUTSTANDING_CHALLENGES) {
+            throw new IllegalStateException(
+                "You already have " + outstanding + " pending challenges to " + opponent);
         }
         int level = Math.max(1, Math.min(difficulty, 4));
         String duelId = UUID.randomUUID().toString().substring(0, 8);
@@ -199,6 +218,15 @@ public class DuelService implements GameEndListener {
             // ELO: expected score from the rating gap, K=32.
             double expectedWin = 1.0 / (1.0 + Math.pow(10, (l.getDuelRating() - w.getDuelRating()) / 400.0));
             int delta = (int) Math.round(ELO_K * (1.0 - expectedWin));
+            // Clamp the DELTA, not the result. User.setDuelRating does Math.max(0, ...),
+            // so once the loser's rating fell below delta the winner still gained the full
+            // amount while the loser surrendered less — the pair stopped being zero-sum and
+            // rating was created from nothing. Worked example at K=32: winner 195 vs loser
+            // 5 gives delta 8, so the loser drops 5 (clamped) while the winner gains 8;
+            // every subsequent duel against the floored account is +8/-0, pure minting,
+            // until the gap saturates around 720 points. Capping the transfer at what the
+            // loser actually has keeps the exchange symmetric at the floor.
+            delta = Math.max(0, Math.min(delta, l.getDuelRating()));
             w.setDuelRating(w.getDuelRating() + delta);
             l.setDuelRating(l.getDuelRating() - delta);
             w.setDuelWins(w.getDuelWins() + 1);

@@ -46,12 +46,14 @@ public class AntiCheatEngine {
     private final Map<String, AtomicInteger> moveRates = new ConcurrentHashMap<>();
     private final Map<String, LocalDateTime> moveRateWindowStart = new ConcurrentHashMap<>();
     private final Map<String, LocalDateTime> lastMoveTimestamps = new ConcurrentHashMap<>();
-    private final Map<String, Integer> cosmicConsistency = new ConcurrentHashMap<>();
     private final Map<String, AtomicInteger> cosmicMoveRates = new ConcurrentHashMap<>();
+    // ip -> (playerId -> solves) and playerId -> (platform -> last seen). Both are read by
+    // AntiCheatScheduler; both are written by detectCheating(board, user).
     private final Map<String, Map<String, Integer>> ipSolveCounts = new ConcurrentHashMap<>();
     private final Map<String, Integer> cosmicStreaks = new ConcurrentHashMap<>();
-    private final Map<String, Map<String, Integer>> movePatterns = new ConcurrentHashMap<>();
     private final Map<String, Map<String, LocalDateTime>> deviceSwitches = new ConcurrentHashMap<>();
+    // Removed: cosmicConsistency and movePatterns. Neither was ever written or read —
+    // they were declared, trimmed on every observation, and nothing else.
 
     // Accumulated suspicion score per player.  Each detected signal adds SUSPICION_SIGNAL_WEIGHT;
     // scores decay toward zero each time the player is observed without a red flag.
@@ -98,9 +100,22 @@ public class AntiCheatEngine {
         double playerSkill = skillScores.getOrDefault(playerId, 0.0);
         double avgPeerSkill = skillScores.values().stream().mapToDouble(Double::doubleValue).average().orElse(0.0);
 
+        // Observation bookkeeping. `ip` and `platform` were computed above and then
+        // dropped on the floor, which left ipSolveCounts and deviceSwitches permanently
+        // empty — so AntiCheatScheduler's IP-clustering and device-switch detectors read
+        // empty maps and could never fire, however blatant the behaviour.
+        ipSolveCounts.computeIfAbsent(ip, k -> new ConcurrentHashMap<>()).merge(playerId, 1, Integer::sum);
+        deviceSwitches.computeIfAbsent(playerId, k -> new ConcurrentHashMap<>()).put(platform, now);
+
         int signals = 0;
 
-        if (solveTime < (difficulty * MIN_SOLVE_TIME_PER_DIFFICULTY)) {
+        // solveTime == 0 means "no elapsed time recorded", not "solved instantly": it is
+        // the initial value on an unsolved board, and it was also what every board
+        // rehydrated from the database or Redis reported before SudokuBoard restored the
+        // transient Duration from solveTimeSeconds. Scoring it would generate two signals
+        // (this one and the per-move-time one below) from a serialization artefact. The
+        // single-argument overload already guards this way; this one did not.
+        if (solveTime > 0 && solveTime < (difficulty * MIN_SOLVE_TIME_PER_DIFFICULTY)) {
             signals++;
         }
 
@@ -115,7 +130,7 @@ public class AntiCheatEngine {
             signals++;
         }
 
-        if (moves > 0 && solveTime / moves < MIN_EXPECTED_MOVE_TIME_MS) {
+        if (solveTime > 0 && moves > 0 && solveTime / moves < MIN_EXPECTED_MOVE_TIME_MS) {
             signals++;
         }
 
@@ -158,6 +173,43 @@ public class AntiCheatEngine {
         trimMaps();
         double score = suspicionScoreMap.getOrDefault(playerId, 0.0);
         return score >= SUSPICION_SIGNAL_WEIGHT;  // flagged if at least one active signal
+    }
+
+    /**
+     * Scores a completed board against the player who solved it, feeding the running
+     * suspicion score that {@link AntiCheatScheduler} enforces on.
+     *
+     * <p>This exists because the anti-cheat subsystem was structurally inert. The only
+     * writer of {@code suspicionScoreMap} is {@link #detectCheating(SudokuBoard, User)},
+     * and its sole caller was {@code EventEngine.submitEventScore} — which has no callers
+     * of its own anywhere in the codebase: no controller maps to it, no service invokes
+     * it. So the map was always empty, {@link #getCheatSuspicionScores()} always returned
+     * nothing, and all eight detectors in AntiCheatScheduler compared
+     * {@code 0.0 >= 75} every 60 seconds and took the else branch. Every detector was
+     * reachable, none could ever fire; the scheduler paged through up to 500 boards and
+     * the whole user table each minute to reach a decision it could not make. The
+     * {@code sudokupro.suspicious.players} gauge read a flat zero for the same reason,
+     * so the dashboard confirmed the system was working.
+     *
+     * <p>Resolving the {@link User} here rather than at the call site keeps GameService's
+     * dependency graph unchanged — this class already holds the repository.
+     *
+     * @return true if the player currently carries at least one active suspicion signal
+     */
+    public synchronized boolean scoreCompletedGame(SudokuBoard board, String playerId) {
+        if (board == null || playerId == null || playerId.isBlank() || "anonymous".equals(playerId)) {
+            return false;
+        }
+        long userId;
+        try {
+            userId = Long.parseLong(playerId);
+        } catch (NumberFormatException e) {
+            logger.debug("Skipping cheat scoring for non-numeric playerId '{}'", playerId);
+            return false;
+        }
+        return userRepository.findById(userId)
+            .map(user -> detectCheating(board, user))
+            .orElse(false);
     }
 
     public synchronized Map<String, Double> getCheatSuspicionScores() {
@@ -262,10 +314,9 @@ public class AntiCheatEngine {
         trimMap(moveRateWindowStart);
         trimMap(lastMoveTimestamps);
         trimMap(cosmicStreaks);
-        trimMap(cosmicConsistency);
+        trimMap(cosmicMoveRates);
         trimMap(ipSolveCounts);
         trimMap(deviceSwitches);
-        trimMap(movePatterns);
     }
 
     private <K, V> void trimMap(Map<K, V> map) {

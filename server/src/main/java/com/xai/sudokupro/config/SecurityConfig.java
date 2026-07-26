@@ -61,9 +61,17 @@ public class SecurityConfig {
             .addFilterBefore(loginAttemptFilter, BasicAuthenticationFilter.class)
             .authorizeHttpRequests(auth -> auth
                 .requestMatchers("/admin/**").hasRole("ADMIN") // Broaden to all admin endpoints
-                .requestMatchers("/actuator/health", "/actuator/info").permitAll() // Allow health checks
+                // /actuator/health/** covers the liveness and readiness GROUPS, not just the
+                // aggregate. With only the exact path permitted, the Kubernetes probes at
+                // /actuator/health/liveness and /actuator/health/readiness get 401 — pods
+                // never become ready and liveness restarts them forever.
+                .requestMatchers("/actuator/health", "/actuator/health/**", "/actuator/info").permitAll()
                 .requestMatchers("/ws/**").permitAll() // WebSocket endpoint for multiplayer
-                .requestMatchers("/play/**").permitAll() // static web client (data calls still authenticate)
+                .requestMatchers("/play", "/play/", "/play/**").permitAll() // static web client (data calls still authenticate)
+                // Without this, Boot's 404 -> forward:/error lands on an authenticated
+                // matcher, so every not-found for an anonymous caller is reported as a
+                // misleading 401 (a wrong URL looked like an auth failure).
+                .requestMatchers("/error").permitAll()
                 .requestMatchers(org.springframework.http.HttpMethod.POST, "/api/auth/register")
                     .permitAll() // account creation precedes credentials by definition
                 .anyRequest().authenticated() // Tighten default access
@@ -132,6 +140,30 @@ public class SecurityConfig {
 
         logger.info("Security filter chain configured with basic auth; OAuth2 upgrade pending.");
         return http.build();
+    }
+
+    /**
+     * Publishes the BCrypt encoder that {@link com.xai.sudokupro.service.auth.AccountService}
+     * hashes with, so EVERY authentication provider uses it — including the one Spring
+     * Security auto-registers from the {@code UserDetailsService} bean.
+     *
+     * <p>Without this bean that auto-registered provider falls back to
+     * {@code DelegatingPasswordEncoder}, which requires an {@code {id}} prefix on the
+     * stored hash. Our hashes are raw {@code $2a$...}, so it threw
+     * {@code IllegalArgumentException: There is no PasswordEncoder mapped for the id "null"}.
+     *
+     * <p>That only bit on a WRONG password: a correct one matches on the first provider and
+     * never reaches the fallback. The consequences were serious — a wrong password returned
+     * HTTP 500 instead of 401, and because {@code IllegalArgumentException} is not an
+     * {@code AuthenticationException}, {@code ProviderManager} never published an
+     * authentication-failure event, so {@link LoginAttemptEventListener} never counted the
+     * attempt and the brute-force lockout NEVER engaged. Verified live: nine consecutive
+     * wrong-password attempts all returned 500 and never the documented 429.
+     */
+    @Bean
+    public org.springframework.security.crypto.password.PasswordEncoder passwordEncoder(
+            com.xai.sudokupro.service.auth.AccountService accountService) {
+        return accountService.encoder();
     }
 
     @Bean

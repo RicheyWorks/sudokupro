@@ -15,6 +15,7 @@ import java.util.concurrent.ConcurrentHashMap;
 
 import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.Mockito.*;
 
@@ -38,6 +39,39 @@ class EconomyServiceTest {
             users.put(u.getUsername(), u);
             return u;
         });
+        // walletFor provisions via saveAndFlush, not save: the flush is what makes the
+        // users.username unique-constraint violation surface inside walletFor's own
+        // try/catch (so the loser of a provisioning race can re-read the winner's row)
+        // rather than at transaction commit, where nothing would handle it.
+        lenient().when(repo.saveAndFlush(any(User.class))).thenAnswer(inv -> {
+            User u = inv.getArgument(0);
+            users.put(u.getUsername(), u);
+            return u;
+        });
+        // Solve rewards now credit atomically in SQL rather than read-modify-write, so the
+        // in-memory double has to emulate the UPDATE. The old form silently reverted any
+        // concurrent hint charge that committed between the read and the save.
+        lenient().when(repo.creditGemsAndXp(anyString(), anyInt(), anyInt())).thenAnswer(inv -> {
+            User u = users.get(inv.<String>getArgument(0));
+            if (u == null) return 0;
+            u.setGems(u.getGems() + inv.<Integer>getArgument(1));
+            u.addXp(inv.<Integer>getArgument(2));
+            return 1;
+        });
+        lenient().when(repo.updateLevel(anyString(), anyInt())).thenReturn(1);
+        // Emulate the atomic conditional UPDATE: decrement only if affordable, and do it
+        // under a lock so the mock behaves like the single SQL statement it stands in for.
+        lenient().when(repo.deductGemsIfAffordable(anyString(), org.mockito.ArgumentMatchers.anyInt()))
+            .thenAnswer(inv -> {
+                String name = inv.getArgument(0);
+                int cost = inv.getArgument(1);
+                synchronized (users) {
+                    User u = users.get(name);
+                    if (u == null || u.getGems() < cost) return 0;
+                    u.setGems(u.getGems() - cost);
+                    return 1;
+                }
+            });
         economy = new EconomyService(repo, HINT_COST, STARTING_GEMS, CLEAN_BONUS);
     }
 
@@ -100,5 +134,47 @@ class EconomyServiceTest {
         new AISolverService(new SecureRandomGenerator(new SimpleMeterRegistry())).solveSudoku(board);
         assertTrue(board.isSolved());
         return board;
+    }
+
+    /**
+     * Regression: concurrent hint charges must never oversell the wallet.
+     *
+     * <p>{@code chargeForHint} was a read-modify-write, and hint charging is serialized
+     * only by the PER-GAME lock — so requests against DIFFERENT games never contended and
+     * all wrote back the same decremented balance. Verified live against a running server:
+     * six concurrent hints across six games were all served for a total of 15 gems instead
+     * of 30, i.e. six hints for the price of three. The charge is now a single atomic
+     * conditional UPDATE.
+     */
+    @Test
+    void concurrentHintChargesCannotOversellTheWallet() throws Exception {
+        economy.walletFor("racer");                       // 15 gems, hint costs 5 -> 3 hints
+        int attempts = 12;
+        java.util.concurrent.atomic.AtomicInteger served = new java.util.concurrent.atomic.AtomicInteger();
+        java.util.concurrent.CountDownLatch go = new java.util.concurrent.CountDownLatch(1);
+        java.util.concurrent.CountDownLatch done = new java.util.concurrent.CountDownLatch(attempts);
+
+        for (int i = 0; i < attempts; i++) {
+            new Thread(() -> {
+                try {
+                    go.await();
+                    economy.chargeForHint("racer");
+                    served.incrementAndGet();
+                } catch (InsufficientGemsException expected) {
+                    // correct outcome once the wallet is empty
+                } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                } finally {
+                    done.countDown();
+                }
+            }).start();
+        }
+        go.countDown();
+        assertTrue(done.await(15, java.util.concurrent.TimeUnit.SECONDS));
+
+        assertEquals(STARTING_GEMS / HINT_COST, served.get(),
+            "exactly " + (STARTING_GEMS / HINT_COST) + " hints are affordable, no matter the concurrency");
+        assertEquals(0, users.get("racer").getGems(), "balance must land exactly on zero");
+        assertTrue(users.get("racer").getGems() >= 0, "balance must never go negative");
     }
 }

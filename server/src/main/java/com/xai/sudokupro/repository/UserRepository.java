@@ -28,8 +28,85 @@ public interface UserRepository extends JpaRepository<User, Long>,
     @Cacheable(value = "userByUsername", key = "#username")
     Optional<User> findByUsername(String username);
 
-    /** Duel ladder: highest-rated players first (rematch/ladder feature). */
-    @Query("SELECT u FROM User u WHERE u.duelWins > 0 OR u.duelLosses > 0 ORDER BY u.duelRating DESC")
+    /**
+     * Atomically deducts {@code cost} gems, but only if the player can afford it.
+     * Returns the number of rows updated: 1 on success, 0 if the balance was too low.
+     *
+     * <p>Required because the read-modify-write in {@code EconomyService.chargeForHint}
+     * loses updates. Hint charging is serialized only by the PER-GAME lock, so requests
+     * against DIFFERENT games never contend: they all read the same balance and all write
+     * back the same decremented value. Verified live — six concurrent hint requests across
+     * six games were all served for a total of 15 gems instead of 30, i.e. six hints for
+     * the price of three. Pushing the compare-and-decrement into a single SQL statement
+     * makes it atomic regardless of how many game locks are involved, without needing
+     * optimistic-lock retries on the whole aggregate.
+     */
+    @Transactional
+    @org.springframework.data.jpa.repository.Modifying(clearAutomatically = true, flushAutomatically = true)
+    // findByUsername is @Cacheable, and a bulk UPDATE bypasses the persistence context
+    // entirely — without this evict the very next read would serve the pre-charge balance.
+    @org.springframework.cache.annotation.CacheEvict(value = "userByUsername", key = "#username")
+    @Query("UPDATE User u SET u.gems = u.gems - :cost WHERE u.username = :username AND u.gems >= :cost")
+    int deductGemsIfAffordable(@Param("username") String username, @Param("cost") int cost);
+
+    /**
+     * Adds {@code amount} gems and {@code xp} atomically, in the database.
+     *
+     * <p>Companion to {@link #deductGemsIfAffordable}, and needed for the same reason.
+     * That method exists because read-modify-write on {@code gems} loses updates — but the
+     * reward path still did {@code wallet.setGems(wallet.getGems() + earned)} followed by
+     * {@code save(wallet)}, which flushes a full-row UPDATE with a value computed from a
+     * snapshot read earlier in the transaction. A concurrent hint charge committing in
+     * between was silently reverted: alice at 15 gems, a solve payout reading 15 and
+     * computing 45, a hint charge taking her to 10, then the payout writing 45 — the hint
+     * was free. Reachable any time a player has two games in flight, because the game locks
+     * are per-game and do not serialise wallet writes.
+     */
+    @Transactional
+    @org.springframework.data.jpa.repository.Modifying(clearAutomatically = true, flushAutomatically = true)
+    @org.springframework.cache.annotation.CacheEvict(value = "userByUsername", key = "#username")
+    @Query("UPDATE User u SET u.gems = u.gems + :amount, u.xp = u.xp + :xp WHERE u.username = :username")
+    int creditGemsAndXp(@Param("username") String username,
+                        @Param("amount") int amount,
+                        @Param("xp") int xp);
+
+    /** Targeted level write, so recomputing level never rewrites the gem balance. */
+    @Transactional
+    @org.springframework.data.jpa.repository.Modifying(clearAutomatically = true, flushAutomatically = true)
+    @org.springframework.cache.annotation.CacheEvict(value = "userByUsername", key = "#username")
+    @Query("UPDATE User u SET u.level = :level WHERE u.username = :username AND u.level < :level")
+    int updateLevel(@Param("username") String username, @Param("level") int level);
+
+    /**
+     * Pulls every rated player's duel rating halfway back to 1000, and returns how many
+     * rows were touched.
+     *
+     * <p>Season rollover previously looped the same top-100 page it used for the podium,
+     * so from rank 101 down nobody was reset. The un-compressed tail kept its full rating
+     * and, season after season, permanently outranked the compressed head — inverting the
+     * ladder the reset exists to refresh. One statement covers everyone and avoids paging
+     * a large ladder through the application.
+     */
+    @Transactional
+    @org.springframework.data.jpa.repository.Modifying(clearAutomatically = true, flushAutomatically = true)
+    @Query("UPDATE User u SET u.duelRating = (u.duelRating + 1000) / 2 "
+         + "WHERE u.duelWins > 0 OR u.duelLosses > 0")
+    int softResetDuelRatings();
+
+    /**
+     * Duel ladder: highest-rated players first (rematch/ladder feature).
+     *
+     * <p>The tie-break is load-bearing, not cosmetic. {@code ORDER BY duelRating DESC}
+     * alone leaves equal-rated rows in whatever order Postgres happens to produce, which
+     * is not stable across executions — and {@link #softResetDuelRatings()} manufactures
+     * the ties, because {@code (rating + 1000) / 2} is INTEGER division and so collapses
+     * adjacent ratings onto the same value every season (1016 and 1017 both land on 1008).
+     * {@code SeasonService} takes the top three from this query to award
+     * {@code SeasonChampion} badges, so five players tied at 1008 meant an arbitrary three
+     * of them got crowned and the podium order shuffled between refreshes.
+     */
+    @Query("SELECT u FROM User u WHERE u.duelWins > 0 OR u.duelLosses > 0 "
+         + "ORDER BY u.duelRating DESC, u.duelWins DESC, u.id ASC")
     List<User> findDuelLadder(org.springframework.data.domain.Pageable pageable);
 
     @Query("SELECT u FROM User u WHERE u.streak >= :streakThreshold")
@@ -192,7 +269,7 @@ public interface UserRepository extends JpaRepository<User, Long>,
 
     @Transactional(readOnly = true)
     @Query(value = "SELECT u.* FROM users u " +
-           "WHERE u.last_login > :since AND EXISTS (SELECT 1 FROM match_history mh WHERE mh.user_id = u.id AND mh.won = true) " +
+           "WHERE u.last_login > :since AND EXISTS (SELECT 1 FROM user_match_history mh WHERE mh.user_id = u.id AND mh.match_won = true) " +
            "AND u.points BETWEEN :minPoints AND :maxPoints " +
            "ORDER BY u.hype_meter DESC, u.cosmic_drip DESC", nativeQuery = true)
     @Cacheable(value = "activeDuelWinnersByPoints", key = "#since + '-' + #minPoints + '-' + #maxPoints + '-' + #pageable.pageNumber")

@@ -23,14 +23,25 @@ public class LoginAttemptEventListener {
         this.limiter = limiter;
     }
 
+    // Both handlers pass the attempted username as well as the address, so the counter is
+    // scoped to (address, account). Keyed on the address alone, a success for ANY account
+    // wiped the counter — see LoginAttemptLimiter.scope.
     @EventListener
     public void onFailure(AbstractAuthenticationFailureEvent event) {
-        remoteAddress(event.getAuthentication().getDetails()).ifPresent(limiter::recordFailure);
+        String user = username(event.getAuthentication());
+        remoteAddress(event.getAuthentication().getDetails())
+            .ifPresent(addr -> limiter.recordFailure(addr, user));
     }
 
     @EventListener
     public void onSuccess(AuthenticationSuccessEvent event) {
-        remoteAddress(event.getAuthentication().getDetails()).ifPresent(limiter::recordSuccess);
+        String user = username(event.getAuthentication());
+        remoteAddress(event.getAuthentication().getDetails())
+            .ifPresent(addr -> limiter.recordSuccess(addr, user));
+    }
+
+    private static String username(org.springframework.security.core.Authentication auth) {
+        return auth == null ? null : String.valueOf(auth.getName());
     }
 
     private java.util.Optional<String> remoteAddress(Object details) {

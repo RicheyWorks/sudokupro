@@ -31,8 +31,10 @@ class AccountServiceTest {
             users.put(u.getUsername(), u);
             return u;
         });
-        service = new AccountService(repo, "admin");
+        service = new AccountService(repo, "admin", STARTING_GEMS);
     }
+
+    private static final int STARTING_GEMS = 15;
 
     @Test
     void registerCreatesALoadableAccountWithHashedPassword() {
@@ -61,6 +63,21 @@ class AccountServiceTest {
         assertThrows(IllegalStateException.class,
             () -> service.register("ada", "someone-else-entirely"),
             "a registered name cannot be re-claimed");
+    }
+
+    /**
+     * Regression: a freshly registered account must receive the signing bonus.
+     * EconomyService.walletFor only grants it when IT creates the row, but
+     * registration creates the row first — so every registered player started on
+     * 0 gems and could never afford a hint (5 gems), silently making the
+     * documented starting balance dead code for real accounts.
+     */
+    @Test
+    void freshRegistrationReceivesTheStartingGemsBonus() {
+        service.register("newplayer", "a-good-password");
+
+        assertEquals(STARTING_GEMS, users.get("newplayer").getGems(),
+            "a new account must be able to afford at least one hint");
     }
 
     @Test

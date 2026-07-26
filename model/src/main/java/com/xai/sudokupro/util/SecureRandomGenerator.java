@@ -29,7 +29,15 @@ public class SecureRandomGenerator {
     private static final boolean FIPS_MODE = Boolean.getBoolean("sudokupro.fips.mode");
     private static final ThreadLocal<SecureRandom> localRand = ThreadLocal.withInitial(() -> FIPS_MODE ? createFipsSecureRandom() : new SecureRandom());
     private final MeterRegistry meterRegistry;
-    private final List<String> methodLog = Collections.synchronizedList(new ArrayList<>());
+    /*
+     * Removed: `methodLog`, a Collections.synchronizedList that every method appended a
+     * string to. It was never read, never cleared, and had no getter — a grep over the
+     * whole repository found only the writes. It grew for the lifetime of the JVM at
+     * roughly 208 entries per generated board, plus one entry per player move (ChaosEngine
+     * calls nextDoubleRange on every move), so it was a steady leak with no upper bound.
+     * Being a synchronized list, it also serialised every RNG call from every request
+     * thread on a single monitor, on the hot path, for no benefit whatsoever.
+     */
 
     public static final String CHARSET_ALPHANUMERIC = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
     public static final String CHARSET_HEX = "0123456789abcdef";
@@ -56,25 +64,21 @@ public class SecureRandomGenerator {
 
     public int nextInt(int bound) {
         if (bound <= 0) throw new IllegalArgumentException("Bound must be positive");
-        methodLog.add("nextInt");
         return localRand.get().nextInt(bound);
     }
 
     public int nextIntRange(int min, int max) {
         if (min > max) throw new IllegalArgumentException("Min must be <= max");
-        methodLog.add("nextIntRange");
         return min + localRand.get().nextInt(max - min + 1);
     }
 
     public long nextLong(long bound) {
         if (bound <= 0) throw new IllegalArgumentException("Bound must be positive");
-        methodLog.add("nextLong");
         return Math.abs(localRand.get().nextLong()) % bound;
     }
 
     public List<Integer> getShuffledNumbers(int start, int end) {
         if (start > end) throw new IllegalArgumentException("Start must be <= end");
-        methodLog.add("getShuffledNumbers");
         List<Integer> numbers = new ArrayList<>();
         for (int i = start; i <= end; i++) numbers.add(i);
         Collections.shuffle(numbers, localRand.get());
@@ -83,36 +87,30 @@ public class SecureRandomGenerator {
 
     public boolean flipCoin() {
         meterRegistry.counter("sudokupro.rng.flip_coin").increment();
-        methodLog.add("flipCoin");
         return localRand.get().nextBoolean();
     }
 
     public double nextDouble() {
-        methodLog.add("nextDouble");
         return localRand.get().nextDouble();
     }
 
     public double nextDoubleRange(double min, double max) {
         if (min > max) throw new IllegalArgumentException("Min must be <= max");
-        methodLog.add("nextDoubleRange");
         return min + (max - min) * localRand.get().nextDouble();
     }
 
     public boolean chance(double probability) {
         if (probability < 0 || probability > 1) throw new IllegalArgumentException("Probability must be 0-1");
-        methodLog.add("chance");
         return localRand.get().nextDouble() < probability;
     }
 
     public double gaussianDouble(double mean, double stdDev) {
         if (stdDev < 0) throw new IllegalArgumentException("StdDev must be non-negative");
-        methodLog.add("gaussianDouble");
         return mean + localRand.get().nextGaussian() * stdDev;
     }
 
     public int nextBinomial(int n, double p) {
         if (n < 0 || p < 0 || p > 1) throw new IllegalArgumentException("Invalid n or p");
-        methodLog.add("nextBinomial");
         int successes = 0;
         for (int i = 0; i < n; i++) {
             if (localRand.get().nextDouble() < p) successes++;
@@ -124,11 +122,9 @@ public class SecureRandomGenerator {
         localRand.set(FIPS_MODE ? createFipsSecureRandom() : new SecureRandom());
         localRand.get().setSeed(seed);
         log.debug("Seed set for thread-local SecureRandom: {}", seed);
-        methodLog.add("setSeed");
     }
 
     public double nextGaussian(double mean, double stddev) {
-        methodLog.add("nextGaussian");
         return mean + stddev * localRand.get().nextGaussian();
     }
 
@@ -137,13 +133,11 @@ public class SecureRandomGenerator {
     }
 
     public long getSeedSnapshot() {
-        methodLog.add("getSeedSnapshot");
         return localRand.get().nextLong();
     }
 
     public void boostEntropy(byte[] extraBytes) {
         if (extraBytes == null || extraBytes.length == 0) throw new IllegalArgumentException("Extra bytes must not be null/empty");
-        methodLog.add("boostEntropy");
         localRand.get().setSeed(extraBytes);
         log.info("Entropy boosted with {} bytes", extraBytes.length);
     }

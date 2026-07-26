@@ -19,13 +19,17 @@ import java.util.concurrent.ConcurrentHashMap;
 
 import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyInt;
+import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.*;
 
 @ExtendWith(MockitoExtension.class)
 class PowerUpServiceTest {
 
     @Mock private GameService gameService;
+    @Mock private com.xai.sudokupro.service.duel.DuelStateStore duels;
 
     private final Map<String, User> users = new ConcurrentHashMap<>();
     private PowerUpService service;
@@ -40,9 +44,28 @@ class PowerUpServiceTest {
             users.put(u.getUsername(), u);
             return u;
         });
+        // EconomyService.walletFor provisions with saveAndFlush so that a
+        // users.username unique-constraint violation surfaces inside its own catch.
+        lenient().when(repo.saveAndFlush(any(User.class))).thenAnswer(inv -> {
+            User u = inv.getArgument(0);
+            users.put(u.getUsername(), u);
+            return u;
+        });
+        // buy() now charges through the same atomic conditional UPDATE a hint uses, instead
+        // of read-modify-write on the whole row (which let two concurrent buys both see the
+        // same balance, and reverted any concurrent hint charge wholesale).
+        lenient().when(repo.deductGemsIfAffordable(anyString(), anyInt())).thenAnswer(inv -> {
+            synchronized (users) {
+                User u = users.get(inv.<String>getArgument(0));
+                int cost = inv.getArgument(1);
+                if (u == null || u.getGems() < cost) return 0;
+                u.setGems(u.getGems() - cost);
+                return 1;
+            }
+        });
         // 100 starting gems so purchases fit
         service = new PowerUpService(new EconomyService(repo, 5, 100, 5), repo, gameService,
-            new AISolverService(new SecureRandomGenerator(new SimpleMeterRegistry())));
+            new AISolverService(new SecureRandomGenerator(new SimpleMeterRegistry())), duels);
     }
 
     @Test
@@ -98,6 +121,7 @@ class PowerUpServiceTest {
 
     @Test
     void freezeLocksTheTargetAndNeedsOne() {
+        when(duels.hasActiveDuelBetween("richmond", "ada")).thenReturn(true);
         service.buy("richmond", "FREEZE");
         service.use("richmond", "FREEZE", null, "ada");
         verify(gameService).lockPlayerInput("ada", 10_000);
@@ -106,6 +130,29 @@ class PowerUpServiceTest {
         assertThrows(IllegalArgumentException.class,
             () -> service.use("richmond", "FREEZE", null, "richmond"),
             "self-freeze is nonsense");
+    }
+
+    /**
+     * Regression: FREEZE accepted ANY username. It checked only "not blank, not me", so
+     * an attacker could read a name off the public leaderboard and lock that player's
+     * input for ten seconds — with no duel between them and no relationship at all. The
+     * class javadoc says FREEZE "locks a duel opponent's input", and its two siblings both
+     * go through requireOwnGame; this one had nothing. It is silent to the victim too:
+     * GameService.applyMove drops a locked player's move with a log line and no error,
+     * while the WebSocket layer has already broadcast the move envelope, so their client
+     * shows a move the authoritative board never recorded. Verified live before the fix.
+     */
+    @Test
+    void freezeCannotTargetSomeoneYouAreNotDuelling() {
+        when(duels.hasActiveDuelBetween("richmond", "stranger")).thenReturn(false);
+        service.buy("richmond", "FREEZE");
+
+        assertThrows(SecurityException.class,
+            () -> service.use("richmond", "FREEZE", null, "stranger"));
+
+        verify(gameService, never()).lockPlayerInput(eq("stranger"), anyLong());
+        assertEquals(1, service.inventory("richmond").get("FREEZE"),
+            "a refused FREEZE must not consume the item");
     }
 
     @Test

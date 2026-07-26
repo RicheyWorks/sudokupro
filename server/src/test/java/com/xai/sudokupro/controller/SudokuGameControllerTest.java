@@ -51,20 +51,36 @@ class SudokuGameControllerTest {
 
     @Test
     void getGameReturns404ForUnknownId() {
-        when(gameService.getGame("nope")).thenThrow(new IllegalArgumentException("Game not found: nope"));
+        // getGame now reads through getGameForReader, which refuses a competitive board
+        // the caller does not own (the REST twin of the WebSocket spectate block).
+        when(gameService.getGameForReader(eq("nope"), any()))
+            .thenThrow(new IllegalArgumentException("Game not found: nope"));
 
         assertEquals(HttpStatus.NOT_FOUND, controller.getGame("nope").getStatusCode());
     }
 
     @Test
     void solveDelegatesAndReturnsFreshState() {
+        when(authService.getCurrentPlayerId()).thenReturn("richmond");
         when(gameService.getGame("g-1")).thenReturn(board);
 
         ResponseEntity<Object> response = controller.solve("g-1");
 
-        verify(gameService).solveSudoku("g-1");
+        // The caller MUST be passed through: solveSudoku had no ownership check, so one
+        // request could auto-solve any player's board — or a shared daily/weekly template,
+        // ruining the puzzle for everyone — and hand back the full solution.
+        verify(gameService).solveSudoku("g-1", "richmond");
         assertEquals(HttpStatus.OK, response.getStatusCode());
         assertInstanceOf(BoardState.class, response.getBody());
+    }
+
+    @Test
+    void solveOnSomeoneElsesGameIsForbidden() {
+        when(authService.getCurrentPlayerId()).thenReturn("attacker");
+        org.mockito.Mockito.doThrow(new SecurityException("Game g-1 belongs to richmond"))
+            .when(gameService).solveSudoku("g-1", "attacker");
+
+        assertEquals(HttpStatus.FORBIDDEN, controller.solve("g-1").getStatusCode());
     }
 
     @Test

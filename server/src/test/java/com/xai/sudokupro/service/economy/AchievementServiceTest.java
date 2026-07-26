@@ -51,6 +51,11 @@ class AchievementServiceTest {
             users.put(u.getUsername(), u);
             return u;
         });
+        lenient().when(repo.saveAndFlush(any(User.class))).thenAnswer(inv -> {
+            User u = inv.getArgument(0);
+            users.put(u.getUsername(), u);
+            return u;
+        });
         StringRedisTemplate downRedis = mock(StringRedisTemplate.class,
             inv -> { throw new RedisConnectionFailureException("down (test)"); });
         dailyState = new DailyStateStore(downRedis);
