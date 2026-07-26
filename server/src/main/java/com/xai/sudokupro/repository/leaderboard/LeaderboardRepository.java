@@ -31,25 +31,64 @@ public interface LeaderboardRepository extends JpaRepository<User, Long> {
     // between executions — so a paginated leaderboard could show the same player on two
     // pages and skip another entirely, and consecutive refreshes reshuffled tied ranks.
     //
-    // The @Cacheable keys are also wrong (they use only pageNumber, so a size-10 and a
-    // size-100 read of page 0 collide), but they are inert: there is no @EnableCaching
-    // anywhere in the project, so no CacheManager is created and none of these fire. Left
-    // in place rather than silently changing behaviour — see the audit's "still open" list.
+    // Caching is now genuinely on (see CacheConfig), so the annotations below are live and
+    // were audited before being armed. Two things changed here:
+    //   * Keys keyed on `#pageable.pageNumber` alone made a size-10 and a size-100 read of
+    //     page 0 collide, so the second caller got the first caller's page. They now key on
+    //     `#pageable`, whose equals/hashCode cover page, size and sort.
+    //   * The queries LeaderboardService already caches at the service layer lost their
+    //     repository-level @Cacheable. Caching both layers made updateScore's @CacheEvict
+    //     cosmetic: it evicts the service cache, and the stale rows come back up from here.
+    // findSocialCosmicIcons and findAchievementHunters still pair @EntityGraph with a
+    // Pageable and so still paginate in memory. They have no production caller anywhere in
+    // the codebase, so they are left alone rather than rewritten speculatively.
 
-    // NOTE: @EntityGraph + Pageable makes Hibernate fetch the whole result set and
-    // paginate it in memory (it warns "firstResult/maxResults specified with collection
-    // fetch"). Correct today, wrong shape at scale; tracked as a known-open item.
+    /**
+     * Top players by points, one page, with {@code matchHistory} fetched.
+     *
+     * <p>Bug fix — a page that was really a full table read. This was a single
+     * {@code @EntityGraph} + {@code Pageable} method. Hibernate cannot push
+     * {@code firstResult/maxResults} into SQL when the query fetch-joins a collection (the
+     * LIMIT would cut the join rows, not the roots), so it silently ran the query unlimited,
+     * materialised every matching {@code User} plus its collection, and sliced the list in
+     * Java — logging {@code HHH90003004: firstResult/maxResults specified with collection
+     * fetch; applying in memory}. Measured on H2 with a 24-row table, asking for the top 3
+     * loaded 24 {@code User} entities; the ratio is the table size, so in production the
+     * hottest leaderboard endpoint pulled the entire user table into heap on the request
+     * thread for every cache miss, and the cost grew linearly with signups while the page
+     * stayed at 10 rows.
+     *
+     * <p>The standard remedy, applied here: query 1 pages the ids (no fetch join, so the
+     * database does the LIMIT), query 2 loads exactly those roots with the fetch graph
+     * (no pagination, so nothing to apply in memory). Two round trips, bounded work.
+     * The ordering is repeated in query 2 because {@code IN} does not preserve it.
+     */
+    default List<User> findTopUsersByPoints(Pageable pageable) {
+        List<Long> ids = findTopUserIdsByPoints(pageable);
+        return ids.isEmpty() ? List.of() : findUsersByIdsOrderedByPoints(ids);
+    }
+
+    @Query("SELECT u.id FROM User u ORDER BY u.points DESC, u.id ASC")
+    List<Long> findTopUserIdsByPoints(Pageable pageable);
+
+
     @EntityGraph(attributePaths = {"matchHistory"})
-    @Query("SELECT u FROM User u ORDER BY u.points DESC, u.id ASC")
-    @Cacheable(value = "topUsersByPoints", key = "#pageable.pageNumber")
-    List<User> findTopUsersByPoints(Pageable pageable);
+    // Not cached at the repository layer: LeaderboardService already caches this
+    // result, and only the service-level cache is named by updateScore /
+    // refreshLeaderboard's @CacheEvict. Caching both layers made that eviction
+    // cosmetic — it would fire, and the stale rows would come straight back up.
+    @Query("SELECT u FROM User u WHERE u.id IN :ids ORDER BY u.points DESC, u.id ASC")
+    List<User> findUsersByIdsOrderedByPoints(@Param("ids") List<Long> ids);
 
     @Query("SELECT u FROM User u ORDER BY u.duelWins DESC, u.id ASC")
-    @Cacheable(value = "topDuelists", key = "#pageable.pageNumber")
+    // Not cached here: LeaderboardService.getTopDuelistsPaged already caches this result, and only the service-level cache is named by
+    // updateScore/refreshLeaderboard's @CacheEvict. Caching both layers made that
+    // eviction cosmetic — it would fire, and the stale rows would come straight back
+    // up from here.
     List<User> findTopDuelists(Pageable pageable);
 
     @Query("SELECT u FROM User u ORDER BY u.level DESC, u.points DESC, u.id ASC")
-    @Cacheable(value = "topUsersByLevel", key = "#pageable.pageNumber")
+    @Cacheable(value = "topUsersByLevel", key = "#pageable")
     List<User> findTopUsersByLevel(Pageable pageable);
 
     @Query("SELECT u FROM User u WHERE u.duelWins > :winsThreshold ORDER BY u.duelWins DESC")
@@ -85,24 +124,47 @@ public interface LeaderboardRepository extends JpaRepository<User, Long> {
     @Cacheable(value = "pvpShyVeterans", key = "#level")
     List<User> findPvPShyVeterans(@Param("level") int level);
 
+    /**
+     * Same two-query shape as {@link #findTopUsersByPoints(Pageable)}, and for the same
+     * reason: this fetch-joined {@code achievements} alongside a {@code Pageable}, so
+     * Hibernate loaded every player above the drip threshold to return ten of them.
+     */
+    default List<User> findTopCosmicDrippers(int minDrip, Pageable pageable) {
+        List<Long> ids = findTopCosmicDripperIds(minDrip, pageable);
+        return ids.isEmpty() ? List.of() : findUsersByIdsOrderedByCosmicDrip(ids);
+    }
+
+    @Query("SELECT u.id FROM User u WHERE u.cosmicDrip >= :minDrip "
+         + "ORDER BY u.cosmicDrip DESC, u.hypeMeter DESC, u.id ASC")
+    List<Long> findTopCosmicDripperIds(@Param("minDrip") int minDrip, Pageable pageable);
+
     @EntityGraph(attributePaths = {"achievements"})
-    @Query("SELECT u FROM User u WHERE u.cosmicDrip >= :minDrip ORDER BY u.cosmicDrip DESC, u.hypeMeter DESC")
-    @Cacheable(value = "topCosmicDrippers", key = "#minDrip + '-' + #pageable.pageNumber")
-    List<User> findTopCosmicDrippers(@Param("minDrip") int minDrip, Pageable pageable);
+    // Not cached at the repository layer: LeaderboardService already caches this
+    // result, and only the service-level cache is named by updateScore /
+    // refreshLeaderboard's @CacheEvict. Caching both layers made that eviction
+    // cosmetic — it would fire, and the stale rows would come straight back up.
+    @Query("SELECT u FROM User u WHERE u.id IN :ids ORDER BY u.cosmicDrip DESC, u.hypeMeter DESC, u.id ASC")
+    List<User> findUsersByIdsOrderedByCosmicDrip(@Param("ids") List<Long> ids);
 
     @Query("SELECT u FROM User u WHERE u.hypeMeter >= :minHype ORDER BY u.hypeMeter DESC, u.points DESC")
-    @Cacheable(value = "hypeLegends", key = "#minHype + '-' + #pageable.pageNumber")
+    // Not cached here: LeaderboardService.getTopPlayersByHypePaged already caches this result, and only the service-level cache is named by
+    // updateScore/refreshLeaderboard's @CacheEvict. Caching both layers made that
+    // eviction cosmetic — it would fire, and the stale rows would come straight back
+    // up from here.
     List<User> findHypeLegends(@Param("minHype") int minHype, Pageable pageable);
 
     @EntityGraph(attributePaths = {"friends"})
     @Query("SELECT u FROM User u WHERE SIZE(u.friends) >= :minFriends AND u.fanCount >= :minFans " +
            "ORDER BY (u.hypeMeter + u.cosmicDrip) DESC")
-    @Cacheable(value = "socialCosmicIcons", key = "#minFriends + '-' + #minFans + '-' + #pageable.pageNumber")
+    @Cacheable(value = "socialCosmicIcons", key = "#minFriends + '-' + #minFans + '-' + #pageable")
     List<User> findSocialCosmicIcons(@Param("minFriends") int minFriends, @Param("minFans") int minFans, Pageable pageable);
 
     @Query("SELECT u FROM User u WHERE u.streak >= :minStreak AND u.lastLogin > :since " +
            "ORDER BY u.streak DESC, u.cosmicDrip DESC")
-    @Cacheable(value = "activeStreakCosmonauts", key = "#minStreak + '-' + #since + '-' + #pageable.pageNumber")
+    // Not cached here: LeaderboardService.getTopRecentPlayersPaged already caches this result, and only the service-level cache is named by
+    // updateScore/refreshLeaderboard's @CacheEvict. Caching both layers made that
+    // eviction cosmetic — it would fire, and the stale rows would come straight back
+    // up from here.
     List<User> findActiveStreakCosmonauts(@Param("minStreak") int minStreak, @Param("since") LocalDateTime since, Pageable pageable);
 
     @Transactional(readOnly = true)
@@ -116,18 +178,21 @@ public interface LeaderboardRepository extends JpaRepository<User, Long> {
            "FROM users u " +
            "ORDER BY (u.points * 0.5 + u.duel_wins * 1.5 + u.cosmic_drip * 0.8 + u.hype_meter * 0.7) DESC",
            nativeQuery = true)
-    @Cacheable(value = "cosmicLeaderboardSummary", key = "#pageable.pageNumber")
+    // Not cached here: LeaderboardService.getLeaderboardSummaryPaged already caches this result, and only the service-level cache is named by
+    // updateScore/refreshLeaderboard's @CacheEvict. Caching both layers made that
+    // eviction cosmetic — it would fire, and the stale rows would come straight back
+    // up from here.
     List<UserSummary> getCosmicLeaderboardSummary(Pageable pageable);
 
     @EntityGraph(attributePaths = {"achievements"})
     @Query("SELECT u FROM User u WHERE SIZE(u.achievements) >= :minAchievements " +
            "ORDER BY u.points DESC, u.cosmicDrip DESC")
-    @Cacheable(value = "achievementHunters", key = "#minAchievements + '-' + #pageable.pageNumber")
+    @Cacheable(value = "achievementHunters", key = "#minAchievements + '-' + #pageable")
     List<User> findAchievementHunters(@Param("minAchievements") int minAchievements, Pageable pageable);
 
     @Query("SELECT u FROM User u WHERE u.xp >= :minXp AND u.level >= :minLevel " +
            "ORDER BY (u.points + u.xp) DESC")
-    @Cacheable(value = "xpPointLeaders", key = "#minXp + '-' + #minLevel + '-' + #pageable.pageNumber")
+    @Cacheable(value = "xpPointLeaders", key = "#minXp + '-' + #minLevel + '-' + #pageable")
     List<User> findXpPointLeaders(@Param("minXp") int minXp, @Param("minLevel") int minLevel, Pageable pageable);
 
     @Transactional(readOnly = true)

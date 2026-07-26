@@ -83,32 +83,49 @@ public class RedisSyncScheduler {
         MDC.put("thread", "redis-sync");
         logger.info("Syncing Redis...");
 
-        try (Jedis jedis = jedisPool.getResource()) {
+        try {
+            // Bug fix: gatherMetrics() runs ~12 aggregate SQL queries and used to sit INSIDE the
+            // try-with-resources below. That meant (a) a pooled Jedis connection was checked out
+            // and held for the whole database round-trip even though Redis is not touched until
+            // the MSET, and (b) any repository failure landed in the generic catch, incremented
+            // redis.sync.failure and was rethrown for @Retryable — so a Postgres blip looked
+            // like a Redis outage on the dashboard and got hammered three more times.
+            Map<String, String> metrics;
+            try {
+                metrics = gatherMetrics();
+            } catch (Exception e) {
+                meterRegistry.counter("redis.sync.metrics.failure", GLOBAL_TAGS).increment();
+                logger.error("Redis sync skipped — metric collection failed (database unavailable?)", e);
+                return;
+            }
 
-            Map<String, String> metrics = gatherMetrics();
-
-            jedis.mset(metrics.entrySet().stream()
+            String[] keysAndValues = metrics.entrySet().stream()
                 .flatMap(e -> List.of(e.getKey(), e.getValue()).stream())
-                .toArray(String[]::new));
+                .toArray(String[]::new);
 
-            meterRegistry.counter("redis.sync.success", GLOBAL_TAGS).increment();
+            try (Jedis jedis = jedisPool.getResource()) {
 
-        } catch (JedisConnectionException e) {
+                jedis.mset(keysAndValues);
 
-            // Connection failures are not retried — just count and log.
-            meterRegistry.counter("redis.sync.failure", GLOBAL_TAGS).increment();
-            logger.error("Redis sync failed (connection unavailable)", e);
+                meterRegistry.counter("redis.sync.success", GLOBAL_TAGS).increment();
 
-        } catch (JedisException e) {
+            } catch (JedisConnectionException e) {
 
-            meterRegistry.counter("redis.sync.failure", GLOBAL_TAGS).increment();
-            logger.error("Redis sync failed", e);
-            throw e;   // retryable
+                // Connection failures are not retried — just count and log.
+                meterRegistry.counter("redis.sync.failure", GLOBAL_TAGS).increment();
+                logger.error("Redis sync failed (connection unavailable)", e);
 
-        } catch (Exception e) {
+            } catch (JedisException e) {
 
-            meterRegistry.counter("redis.sync.failure", GLOBAL_TAGS).increment();
-            throw new RuntimeException(e);   // retryable
+                meterRegistry.counter("redis.sync.failure", GLOBAL_TAGS).increment();
+                logger.error("Redis sync failed", e);
+                throw e;   // retryable
+
+            } catch (Exception e) {
+
+                meterRegistry.counter("redis.sync.failure", GLOBAL_TAGS).increment();
+                throw new RuntimeException(e);   // retryable
+            }
 
         } finally {
             isRunning.set(false);

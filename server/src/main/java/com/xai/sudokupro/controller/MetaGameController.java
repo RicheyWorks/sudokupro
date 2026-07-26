@@ -108,4 +108,29 @@ public class MetaGameController {
             return ResponseEntity.badRequest().body(Map.of("title", "Bad Request", "detail", e.getMessage()));
         }
     }
+
+    /**
+     * Parameter-validation failures are the caller's fault, not the server's.
+     *
+     * <p>The class-level {@code @Validated} makes Spring validate {@code @Min}/{@code @Max}
+     * through an AOP proxy, which raises {@code ConstraintViolationException}. That
+     * exception has NO default Spring MVC mapping, so it escaped the dispatcher as an HTTP
+     * 500. Verified live before this handler existed: {@code POST /api/tournament/0/join},
+     * {@code /api/tournament/6/join}, {@code /api/tournament/-1/join} and
+     * {@code GET /api/tournament/standings?limit=0|9999} all returned 500 instead of 400.
+     *
+     * <p>{@link SudokuGameController} already carries this handler for exactly the same
+     * reason; this controller (and {@link LeaderboardController}) were missed.
+     */
+    @ExceptionHandler(jakarta.validation.ConstraintViolationException.class)
+    public ResponseEntity<Object> handleConstraintViolation(
+            jakarta.validation.ConstraintViolationException e) {
+        String detail = e.getConstraintViolations().stream()
+            .map(v -> v.getPropertyPath() + " " + v.getMessage())
+            .reduce((a, b) -> a + "; " + b)
+            .orElse("invalid request parameter");
+        return ResponseEntity.badRequest()
+            .contentType(org.springframework.http.MediaType.APPLICATION_PROBLEM_JSON)
+            .body(Map.of("title", "Invalid Parameter", "detail", detail));
+    }
 }

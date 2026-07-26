@@ -1,0 +1,70 @@
+/*
+ * Cyber Grid — the client's default theme, and the stylesheet MainStage loads by
+ * name at startup.
+ *
+ * This file (and its three siblings) did not exist. The client had no
+ * src/main/resources directory at all, so every getResource("/css/...") returned
+ * null in every build: the welcome screen was unstyled, ".title-fade" did nothing,
+ * and picking a theme cleared the scene's stylesheet list and had nothing to put
+ * back. Shipping the resources the code loads is the fix; ThemeManager no longer
+ * clears styling it cannot replace.
+ */
+.root {
+    -fx-background-color: #000000;
+    -fx-font-family: "Arial";
+}
+.title-fade {
+    -fx-fill: #00FFFF;
+    -fx-effect: dropshadow(gaussian, #00FFFF, 12, 0.4, 0, 0);
+}
+.button, .toggle-button {
+    -fx-background-color: #1A1A3A;
+    -fx-text-fill: #00FFFF;
+    -fx-border-color: #00FFFF;
+    -fx-border-width: 1;
+    -fx-background-radius: 2;
+    -fx-border-radius: 2;
+    -fx-padding: 6 12 6 12;
+}
+.button:hover, .toggle-button:hover {
+    -fx-background-color: #24244E;
+}
+.toggle-button:selected {
+    -fx-background-color: #4B0082;
+    -fx-text-fill: #FFFFFF;
+}
+.label {
+    -fx-text-fill: #E0E0E0;
+}
+.text-field, .password-field {
+    -fx-background-color: #101024;
+    -fx-text-fill: #FFFFFF;
+    -fx-prompt-text-fill: #6A6A8A;
+    -fx-border-color: #2A2A5A;
+}
+.check-box {
+    -fx-text-fill: #FFFFFF;
+}
+.check-box .box {
+    -fx-background-color: #101024;
+    -fx-border-color: #00FFFF;
+}
+.combo-box {
+    -fx-background-color: #101024;
+    -fx-text-fill: #FFFFFF;
+}
+.combo-box .list-cell {
+    -fx-text-fill: #FFFFFF;
+    -fx-background-color: #101024;
+}
+.list-view {
+    -fx-background-color: #101024;
+    -fx-control-inner-background: #101024;
+}
+.list-cell {
+    -fx-text-fill: #C8C8E0;
+    -fx-background-color: #101024;
+}
+.progress-bar > .bar {
+    -fx-accent: #00FFFF;
+}

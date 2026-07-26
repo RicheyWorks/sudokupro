@@ -1,0 +1,59 @@
+/* Astral Nebula — deep indigo with gold accents. */
+.root {
+    -fx-background-color: #0A0A23;
+    -fx-font-family: "Arial";
+}
+.title-fade {
+    -fx-fill: #FFD700;
+    -fx-effect: dropshadow(gaussian, #7B68EE, 14, 0.5, 0, 0);
+}
+.button, .toggle-button {
+    -fx-background-color: #251E58;
+    -fx-text-fill: #FFD700;
+    -fx-border-color: #7B68EE;
+    -fx-background-radius: 6;
+    -fx-border-radius: 6;
+    -fx-padding: 6 12 6 12;
+}
+.button:hover, .toggle-button:hover {
+    -fx-background-color: #322A70;
+}
+.toggle-button:selected {
+    -fx-background-color: #7B68EE;
+    -fx-text-fill: #0A0A23;
+}
+.label {
+    -fx-text-fill: #E6E1FF;
+}
+.text-field, .password-field {
+    -fx-background-color: #14143A;
+    -fx-text-fill: #FFFFFF;
+    -fx-prompt-text-fill: #6F6FA0;
+    -fx-border-color: #7B68EE;
+}
+.check-box {
+    -fx-text-fill: #E6E1FF;
+}
+.check-box .box {
+    -fx-background-color: #14143A;
+    -fx-border-color: #7B68EE;
+}
+.combo-box {
+    -fx-background-color: #14143A;
+    -fx-text-fill: #FFFFFF;
+}
+.combo-box .list-cell {
+    -fx-text-fill: #FFFFFF;
+    -fx-background-color: #14143A;
+}
+.list-view {
+    -fx-background-color: #14143A;
+    -fx-control-inner-background: #14143A;
+}
+.list-cell {
+    -fx-text-fill: #D8D2FF;
+    -fx-background-color: #14143A;
+}
+.progress-bar > .bar {
+    -fx-accent: #FFD700;
+}

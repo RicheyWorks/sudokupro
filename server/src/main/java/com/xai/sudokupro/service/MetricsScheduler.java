@@ -1,6 +1,5 @@
 package com.xai.sudokupro.service;
 
-import com.xai.sudokupro.model.SudokuBoard;
 import com.xai.sudokupro.model.User;
 import com.xai.sudokupro.repository.GameRepository;
 import com.xai.sudokupro.repository.UserRepository;
@@ -20,12 +19,12 @@ import org.springframework.stereotype.Service;
 import jakarta.annotation.PreDestroy;
 import java.time.LocalDateTime;
 import java.util.HashMap;
-import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReference;
 
 /**
  * Cosmic observer of SudokuPro's metric universe.
@@ -55,16 +54,19 @@ public class MetricsScheduler {
     private final DistributionSummary solveTimeHistogram;
     private final DistributionSummary suspicionRateHistogram;
     private final Map<String, AtomicLong> tierGauges = new HashMap<>();
-    private final Map<String, AtomicLong> themeGameGauges = new HashMap<>();
     private final AtomicLong totalUsersGauge = new AtomicLong(0);
     private final AtomicLong totalGemsGauge = new AtomicLong(0);
     private final AtomicLong activeGamesGauge = new AtomicLong(0);
     private final AtomicLong suspiciousPlayersGauge = new AtomicLong(0);
-    private final AtomicLong cosmicDripGauge = new AtomicLong(0);
-    private final AtomicLong duelWinRateGauge = new AtomicLong(0);
+    // Bug fix: these three were AtomicLong fed through a (long) cast even though they are
+    // published as double gauges named "...average". A population averaging 0.9 cosmic drip
+    // was reported as 0, and a 2/3 duel win rate as 66 instead of 66.67 — the metrics were
+    // wrong by up to 100% for small averages. AtomicReference<Double> keeps the fraction.
+    private final AtomicReference<Double> cosmicDripGauge = new AtomicReference<>(0.0);
+    private final AtomicReference<Double> duelWinRateGauge = new AtomicReference<>(0.0);
     private final AtomicLong dailyActiveGauge = new AtomicLong(0);
     private final AtomicLong activeUsersGauge = new AtomicLong(0);
-    private final AtomicLong solveTimeGauge = new AtomicLong(0);
+    private final AtomicReference<Double> solveTimeGauge = new AtomicReference<>(0.0);
     private final Map<String, AtomicLong> themePointsGauges = new HashMap<>();
 
     @Autowired
@@ -94,9 +96,9 @@ public class MetricsScheduler {
             meterRegistry.gauge("sudokupro.tiers." + tier.toLowerCase(), GLOBAL_TAGS, tierGauges.get(tier), AtomicLong::get);
         }
         for (String theme : THEMES) {
-            themeGameGauges.put(theme, new AtomicLong(0));
-            meterRegistry.gauge("sudokupro.active.games.by.theme", Tags.concat(GLOBAL_TAGS, Tags.of("theme", theme)), 
-                themeGameGauges.get(theme), AtomicLong::get);
+            // Bug fix: "sudokupro.active.games.by.theme" used to be registered here. It could
+            // only ever read 0 — see reportUserMetrics — and there is no honest way to fill
+            // it, so it is no longer published. The real figure is sudokupro.active.games.
             themePointsGauges.put(theme, new AtomicLong(0));
             meterRegistry.gauge("sudokupro.points.by.theme", Tags.concat(GLOBAL_TAGS, Tags.of("theme", theme)), 
                 themePointsGauges.get(theme), AtomicLong::get);
@@ -105,12 +107,12 @@ public class MetricsScheduler {
         meterRegistry.gauge("sudokupro.total.gems", GLOBAL_TAGS, totalGemsGauge, AtomicLong::get);
         meterRegistry.gauge("sudokupro.active.games", GLOBAL_TAGS, activeGamesGauge, AtomicLong::get);
         meterRegistry.gauge("sudokupro.suspicious.players", GLOBAL_TAGS, suspiciousPlayersGauge, AtomicLong::get);
-        meterRegistry.gauge("sudokupro.cosmic.drip.average", GLOBAL_TAGS, cosmicDripGauge, AtomicLong::doubleValue);
-        meterRegistry.gauge("sudokupro.duel.win.rate.average", GLOBAL_TAGS, duelWinRateGauge, AtomicLong::doubleValue);
+        meterRegistry.gauge("sudokupro.cosmic.drip.average", GLOBAL_TAGS, cosmicDripGauge, r -> r.get());
+        meterRegistry.gauge("sudokupro.duel.win.rate.average", GLOBAL_TAGS, duelWinRateGauge, r -> r.get());
         meterRegistry.gauge("sudokupro.daily.active.users", GLOBAL_TAGS, dailyActiveGauge, AtomicLong::get);
         meterRegistry.gauge("sudokupro.active.users",
             Tags.concat(GLOBAL_TAGS, Tags.of("period", "24h")), activeUsersGauge, AtomicLong::get);
-        meterRegistry.gauge("sudokupro.solve.time.average", GLOBAL_TAGS, solveTimeGauge, AtomicLong::doubleValue);
+        meterRegistry.gauge("sudokupro.solve.time.average", GLOBAL_TAGS, solveTimeGauge, r -> r.get());
     }
 
     @Scheduled(fixedRate = METRICS_INTERVAL_MS)
@@ -150,13 +152,13 @@ public class MetricsScheduler {
 
             // Cosmic Drip Distribution
             double avgDrip = analyticsService.getAverageCosmicDripActiveUsers(LocalDateTime.now().minusDays(1));
-            cosmicDripGauge.set((long) avgDrip);
+            cosmicDripGauge.set(avgDrip);
             logger.debug("Reported average cosmic drip: {}", avgDrip);
 
             // Duel Win Rate
             Map<String, Double> winRates = analyticsService.getPlayerWinRates();
             double avgWinRate = winRates.values().stream().mapToDouble(Double::doubleValue).average().orElse(0.0);
-            duelWinRateGauge.set((long) (avgWinRate * 100)); // Store as percentage
+            duelWinRateGauge.set(avgWinRate * 100); // Store as percentage
             logger.debug("Reported average duel win rate: {}", avgWinRate);
 
             // Suspicious Players
@@ -168,15 +170,24 @@ public class MetricsScheduler {
             reportSuspicionBuckets(suspiciousCount);
             logger.debug("Reported suspicious players: {}", suspiciousCount);
 
-            // Active Games by Theme — no board list available here; gauges updated in reportDailyMetrics.
-            // Bug fix: themeGameGauges.get(theme) returns null for unknown themes, causing NPE.
-            // Guard with a null check so an unexpected theme key doesn't crash the whole metrics run.
-            Map<String, Long> activeGamesByTheme = calculateActiveGamesByTheme(List.of());
-            activeGamesByTheme.forEach((theme, count) -> {
-                AtomicLong gauge = themeGameGauges.get(theme);
-                if (gauge != null) gauge.set(count);
-            });
-            logger.debug("Reported active games by theme: {}", activeGamesByTheme);
+            // Bug fix: an "active games by theme" block used to sit here. It called
+            // calculateActiveGamesByTheme(List.of()) — a hardcoded empty list — every 30
+            // seconds, so all four sudokupro.active.games.by.theme{theme=...} series read 0
+            // for the life of the process. The comment claimed the gauges were "updated in
+            // reportDailyMetrics", but that method only writes sudokupro.points.by.theme;
+            // nothing anywhere ever wrote a non-zero value.
+            //
+            // It could not have been fixed by passing real rows either: SudokuBoard has no
+            // theme attribute, and the getBoardTheme() helper was a placeholder returning the
+            // literal "default", so three of the four series would still have been flat zero
+            // and the fourth would merely have duplicated sudokupro.active.games.
+            //
+            // A gauge that always reads 0 is worse than no gauge: a dashboard panel built on
+            // it looks identical during an outage and during normal operation, so it
+            // positively argues that a broken system is healthy. Rather than publish a
+            // dimension the data model cannot support, the series is removed; the honest
+            // total is already published above as sudokupro.active.games. Restoring a
+            // per-theme breakdown needs a theme column on SudokuBoard first.
 
         } catch (Exception e) {
             logger.error("Failed to update cosmic user metrics: {}", e.getMessage(), e);
@@ -206,7 +217,7 @@ public class MetricsScheduler {
 
             // Average Solve Time with Buckets
             double avgSolveTime = analyticsService.getAverageSolveTime();
-            solveTimeGauge.set((long) avgSolveTime);
+            solveTimeGauge.set(avgSolveTime);
             solveTimeHistogram.record(avgSolveTime);
             reportSolveTimeBuckets(avgSolveTime);
             logger.debug("Reported average solve time: {}s", avgSolveTime);
@@ -253,7 +264,6 @@ public class MetricsScheduler {
             logger.info("Daily Active Users: {}", dailyActiveGauge.get());
             logger.info("Average Solve Time: {}s", solveTimeGauge.get());
             tierGauges.forEach((tier, gauge) -> logger.info("Tier {} Users: {}", tier, gauge.get()));
-            themeGameGauges.forEach((theme, gauge) -> logger.info("Active Games for Theme {}: {}", theme, gauge.get()));
             themePointsGauges.forEach((theme, gauge) -> logger.info("Points for Theme {}: {}", theme, gauge.get()));
             logger.info("Cosmic gauge dump complete");
         } catch (Exception e) {
@@ -265,7 +275,11 @@ public class MetricsScheduler {
 
     public void triggerChaosMode(String playerId) {
         validatePlayerId(playerId);
-        meterRegistry.counter("sudokupro.chaos.mode.activations", Tags.concat(GLOBAL_TAGS, Tags.of("player", playerId))).increment();
+        // Bug fix: this counter used to carry a "player" tag holding the raw player id. Every
+        // distinct player minted a new Micrometer meter that the registry retains for the life
+        // of the process — unbounded heap growth here and a cardinality explosion in whatever
+        // scrapes it. The player id belongs in a log line, not in a metric tag.
+        meterRegistry.counter("sudokupro.chaos.mode.activations", GLOBAL_TAGS).increment();
         logger.info("Chaos mode triggered by player {}—cosmic metrics updated", playerId);
     }
 
@@ -285,11 +299,20 @@ public class MetricsScheduler {
             rank = leaderboardService.getPlayerRank(Long.parseLong(playerId));
         } catch (NumberFormatException e) {
             logger.debug("Cannot look up rank for non-numeric playerId '{}', defaulting to Unranked", playerId);
+        } catch (RuntimeException e) {
+            // Bug fix: only NumberFormatException was handled. LeaderboardService.getPlayerRank
+            // wraps every repository failure in a RuntimeException, so a database blip escaped
+            // this metrics sink and failed the duel flow that was merely trying to record a
+            // result. Telemetry must never break the caller.
+            logger.warn("Rank lookup failed for player {} while recording a duel outcome; tagging Unranked: {}",
+                playerId, e.getMessage());
         }
         String tier = rank != null ? rank.tier() : "Unranked";
         String outcome = won ? "win" : "loss";
-        meterRegistry.counter("sudokupro.duels.by.tier", 
-            Tags.concat(GLOBAL_TAGS, Tags.of("player", playerId, "outcome", outcome, "tier", tier))).increment();
+        // Bug fix: the "player" tag made this counter unbounded in cardinality (see
+        // triggerChaosMode). outcome x tier is a bounded 2 x 5 tag space.
+        meterRegistry.counter("sudokupro.duels.by.tier",
+            Tags.concat(GLOBAL_TAGS, Tags.of("outcome", outcome, "tier", tier))).increment();
         logger.debug("Duel outcome recorded for player {}: {} (tier: {})", playerId, outcome, tier);
     }
 
@@ -357,26 +380,6 @@ public class MetricsScheduler {
         } else {
             meterRegistry.counter("sudokupro.suspicion.bucket.10_plus", GLOBAL_TAGS).increment();
         }
-    }
-
-    private Map<String, Long> calculateActiveGamesByTheme(List<SudokuBoard> activeGames) {
-        Map<String, Long> themeCounts = new HashMap<>();
-        for (String theme : THEMES) {
-            long count = activeGames.stream()
-                .filter(board -> theme.equals(getBoardTheme(board)))
-                .count();
-            themeCounts.put(theme, count);
-        }
-        return themeCounts;
-    }
-
-    /**
-     * TODO: Replace with actual theme extraction logic when SudokuBoard includes a theme field.
-     * Expected: board.getTheme() or similar.
-     */
-    private String getBoardTheme(SudokuBoard board) {
-        // Placeholder until theme is implemented in SudokuBoard
-        return "default";
     }
 
     private void validatePlayerId(String playerId) {

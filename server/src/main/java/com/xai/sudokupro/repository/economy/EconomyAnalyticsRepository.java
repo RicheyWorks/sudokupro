@@ -31,7 +31,7 @@ public interface EconomyAnalyticsRepository extends JpaRepository<User, Long> {
 
     @EntityGraph(attributePaths = {"achievements", "powerUps"})
     @Query("SELECT u FROM User u WHERE u.level >= :level ORDER BY u.gems DESC")
-    @Cacheable(value = "topGemHoarders", key = "#level + '-' + #pageable.pageNumber")
+    @Cacheable(value = "topGemHoarders", key = "#level + '-' + #pageable")
     List<User> findTopGemHoardersByLevel(@Param("level") int level, Pageable pageable);
 
     @Query("SELECT u FROM User u WHERE u.gems >= :minGems AND u.points >= :minPoints AND u.duelWins >= :minWins")
@@ -41,21 +41,21 @@ public interface EconomyAnalyticsRepository extends JpaRepository<User, Long> {
                                 @Param("minWins") int minWins);
 
     @Query(value = "SELECT * FROM users ORDER BY points DESC", nativeQuery = true)
-    @Cacheable(value = "topUsers", key = "#pageable.pageNumber")
+    @Cacheable(value = "topUsers", key = "#pageable")
     List<User> findTopUsersNative(Pageable pageable);
 
     @EntityGraph(attributePaths = {"matchHistory"})
     @Query("SELECT u FROM User u WHERE u.cosmicDrip >= :minDrip ORDER BY u.cosmicDrip DESC, u.points DESC")
-    @Cacheable(value = "cosmicDrippers", key = "#minDrip + '-' + #pageable.pageNumber")
+    @Cacheable(value = "cosmicDrippers", key = "#minDrip + '-' + #pageable")
     List<User> findCosmicDrippers(@Param("minDrip") int minDrip, Pageable pageable);
 
     @Query("SELECT u FROM User u WHERE SIZE(u.friends) >= :minFriends ORDER BY u.hypeMeter DESC")
-    @Cacheable(value = "socialInfluencers", key = "#minFriends + '-' + #pageable.pageNumber")
+    @Cacheable(value = "socialInfluencers", key = "#minFriends + '-' + #pageable")
     List<User> findSocialInfluencers(@Param("minFriends") int minFriends, Pageable pageable);
 
     @Query("SELECT u FROM User u WHERE u.level BETWEEN :minLevel AND :maxLevel AND u.gems >= :minGems " +
            "ORDER BY (u.duelWins * 1.5 + u.points * 0.5 + u.cosmicDrip) DESC")
-    @Cacheable(value = "cosmicElite", key = "#minLevel + '-' + #maxLevel + '-' + #minGems + '-' + #pageable.pageNumber")
+    @Cacheable(value = "cosmicElite", key = "#minLevel + '-' + #maxLevel + '-' + #minGems + '-' + #pageable")
     List<User> findCosmicEliteByLevelRange(@Param("minLevel") int minLevel,
                                            @Param("maxLevel") int maxLevel,
                                            @Param("minGems") int minGems,
@@ -66,7 +66,7 @@ public interface EconomyAnalyticsRepository extends JpaRepository<User, Long> {
            "FROM user_match_history GROUP BY user_id HAVING match_count >= :minMatches) mh " +
            "ON u.id = mh.user_id WHERE u.hype_meter >= :minHype ORDER BY mh.win_rate DESC, u.points DESC",
            nativeQuery = true)
-    @Cacheable(value = "hypeMatchMasters", key = "#minMatches + '-' + #minHype + '-' + #pageable.pageNumber")
+    @Cacheable(value = "hypeMatchMasters", key = "#minMatches + '-' + #minHype + '-' + #pageable")
     List<User> findHypeMatchMasters(@Param("minMatches") int minMatches,
                                    @Param("minHype") int minHype,
                                    Pageable pageable);
@@ -75,13 +75,13 @@ public interface EconomyAnalyticsRepository extends JpaRepository<User, Long> {
 
     @EntityGraph(attributePaths = {"powerUps"})
     @Query("SELECT u FROM User u WHERE u.powerUps[:powerUp] >= :minCount ORDER BY u.powerUps[:powerUp] DESC")
-    @Cacheable(value = "powerUpUsers", key = "#powerUp + '-' + #minCount + '-' + #pageable.pageNumber")
+    @Cacheable(value = "powerUpUsers", key = "#powerUp + '-' + #minCount + '-' + #pageable")
     List<User> findPowerUpUsers(@Param("powerUp") String powerUp,
                                @Param("minCount") int minCount,
                                Pageable pageable);
 
     @Query("SELECT u FROM User u WHERE u.lastLogin >= :since ORDER BY u.points DESC, u.cosmicDrip DESC")
-    @Cacheable(value = "activeUsers", key = "#since + '-' + #pageable.pageNumber")
+    @Cacheable(value = "activeUsers", key = "#since + '-' + #pageable")
     List<User> findActiveUsersSince(@Param("since") LocalDateTime since, Pageable pageable);
 
     @Transactional(readOnly = true)
@@ -91,7 +91,7 @@ public interface EconomyAnalyticsRepository extends JpaRepository<User, Long> {
 
     @Query("SELECT u FROM User u WHERE u.xp >= :minXp AND u.level <= :maxLevel " +
            "ORDER BY (u.xp / u.level) DESC")
-    @Cacheable(value = "xpEfficiency", key = "#minXp + '-' + #maxLevel + '-' + #pageable.pageNumber")
+    @Cacheable(value = "xpEfficiency", key = "#minXp + '-' + #maxLevel + '-' + #pageable")
     List<User> findXpEfficientUsers(@Param("minXp") int minXp,
                                    @Param("maxLevel") int maxLevel,
                                    Pageable pageable);

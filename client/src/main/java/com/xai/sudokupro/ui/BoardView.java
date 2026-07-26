@@ -1,7 +1,9 @@
 package com.xai.sudokupro.ui;
 
 import com.xai.sudokupro.client.GameClient;
+import com.xai.sudokupro.client.MoveLabels;
 import com.xai.sudokupro.client.Notifier;
+import com.xai.sudokupro.client.net.ConnectionException;
 import com.xai.sudokupro.model.EnhancedMove;
 import com.xai.sudokupro.model.SudokuBoard;
 import com.xai.sudokupro.model.SudokuCell;
@@ -131,6 +133,13 @@ public class BoardView {
         cell.textProperty().addListener((ChangeListener<String>) (obs, oldVal, newVal) -> {
             // Bug 2 fix: ignore programmatic setText() fired from refreshCell()
             if (updatingCell.get()) return;
+            // Pause used to be decorative on this side too: setPaused() stored a flag
+            // nothing read, so a "paused" game accepted moves exactly as before.
+            if (isPaused) {
+                notifier.notify("ui", "The game is paused — press Resume to keep playing");
+                revertCellText(cell, oldVal);
+                return;
+            }
             try {
                 SudokuBoard board = board();
                 if (!board.isCellEditable(row, col)) return;
@@ -146,21 +155,19 @@ public class BoardView {
                     updateMoveHistory(move);
                     updateDifficultyProgress();
                 }
+            } catch (ConnectionException e) {
+                // A dead channel is not a bad move. This used to fall through to the
+                // clause below and tell the player "Invalid move: Gameplay channel is
+                // not connected" — blaming a legal digit for a network fault, and
+                // pointing at nothing they could do about it.
+                logger.warn("Move at ({},{}) not sent: {}", row, col, e.getMessage());
+                notifier.notify("error", e.getMessage());
+                requestReconnect();
+                revertCellText(cell, oldVal);
             } catch (Exception e) {
                 logger.error("Move failed at ({},{}): {}", row, col, e.getMessage());
                 notifier.notify("error", "Invalid move: " + e.getMessage());
-                // The revert is programmatic, so it must carry the same guard
-                // refreshCell() uses — otherwise setText re-enters this listener
-                // and attempts a second (also failing) move, double-reporting
-                // the error and firing a redundant server round-trip.
-                Platform.runLater(() -> {
-                    updatingCell.set(true);
-                    try {
-                        cell.setText(oldVal);
-                    } finally {
-                        updatingCell.set(false);
-                    }
-                });
+                revertCellText(cell, oldVal);
             }
         });
 
@@ -275,7 +282,11 @@ public class BoardView {
             Platform.runLater(this::filterMoveHistory);
             notifier.notify("ui", "Move undone");
         } catch (Exception e) {
+            // A failure here used to be logged and nothing else, so a player on a
+            // dead channel pressed Undo, saw the board not change, and was told
+            // nothing at all.
             logger.error("Undo failed: {}", e.getMessage());
+            reportActionFailure("Undo", e);
         }
     }
 
@@ -285,7 +296,55 @@ public class BoardView {
             notifier.notify("ui", "Move redone");
         } catch (Exception e) {
             logger.error("Redo failed: {}", e.getMessage());
+            reportActionFailure("Redo", e);
         }
+    }
+
+    /** Tells the player an action failed, and starts a reconnect when the channel is why. */
+    private void reportActionFailure(String action, Exception cause) {
+        if (cause instanceof ConnectionException) {
+            notifier.notify("error", action + " not sent — " + cause.getMessage());
+            requestReconnect();
+        } else {
+            notifier.notify("error", action + " failed: " + cause.getMessage());
+        }
+    }
+
+    /**
+     * Rejoins the gameplay channel in the background. Deliberately off the FX
+     * thread: the reconnect does a blocking WebSocket handshake, and running it
+     * inline would freeze the window for the connect timeout.
+     */
+    private void requestReconnect() {
+        Thread t = new Thread(() -> {
+            try {
+                client.reconnect();
+                notifier.notify("ui", "Reconnected — the board is back in sync");
+            } catch (Exception e) {
+                logger.warn("Manual reconnect failed: {}", e.getMessage());
+                notifier.notify("error", "Reconnect failed: " + e.getMessage());
+            }
+        }, "sudokupro-reconnect-request");
+        t.setDaemon(true);
+        t.start();
+    }
+
+    /**
+     * Restores a cell's previous text without re-entering the move path.
+     *
+     * <p>The revert is programmatic, so it must carry the same guard refreshCell()
+     * uses — otherwise setText re-enters the listener and attempts a second (also
+     * failing) move, double-reporting the error and firing a redundant round trip.
+     */
+    private void revertCellText(TextField cell, String previous) {
+        Platform.runLater(() -> {
+            updatingCell.set(true);
+            try {
+                cell.setText(previous);
+            } finally {
+                updatingCell.set(false);
+            }
+        });
     }
 
     /** One-shot server-side auto-solve (network call — off the FX thread). */
@@ -404,6 +463,12 @@ public class BoardView {
         cell.setFont(Font.font("Arial", sc.getPencilMarks().isEmpty() ? 18 : 12));
     }
 
+    /** Selects and highlights one cell — used by Replay to walk the grid. Safe from any thread. */
+    public void highlightCell(int row, int col) {
+        if (row < 0 || row >= GRID_SIZE || col < 0 || col >= GRID_SIZE) return;
+        Platform.runLater(() -> highlightCells(row, col));
+    }
+
     private void highlightCells(int row, int col) {
         highlightedRow = row; highlightedCol = col;
         for (int r = 0; r < GRID_SIZE; r++) for (int c = 0; c < GRID_SIZE; c++)
@@ -433,17 +498,15 @@ public class BoardView {
      */
     private void recordHintInHistory(String hint) {
         Platform.runLater(() -> {
-            allMoveHistory.add(HINT_HISTORY_LABEL);
+            allMoveHistory.add(MoveLabels.HINT);
             filterMoveHistory();
         });
     }
 
-    /** The single spelling of the hint entry, shared by the writer and the filter. */
-    private static final String HINT_HISTORY_LABEL = "Hint Applied";
-
     private void updateMoveHistory(EnhancedMove move) {
-        String text = move.source() == SudokuCell.MoveSource.HINT ? HINT_HISTORY_LABEL
-            : String.format("(%d,%d)=%d", move.row()+1, move.col()+1, move.newVal());
+        // MoveLabels is the one place a move becomes a line, so the writer and the
+        // filter below cannot drift on to different spellings of "Hint Applied".
+        String text = MoveLabels.describe(move);
         // Bug 1 fix: append to the immutable backing list, then re-render
         Platform.runLater(() -> {
             allMoveHistory.add(text);
@@ -456,8 +519,8 @@ public class BoardView {
         // so switching the filter back to "All" restores entries that were hidden.
         String filter = historyFilter.getValue();
         List<String> filtered = allMoveHistory.stream().filter(item -> switch (filter) {
-            case "Player Moves" -> !item.equals("Hint Applied");
-            case "Hints"        -> item.equals("Hint Applied");
+            case "Player Moves" -> !MoveLabels.isHint(item);
+            case "Hints"        -> MoveLabels.isHint(item);
             default             -> true;
         }).collect(Collectors.toList());
         moveHistoryList.getItems().setAll(filtered);

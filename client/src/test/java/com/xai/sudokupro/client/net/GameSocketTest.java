@@ -99,22 +99,78 @@ class GameSocketTest {
         assertEquals("unknown", received.get(0).from());
     }
 
+    /**
+     * The close callback carries the WebSocket status, because the reconnect policy
+     * needs it: 1008 is the server saying "never", anything else is "not right now".
+     */
     @Test
-    void onCloseAndOnErrorBothInvokeTheCloseCallback() {
+    void closeCallbackReportsTheStatusCodeAndReason() {
         AtomicInteger closeCount = new AtomicInteger();
-        GameSocket socket = new GameSocket(mapper, e -> { }, closeCount::incrementAndGet);
+        AtomicInteger seenStatus = new AtomicInteger();
+        List<String> seenReason = new ArrayList<>();
+        GameSocket socket = new GameSocket(mapper, e -> { }, (status, reason) -> {
+            closeCount.incrementAndGet();
+            seenStatus.set(status);
+            seenReason.add(reason);
+        });
 
-        socket.onClose(new FakeWebSocket(), WebSocket.NORMAL_CLOSURE, "bye");
+        socket.onClose(new FakeWebSocket(), 1008, "Competitive games cannot be spectated");
+
         assertEquals(1, closeCount.get());
+        assertEquals(1008, seenStatus.get());
+        assertEquals(List.of("Competitive games cannot be spectated"), seenReason);
+    }
+
+    /**
+     * One link death is one report. The JDK calls onError and then onClose for the
+     * same broken connection, so reporting both burns two of the reconnect budget's
+     * attempts (and shows the player two "connection lost" notices) for one event.
+     */
+    @Test
+    void oneDeadLinkIsReportedExactlyOnceEvenWhenOnErrorPrecedesOnClose() {
+        AtomicInteger closeCount = new AtomicInteger();
+        GameSocket socket = new GameSocket(mapper, e -> { }, (status, reason) -> closeCount.incrementAndGet());
 
         socket.onError(new FakeWebSocket(), new RuntimeException("boom"));
-        assertEquals(2, closeCount.get());
+        socket.onClose(new FakeWebSocket(), WebSocket.NORMAL_CLOSURE, "bye");
+
+        assertEquals(1, closeCount.get());
+    }
+
+    /**
+     * A link can die without a close frame at all — a TCP reset, a proxy timeout, a
+     * laptop lid. The JDK reports that through onError, and if that path does not
+     * report the loss the channel sits believing it is live forever.
+     */
+    @Test
+    void aTransportErrorWithNoCloseFrameIsStillReportedAsALostLink() {
+        List<Integer> statuses = new ArrayList<>();
+        GameSocket socket = new GameSocket(mapper, e -> { },
+            (status, reason) -> statuses.add(status));
+
+        socket.onError(new FakeWebSocket(), new java.io.IOException("connection reset"));
+
+        assertEquals(List.of(CloseListener.TRANSPORT_ERROR), statuses);
+    }
+
+    /** A deliberate close is ours, so it must not be reported as a lost connection. */
+    @Test
+    void aDeliberateCloseIsNotReportedAsAConnectionLoss() {
+        AtomicInteger closeCount = new AtomicInteger();
+        GameSocket socket = new GameSocket(mapper, e -> { }, (status, reason) -> closeCount.incrementAndGet());
+
+        socket.close();
+        socket.onClose(new FakeWebSocket(), WebSocket.NORMAL_CLOSURE, "bye");
+
+        assertEquals(0, closeCount.get(),
+            "Every intentional game switch closes the socket; each one used to tell the "
+            + "player their connection had been lost");
     }
 
     @Test
     void sendBeforeConnectionEstablishedThrowsRatherThanNullPointerException() {
         GameSocket socket = new GameSocket(mapper, e -> { }, null);
-        ApiException e = assertThrows(ApiException.class, () -> socket.send("move", "payload"));
+        ConnectionException e = assertThrows(ConnectionException.class, () -> socket.send("move", "payload"));
         assertTrue(e.getMessage().contains("closed"));
     }
 

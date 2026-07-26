@@ -241,31 +241,84 @@ public class SudokuGameController {
         }
     }
 
-    @Operation(summary = "Get a hint from the AI solver")
+    /**
+     * Date after which the deprecated {@code GET /api/game/hint} may be removed (RFC 8594).
+     * Advertised on every GET response so a client operator can see the deadline without
+     * reading our source.
+     */
+    private static final String HINT_GET_SUNSET = "Sat, 31 Oct 2026 23:59:59 GMT";
+
+    @Operation(summary = "Buy a hint from the AI solver (spends gems)")
     @ApiResponses({
         @ApiResponse(responseCode = "200", description = "Hint returned"),
+        @ApiResponse(responseCode = "402", description = "Not enough gems",
+                content = @io.swagger.v3.oas.annotations.media.Content(mediaType = "application/problem+json")),
+        @ApiResponse(responseCode = "403", description = "Board belongs to another player",
+                content = @io.swagger.v3.oas.annotations.media.Content(mediaType = "application/problem+json")),
         @ApiResponse(responseCode = "500", description = "Error retrieving hint",
                 content = @io.swagger.v3.oas.annotations.media.Content(mediaType = "application/problem+json"))
+    })
+    @PostMapping("/hint")
+    public ResponseEntity<Object> buyHint(@RequestParam(required = false) String gameId) {
+        return hintResponse(gameId, false);
+    }
+
+    /**
+     * Deprecated: use {@code POST /api/game/hint}.
+     *
+     * <p>This endpoint charged gems, incremented {@code hintCount} and wrote the board — on a
+     * GET. HTTP defines GET as safe (RFC 9110 §9.2.1), and the ecosystem acts on that
+     * literally: a browser reload, a bfcache restore, a {@code <link rel=prefetch>}, a
+     * security proxy's URL warm-up, or a crawler that finds the URL in a log will all replay
+     * it with no user involvement, and each replay spent five of the player's gems and cost
+     * them the clean-solve bonus by inflating a hint count they never asked for.
+     *
+     * <p>Rather than break the already-shipped JavaFX desktop client ({@code client/}) that
+     * calls this URL, the route stays — but it now delegates to
+     * {@link com.xai.sudokupro.service.GameService#getHintIdempotent(String, String)}, so
+     * repeating it against an unchanged grid replays the hint already issued, free. It is
+     * therefore safe and idempotent as HTTP requires, while still answering old clients. The
+     * response advertises its own deprecation so the migration is visible in-band rather
+     * than only in a changelog.
+     */
+    @Deprecated
+    @Operation(summary = "Deprecated — use POST /api/game/hint. Safe/idempotent hint read.",
+               deprecated = true)
+    @ApiResponses({
+        @ApiResponse(responseCode = "200", description = "Hint returned (replayed if unchanged)")
     })
     @GetMapping("/hint")
     public ResponseEntity<Object> getHint(
             @RequestParam(required = false) String gameId) {
+        return hintResponse(gameId, true);
+    }
+
+    /**
+     * @param idempotent {@code true} for the deprecated GET (replay an already-issued hint
+     *                   for an unchanged grid), {@code false} for the POST (always a purchase)
+     */
+    private ResponseEntity<Object> hintResponse(String gameId, boolean idempotent) {
         try {
             String hint;
+            String playerId = authService.getCurrentPlayerId();
             if (gameId != null && !gameId.isBlank()) {
                 // Pass the caller so the charge lands on them and a non-owner is refused;
                 // without this a spectator could drain the board owner's wallet.
-                hint = gameService.getHint(gameId, authService.getCurrentPlayerId());
+                hint = idempotent
+                    ? gameService.getHintIdempotent(gameId, playerId)
+                    : gameService.getHint(gameId, playerId);
             } else {
-                String playerId = authService.getCurrentPlayerId();
-                hint = gameService.getHintForPlayer(playerId);
+                hint = idempotent
+                    ? gameService.getHintForPlayerIdempotent(playerId)
+                    : gameService.getHintForPlayer(playerId);
             }
             if (hint == null || hint.isEmpty()) {
                 logger.debug("No hint available for current game state");
-                return ResponseEntity.ok(Map.of("hint", "No hint available—keep solving!"));
+                return hintHeaders(ResponseEntity.ok(), idempotent)
+                    .body(Map.of("hint", "No hint available—keep solving!"));
             }
             logger.debug("Hint provided: {}", hint);
-            return ResponseEntity.ok(Map.of("hint", hint));
+            return hintHeaders(ResponseEntity.ok(), idempotent).body(Map.of("hint", hint));
         } catch (com.xai.sudokupro.service.economy.InsufficientGemsException e) {
             return ResponseEntity.status(HttpStatus.PAYMENT_REQUIRED)
                 .contentType(MediaType.APPLICATION_PROBLEM_JSON)
@@ -293,6 +346,24 @@ public class SudokuGameController {
                     "Unable to fetch hint: " + e.getMessage()
                 ));
         }
+    }
+
+    /**
+     * Headers common to both hint verbs.
+     *
+     * <p>{@code Cache-Control: no-store} on both: a hint is per-player, per-board and paid
+     * for, so no intermediary may keep a copy — and a cached GET response is one more way the
+     * old endpoint could be replayed. The deprecation signalling (RFC 8594 {@code Deprecation}
+     * and {@code Sunset}, plus a {@code Link} to the successor) rides on the GET only.
+     */
+    private ResponseEntity.BodyBuilder hintHeaders(ResponseEntity.BodyBuilder builder, boolean deprecated) {
+        builder.header("Cache-Control", "no-store");
+        if (deprecated) {
+            builder.header("Deprecation", "true");
+            builder.header("Sunset", HINT_GET_SUNSET);
+            builder.header("Link", "</api/game/hint>; rel=\"successor-version\"; method=\"POST\"");
+        }
+        return builder;
     }
 
     /**

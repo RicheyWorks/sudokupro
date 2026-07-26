@@ -14,6 +14,7 @@ import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Qualifier;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.data.redis.core.RedisTemplate;
 import org.springframework.stereotype.Service;
 
@@ -26,8 +27,21 @@ import java.util.concurrent.TimeUnit;
 public class GameService {
     private static final Logger logger = LoggerFactory.getLogger(GameService.class);
     private static final long REDIS_TTL_MINUTES = 60;
-    private static final int  MAX_ACTIVE_GAMES  = 10_000;
+    /** Shipped default for {@link #maxActiveGames}. */
+    static final int DEFAULT_MAX_ACTIVE_GAMES = 10_000;
     private static final int  MAX_STREAK_BONUS  = 5;
+
+    /**
+     * How many boards this pod keeps cached before evicting the least-recently-used one.
+     *
+     * <p>A per-pod memory-sizing decision rather than a law of the program, so it is a
+     * tunable field instead of a compile-time constant. That also makes eviction reachable
+     * in a unit test: the cap test used to read a few hundred games against a hard-wired
+     * 10,000 and so never crossed the threshold — it passed with eviction entirely
+     * disabled.
+     */
+    @Value("${sudokupro.game.max-active-games:10000}")
+    private int maxActiveGames = DEFAULT_MAX_ACTIVE_GAMES;
 
     private final AISolverService      aiSolverService;
     private final GameRepository       gameRepository;
@@ -130,7 +144,7 @@ public class GameService {
         board.setTimeAttack(timeAttack);
         board.setInfiniteMode(infiniteMode);
 
-        // Register and trim under a narrow creation lock so MAX_ACTIVE_GAMES is enforced atomically.
+        // Register and trim under a narrow creation lock so the cap is enforced atomically.
         synchronized (creationLock) {
             activeGames.put(gameId, board);
             touch(gameId);
@@ -207,6 +221,17 @@ public class GameService {
         return getHint(gameId);
     }
 
+    /**
+     * Safe/idempotent variant of {@link #getHintForPlayer(String)} for the deprecated
+     * {@code GET /api/game/hint} with no {@code gameId}.
+     */
+    public String getHintForPlayerIdempotent(String playerId) {
+        if (playerId == null || playerId.isBlank()) return "No player specified.";
+        String gameId = findActiveGameForPlayer(playerId);
+        if (gameId == null) return "No active game found for player.";
+        return getHintIdempotent(gameId, playerId);
+    }
+
     /** Returns the gameId of the player's current active game, or null if none. */
     public String findActiveGameForPlayer(String playerId) {
         return activeGames.entrySet().stream()
@@ -235,12 +260,64 @@ public class GameService {
     public String getHint(String gameId, String requesterId) {
         validateGameId(gameId);
         try (var lock = gameLocks.lock(gameId)) {
+            return purchaseHint(gameId, requesterId);
+        }
+    }
+
+    /**
+     * The hint most recently sold for a game, remembered against the exact grid it was sold
+     * for. Bounded by construction: one entry per cached board, discarded by
+     * {@link #forget(String)}, {@link #endGame(String, String)} and {@link #trimActiveGames()}
+     * alongside the board itself.
+     */
+    private final Map<String, IssuedHint> lastIssuedHint = new ConcurrentHashMap<>();
+
+    private record IssuedHint(String gridFingerprint, String hint) {}
+
+    /**
+     * Safe, idempotent hint read — what {@code GET /api/game/hint} now calls.
+     *
+     * <p>{@code GET} was charging gems, incrementing {@code hintCount} and writing the board.
+     * HTTP defines GET as safe (RFC 9110 §9.2.1) and the ecosystem takes that literally: a
+     * reload, a bfcache restore, a {@code <link rel=prefetch>}, an antivirus/proxy URL
+     * warm-up, or a crawler that finds the URL in a log all replay it with no user
+     * involvement. Each replay bought another hint, and every purchase also raised
+     * {@code hintCount}, which costs the player the clean-solve bonus and the
+     * {@code CleanSolver} achievement — a penalty applied for something they never did.
+     *
+     * <p>So the purchase moved to {@code POST} and this method makes the surviving GET
+     * genuinely idempotent: while the grid is unchanged it replays the hint already issued
+     * for that grid, free, with no board mutation and no write. Asking again after a move
+     * (a different grid) is a new purchase, so the feature still works; a player who wants a
+     * second hint on the same grid uses POST.
+     *
+     * <p>The fingerprint covers cell values only, deliberately. {@code hintCount} changes on
+     * every purchase, so including it would invalidate the memo the instant it was written
+     * and restore the double-charge.
+     */
+    public String getHintIdempotent(String gameId, String requesterId) {
+        validateGameId(gameId);
+        try (var lock = gameLocks.lock(gameId)) {
             SudokuBoard board = getGame(gameId);
-            if (requesterId != null && board.getPlayerId() != null
-                    && !requesterId.equals(board.getPlayerId())) {
-                throw new SecurityException(
-                    "Game " + gameId + " belongs to " + board.getPlayerId() + " — hints are for its owner");
+            requireHintOwner(board, gameId, requesterId);
+            IssuedHint prior = lastIssuedHint.get(gameId);
+            if (prior != null && prior.gridFingerprint().equals(gridFingerprint(board))) {
+                logger.debug("Replaying already-issued hint for {} (grid unchanged) — no charge", gameId);
+                return prior.hint();
             }
+            return purchaseHint(gameId, requesterId);
+        }
+    }
+
+    /**
+     * Buys a hint. Caller must already hold the game lock.
+     *
+     * @throws SecurityException if the requester does not own the board (mapped to 403)
+     */
+    private String purchaseHint(String gameId, String requesterId) {
+        {
+            SudokuBoard board = getGame(gameId);
+            requireHintOwner(board, gameId, requesterId);
             String hint = aiSolverService.getNextLogicalMove(board);
             // Hint economy: charge AFTER computing but BEFORE revealing — a
             // throw here (InsufficientGemsException) means the player pays
@@ -262,8 +339,36 @@ public class GameService {
             // then rewarded as though they had never taken one.
             saveToRedis(gameId, board);
             persistBoard(board);
+            // Remember what this grid state has already been sold, so a replayed GET
+            // (prefetch, reload, crawler) returns the same answer instead of buying another.
+            lastIssuedHint.put(gameId, new IssuedHint(gridFingerprint(board), hint));
             return hint;
         }
+    }
+
+    /** Shared ownership check for both hint paths. */
+    private void requireHintOwner(SudokuBoard board, String gameId, String requesterId) {
+        if (requesterId != null && board.getPlayerId() != null
+                && !requesterId.equals(board.getPlayerId())) {
+            throw new SecurityException(
+                "Game " + gameId + " belongs to " + board.getPlayerId() + " — hints are for its owner");
+        }
+    }
+
+    /**
+     * Compact identity of the playable grid: the 81 cell values in row-major order.
+     *
+     * <p>Values only — not {@code hintCount}, not the move counter, not pencil marks. Two
+     * requests with the same values get the same next logical move, which is precisely when
+     * replaying is honest.
+     */
+    private String gridFingerprint(SudokuBoard board) {
+        SudokuCell[][] grid = board.getBoard();
+        StringBuilder sb = new StringBuilder(grid.length * grid.length);
+        for (SudokuCell[] row : grid) {
+            for (SudokuCell cell : row) sb.append((char) ('0' + cell.getValue()));
+        }
+        return sb.toString();
     }
 
     // =====================================================================
@@ -340,6 +445,7 @@ public class GameService {
             SudokuBoard board = activeGames.remove(gameId);
             lastAccess.remove(gameId);
             locallyMutated.remove(gameId);
+            lastIssuedHint.remove(gameId);
             if (board != null) {
                 wasActive = true;
                 redisTemplate.delete(redisKey(gameId));
@@ -880,11 +986,12 @@ public class GameService {
     private void forget(String gameId) {
         activeGames.remove(gameId);
         lastAccess.remove(gameId);
+        lastIssuedHint.remove(gameId);
         gameLocks.releaseGame(gameId);
     }
 
     private void trimActiveGames() {
-        while (activeGames.size() > MAX_ACTIVE_GAMES) {
+        while (activeGames.size() > maxActiveGames) {
             // Genuinely least-recently-used, not "whatever the hash iterator yields first".
             String victim = lastAccess.entrySet().stream()
                 .min(Map.Entry.comparingByValue())
@@ -894,6 +1001,7 @@ public class GameService {
             activeGames.remove(victim);
             lastAccess.remove(victim);
             locallyMutated.remove(victim);
+            lastIssuedHint.remove(victim);
             // Only drops the monitor if nobody holds it — evicting a busy game's lock
             // would let two threads into the same critical section.
             gameLocks.releaseGame(victim);

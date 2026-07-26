@@ -1,0 +1,59 @@
+/* Retro Pixel — high-contrast green-on-black, chunky borders. */
+.root {
+    -fx-background-color: #0B0B0B;
+    -fx-font-family: "Monospaced";
+}
+.title-fade {
+    -fx-fill: #33FF33;
+}
+.button, .toggle-button {
+    -fx-background-color: #1B1B1B;
+    -fx-text-fill: #33FF33;
+    -fx-border-color: #33FF33;
+    -fx-border-width: 2;
+    -fx-background-radius: 0;
+    -fx-border-radius: 0;
+    -fx-padding: 6 12 6 12;
+}
+.button:hover, .toggle-button:hover {
+    -fx-background-color: #263326;
+}
+.toggle-button:selected {
+    -fx-background-color: #33FF33;
+    -fx-text-fill: #0B0B0B;
+}
+.label {
+    -fx-text-fill: #33FF33;
+}
+.text-field, .password-field {
+    -fx-background-color: #0B0B0B;
+    -fx-text-fill: #33FF33;
+    -fx-prompt-text-fill: #1F661F;
+    -fx-border-color: #33FF33;
+}
+.check-box {
+    -fx-text-fill: #33FF33;
+}
+.check-box .box {
+    -fx-background-color: #0B0B0B;
+    -fx-border-color: #33FF33;
+}
+.combo-box {
+    -fx-background-color: #0B0B0B;
+    -fx-text-fill: #33FF33;
+}
+.combo-box .list-cell {
+    -fx-text-fill: #33FF33;
+    -fx-background-color: #0B0B0B;
+}
+.list-view {
+    -fx-background-color: #0B0B0B;
+    -fx-control-inner-background: #0B0B0B;
+}
+.list-cell {
+    -fx-text-fill: #33FF33;
+    -fx-background-color: #0B0B0B;
+}
+.progress-bar > .bar {
+    -fx-accent: #33FF33;
+}

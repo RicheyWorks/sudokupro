@@ -29,6 +29,7 @@ public class SecurityConfig {
 
     @Bean
     public SecurityFilterChain securityFilterChain(HttpSecurity http, LoginAttemptFilter loginAttemptFilter,
+            RegistrationThrottleFilter registrationThrottleFilter,
             com.xai.sudokupro.service.auth.AccountService accountService,
             @org.springframework.beans.factory.annotation.Value("${spring.security.user.name:admin}") String adminUser,
             @org.springframework.beans.factory.annotation.Value("${spring.security.user.password:}") String adminPassword)
@@ -59,6 +60,10 @@ public class SecurityConfig {
             // Brute-force lockout (LoginAttemptLimiter): must run before Spring Security
             // even attempts to authenticate the Basic credentials.
             .addFilterBefore(loginAttemptFilter, BasicAuthenticationFilter.class)
+            // Account-creation quota (RegistrationAttemptLimiter). POST /api/auth/register is
+            // permitAll and CSRF-exempt by necessity, so nothing else in this chain stands
+            // between an anonymous client and an unbounded supply of real user rows.
+            .addFilterBefore(registrationThrottleFilter, BasicAuthenticationFilter.class)
             .authorizeHttpRequests(auth -> auth
                 .requestMatchers("/admin/**").hasRole("ADMIN") // Broaden to all admin endpoints
                 // /actuator/health/** covers the liveness and readiness GROUPS, not just the
@@ -180,6 +185,26 @@ public class SecurityConfig {
     @Bean
     public FilterRegistrationBean<LoginAttemptFilter> loginAttemptFilterRegistration(LoginAttemptFilter filter) {
         FilterRegistrationBean<LoginAttemptFilter> registration = new FilterRegistrationBean<>(filter);
+        registration.setEnabled(false);
+        return registration;
+    }
+
+    @Bean
+    public RegistrationThrottleFilter registrationThrottleFilter(
+            com.xai.sudokupro.service.RegistrationAttemptLimiter limiter) {
+        return new RegistrationThrottleFilter(limiter);
+    }
+
+    /**
+     * Same reason as {@link #loginAttemptFilterRegistration}: Boot auto-registers every
+     * {@code Filter} bean as a global servlet filter mapped to {@code /*}. Left enabled, the
+     * throttle filter would run twice per registration and count each attempt twice, halving
+     * the effective quota.
+     */
+    @Bean
+    public FilterRegistrationBean<RegistrationThrottleFilter> registrationThrottleFilterRegistration(
+            RegistrationThrottleFilter filter) {
+        FilterRegistrationBean<RegistrationThrottleFilter> registration = new FilterRegistrationBean<>(filter);
         registration.setEnabled(false);
         return registration;
     }

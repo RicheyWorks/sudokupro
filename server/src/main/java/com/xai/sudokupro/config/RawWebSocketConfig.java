@@ -12,7 +12,9 @@ import org.springframework.web.socket.config.annotation.WebSocketConfigurer;
 import org.springframework.web.socket.config.annotation.WebSocketHandlerRegistry;
 import org.springframework.web.socket.server.HandshakeInterceptor;
 import org.springframework.web.util.UriComponentsBuilder;
+import org.springframework.web.util.UriUtils;
 
+import java.nio.charset.StandardCharsets;
 import java.util.Map;
 
 /**
@@ -85,17 +87,47 @@ public class RawWebSocketConfig implements WebSocketConfigurer {
      * session attributes so WebSocketController joins that game instead of
      * creating a new one — this is how a remote client reconnects to the game
      * it created over REST.
+     *
+     * <p>The value is percent-DECODED before it is stored. It previously was not, and the
+     * attribute is later used as a game id verbatim, so any id containing a character a
+     * conscientious client escapes could never be joined. That is not hypothetical: daily
+     * and duel ids embed a player name after a colon — {@code daily-2026-07-26:someuser} —
+     * and the web client builds its socket URL with {@code encodeURIComponent}, so the
+     * server received {@code daily-2026-07-26%3Asomeuser}, found no such game, and closed
+     * the socket with {@code 1008 Unknown game}. Every id from the ordinary "new game" flow
+     * is a bare UUID, which survives encoding unchanged — which is exactly why this stayed
+     * hidden while breaking both multiplayer modes.
      */
     static final class GameIdHandshakeInterceptor implements HandshakeInterceptor {
         @Override
         public boolean beforeHandshake(ServerHttpRequest request, ServerHttpResponse response,
                                        WebSocketHandler wsHandler, Map<String, Object> attributes) {
-            String gameId = UriComponentsBuilder.fromUri(request.getURI())
-                .build().getQueryParams().getFirst("gameId");
+            String gameId = decodeOrNull(UriComponentsBuilder.fromUri(request.getURI())
+                .build().getQueryParams().getFirst("gameId"));
             if (gameId != null && !gameId.isBlank()) {
                 attributes.put("gameId", gameId);
             }
             return true;
+        }
+
+        /**
+         * Decodes the raw parameter, or returns null if it cannot be decoded.
+         *
+         * <p>A syntactically broken escape is already rejected upstream by
+         * {@link java.net.URI}, so the catch is defence in depth rather than a live path —
+         * but an exception escaping {@code beforeHandshake} would turn a bad query string
+         * into a failed upgrade with a stack trace, and an id nobody can decode is not an
+         * id worth joining. Starting a fresh game is the better failure.
+         */
+        private static String decodeOrNull(String raw) {
+            if (raw == null) return null;
+            try {
+                return UriUtils.decode(raw, StandardCharsets.UTF_8);
+            } catch (IllegalArgumentException e) {
+                logger.debug("Ignoring an undecodable gameId handshake parameter: {}",
+                    e.getMessage());
+                return null;
+            }
         }
 
         @Override

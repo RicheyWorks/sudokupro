@@ -8,6 +8,7 @@ import io.micrometer.core.instrument.MeterRegistry;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
+import com.xai.sudokupro.config.AsyncConfig;
 import org.springframework.scheduling.annotation.Async;
 import org.springframework.stereotype.Service;
 
@@ -49,7 +50,14 @@ public class NotificationService {
         meterRegistry.gauge("sudokupro.notification.queue.size", notificationQueue, Queue::size);
     }
 
-    @Async
+    // Executor named explicitly rather than left to AsyncConfigurer resolution. Spring only
+    // consults the AsyncConfigurer if that bean happens to be initialised before the async
+    // post-processor needs it, and this application initialises lazily — the same ordering
+    // trap that left SecretsGuard dead. Observed for real: in a full-suite run @Async
+    // silently resolved to the scheduler's pool ("scheduling-1"), so notifications competed
+    // with every @Scheduled job for the same threads while the bounded pool built for them
+    // sat idle. Naming the bean makes resolution order-independent.
+    @Async(AsyncConfig.ASYNC_EXECUTOR)
     public void sendNotification(String playerId, String message) {
         validatePlayerId(playerId);
         validateMessage(message);
@@ -72,7 +80,14 @@ public class NotificationService {
         }
     }
 
-    @Async
+    // Executor named explicitly rather than left to AsyncConfigurer resolution. Spring only
+    // consults the AsyncConfigurer if that bean happens to be initialised before the async
+    // post-processor needs it, and this application initialises lazily — the same ordering
+    // trap that left SecretsGuard dead. Observed for real: in a full-suite run @Async
+    // silently resolved to the scheduler's pool ("scheduling-1"), so notifications competed
+    // with every @Scheduled job for the same threads while the bounded pool built for them
+    // sat idle. Naming the bean makes resolution order-independent.
+    @Async(AsyncConfig.ASYNC_EXECUTOR)
     public void sendTypedNotification(String playerId, String type, String message) {
         validatePlayerId(playerId);
         validateType(type);
@@ -96,7 +111,14 @@ public class NotificationService {
         }
     }
 
-    @Async
+    // Executor named explicitly rather than left to AsyncConfigurer resolution. Spring only
+    // consults the AsyncConfigurer if that bean happens to be initialised before the async
+    // post-processor needs it, and this application initialises lazily — the same ordering
+    // trap that left SecretsGuard dead. Observed for real: in a full-suite run @Async
+    // silently resolved to the scheduler's pool ("scheduling-1"), so notifications competed
+    // with every @Scheduled job for the same threads while the bounded pool built for them
+    // sat idle. Naming the bean makes resolution order-independent.
+    @Async(AsyncConfig.ASYNC_EXECUTOR)
     public void broadcastNotification(String type, String message) {
         validateType(type);
         validateMessage(message);

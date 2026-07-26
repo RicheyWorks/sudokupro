@@ -27,7 +27,7 @@ public interface RetentionStatsRepository extends JpaRepository<User, Long> {
 
     @EntityGraph(attributePaths = {"matchHistory"})
     @Query("SELECT u FROM User u WHERE u.level < :levelCap ORDER BY u.level ASC")
-    @Cacheable(value = "newbies", key = "#levelCap + '-' + #pageable.pageNumber")
+    @Cacheable(value = "newbies", key = "#levelCap + '-' + #pageable")
     List<User> findNewbies(@Param("levelCap") int levelCap, Pageable pageable);
 
     @Query("SELECT u FROM User u WHERE u.points > :pointsThreshold AND u.lastLogin > :since ORDER BY u.points DESC")
@@ -36,21 +36,21 @@ public interface RetentionStatsRepository extends JpaRepository<User, Long> {
                                              @Param("since") LocalDateTime since);
 
     @Query("SELECT u FROM User u WHERE u.lastLogin < :cutoff AND u.level >= :minLevel ORDER BY u.lastLogin ASC")
-    @Cacheable(value = "churnRisks", key = "#cutoff + '-' + #minLevel + '-' + #pageable.pageNumber")
+    @Cacheable(value = "churnRisks", key = "#cutoff + '-' + #minLevel + '-' + #pageable")
     List<User> findChurnRisks(@Param("cutoff") LocalDateTime cutoff,
                              @Param("minLevel") int minLevel,
                              Pageable pageable);
 
     @EntityGraph(attributePaths = {"achievements"})
     @Query("SELECT u FROM User u WHERE u.lastLogin > :since AND u.cosmicDrip >= :minDrip ORDER BY u.cosmicDrip DESC, u.hypeMeter DESC")
-    @Cacheable(value = "activeDripLords", key = "#since + '-' + #minDrip + '-' + #pageable.pageNumber")
+    @Cacheable(value = "activeDripLords", key = "#since + '-' + #minDrip + '-' + #pageable")
     List<User> findActiveDripLords(@Param("since") LocalDateTime since,
                                   @Param("minDrip") int minDrip,
                                   Pageable pageable);
 
     @Query("SELECT u FROM User u WHERE u.lastLogin BETWEEN :start AND :end AND u.duelWins >= :minWins " +
            "ORDER BY u.duelWins DESC, u.points DESC")
-    @Cacheable(value = "engagedDuelists", key = "#start + '-' + #end + '-' + #minWins + '-' + #pageable.pageNumber")
+    @Cacheable(value = "engagedDuelists", key = "#start + '-' + #end + '-' + #minWins + '-' + #pageable")
     List<User> findEngagedDuelistsInPeriod(@Param("start") LocalDateTime start,
                                            @Param("end") LocalDateTime end,
                                            @Param("minWins") int minWins,
@@ -58,7 +58,7 @@ public interface RetentionStatsRepository extends JpaRepository<User, Long> {
 
     @Query("SELECT u FROM User u WHERE u.lastLogin > :since AND u.streak >= :minStreak AND u.level < :levelCap " +
            "ORDER BY u.streak DESC, u.cosmicDrip DESC")
-    @Cacheable(value = "streakingNewbies", key = "#since + '-' + #minStreak + '-' + #levelCap + '-' + #pageable.pageNumber")
+    @Cacheable(value = "streakingNewbies", key = "#since + '-' + #minStreak + '-' + #levelCap + '-' + #pageable")
     List<User> findStreakingNewbies(@Param("since") LocalDateTime since,
                                    @Param("minStreak") int minStreak,
                                    @Param("levelCap") int levelCap,
@@ -70,7 +70,7 @@ public interface RetentionStatsRepository extends JpaRepository<User, Long> {
            "AND EXISTS (SELECT 1 FROM user_match_history mh WHERE mh.user_id = u.id AND mh.match_timestamp > :since) " +
            "ORDER BY u.hype_meter DESC, u.cosmic_drip DESC",
            nativeQuery = true)
-    @Cacheable(value = "activeMatchPlayers", key = "#since + '-' + #pageable.pageNumber")
+    @Cacheable(value = "activeMatchPlayers", key = "#since + '-' + #pageable")
     List<User> findActiveMatchPlayers(@Param("since") LocalDateTime since, Pageable pageable);
 
     // New Queries
@@ -78,7 +78,7 @@ public interface RetentionStatsRepository extends JpaRepository<User, Long> {
     @EntityGraph(attributePaths = {"powerUps"})
     @Query("SELECT u FROM User u WHERE u.lastLogin > :since AND u.powerUps[:powerUp] >= :minCount " +
            "ORDER BY u.powerUps[:powerUp] DESC, u.hypeMeter DESC")
-    @Cacheable(value = "powerUpRetainees", key = "#since + '-' + #powerUp + '-' + #minCount + '-' + #pageable.pageNumber")
+    @Cacheable(value = "powerUpRetainees", key = "#since + '-' + #powerUp + '-' + #minCount + '-' + #pageable")
     List<User> findPowerUpRetainees(@Param("since") LocalDateTime since,
                                    @Param("powerUp") String powerUp,
                                    @Param("minCount") int minCount,
@@ -86,7 +86,7 @@ public interface RetentionStatsRepository extends JpaRepository<User, Long> {
 
     @Query("SELECT u FROM User u WHERE u.lastLogin > :since AND SIZE(u.achievements) >= :minAchievements " +
            "ORDER BY u.points DESC, u.cosmicDrip DESC")
-    @Cacheable(value = "achievementRetainees", key = "#since + '-' + #minAchievements + '-' + #pageable.pageNumber")
+    @Cacheable(value = "achievementRetainees", key = "#since + '-' + #minAchievements + '-' + #pageable")
     List<User> findAchievementRetainees(@Param("since") LocalDateTime since,
                                         @Param("minAchievements") int minAchievements,
                                         Pageable pageable);
@@ -98,7 +98,7 @@ public interface RetentionStatsRepository extends JpaRepository<User, Long> {
 
     @Query("SELECT u FROM User u WHERE u.lastLogin > :since AND u.fanCount >= :minFans " +
            "ORDER BY u.hypeMeter DESC, u.cosmicDrip DESC")
-    @Cacheable(value = "fanEngagedPlayers", key = "#since + '-' + #minFans + '-' + #pageable.pageNumber")
+    @Cacheable(value = "fanEngagedPlayers", key = "#since + '-' + #minFans + '-' + #pageable")
     List<User> findFanEngagedPlayers(@Param("since") LocalDateTime since,
                                     @Param("minFans") int minFans,
                                     Pageable pageable);

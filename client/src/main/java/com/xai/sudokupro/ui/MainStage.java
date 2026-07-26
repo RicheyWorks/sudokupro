@@ -1,7 +1,12 @@
 package com.xai.sudokupro.ui;
 
+import com.xai.sudokupro.client.ChatLine;
 import com.xai.sudokupro.client.GameClient;
+import com.xai.sudokupro.client.MoveLabels;
+import com.xai.sudokupro.client.PlayClock;
+import com.xai.sudokupro.client.ReplaySession;
 import com.xai.sudokupro.client.net.ApiException;
+import com.xai.sudokupro.client.net.ConnectionState;
 import com.xai.sudokupro.client.net.ServerApi;
 import com.xai.sudokupro.client.net.ServerConfig;
 import com.xai.sudokupro.model.SudokuBoard;
@@ -9,7 +14,9 @@ import com.xai.sudokupro.model.api.BoardState;
 import com.xai.sudokupro.model.api.EventInfo;
 import com.xai.sudokupro.model.api.LeaderboardEntry;
 import javafx.animation.FadeTransition;
+import javafx.animation.KeyFrame;
 import javafx.animation.ScaleTransition;
+import javafx.animation.Timeline;
 import javafx.application.Application;
 import javafx.application.Platform;
 import javafx.geometry.Insets;
@@ -27,9 +34,6 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.net.URL;
-import java.time.LocalDateTime;
-import java.time.format.DateTimeFormatter;
-import java.util.Deque;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -62,11 +66,20 @@ public class MainStage extends Application {
     private ListView<String> eventNotifications;
     private AudioClip backgroundMusic;
     private AudioClip victorySound;
-    private volatile boolean isPaused = false;
+    private Label connectionLabel;
+    private Button reconnectButton;
+    private Timeline replayTimeline;
     private int timerInterval = 1000; // Default 1s
     // Bug 5 fix: generation counter — each startTimer() call increments this so older
     // threads see a changed generation and exit, preventing thread accumulation on reset.
     private volatile int timerGeneration = 0;
+
+    /**
+     * The one source of elapsed play time. It replaces a bare {@code startTime}
+     * that the pause flag never touched, so "paused" only stopped the label from
+     * being repainted and the whole break was billed to the player on resume.
+     */
+    private final PlayClock clock = new PlayClock();
 
     @Override
     public void start(Stage primaryStage) {
@@ -215,8 +228,10 @@ public class MainStage extends Application {
                 updateStats();
             }
         });
-        client.setOnChat(msg -> Platform.runLater(() -> chatList.getItems().add(msg)));
+        client.setOnChat((from, text) ->
+            Platform.runLater(() -> addChatLine(ChatLine.renderNow(from, text))));
         client.setOnEvent(msg -> Platform.runLater(() -> eventNotifications.getItems().add(msg)));
+        client.setOnConnectionState(state -> Platform.runLater(() -> showConnectionState(state)));
 
         primaryStage.setScene(gameScene);
         resetBoard(primaryStage);
@@ -298,12 +313,21 @@ public class MainStage extends Application {
         themeButton.setOnAction(e -> themeManager.showThemeCustomizer(primaryStage.getScene()));
         pauseButton = new ToggleButton("Pause");
         pauseButton.setOnAction(e -> togglePause());
+        // A visible connection state, and a way to act on it. Neither existed: a
+        // dead channel was invisible until the next move failed, and there was no
+        // control anywhere in the client that could open a socket again.
+        connectionLabel = new Label("Live");
+        connectionLabel.setStyle("-fx-text-fill: #55FF55; -fx-font-size: 14;");
+        reconnectButton = new Button("Reconnect");
+        reconnectButton.setDisable(true);
+        reconnectButton.setOnAction(e -> reconnectNow());
         Button replayButton = new Button("Replay");
         replayButton.setOnAction(e -> replayGame(primaryStage));
         Button settingsButton = new Button("Settings");
         settingsButton.setOnAction(e -> showSettings());
 
         HBox controls = new HBox(10, difficultySelector, chaosModeCheck, mirrorModeCheck, timerLabel, statsLabel,
+            connectionLabel, reconnectButton,
             dailyButton, duelButton, weeklyButton, friendsButton, shopButton, hintButton, resetButton, leaderboardButton, soundToggle, saveButton, loadButton, themeButton, pauseButton,
             replayButton, settingsButton);
         controls.setAlignment(Pos.CENTER);
@@ -374,6 +398,18 @@ public class MainStage extends Application {
             } catch (Exception e) {
                 logger.error("Failed to reset board: {}", e.getMessage(), e);
                 notify("error", "Reset failed: " + e.getMessage());
+                // Without this the window keeps the "Creating puzzle…" placeholder
+                // for good: the only sign of failure was a line in a side panel.
+                Platform.runLater(() -> {
+                    if (boardView == null) {
+                        BorderPane root = (BorderPane) primaryStage.getScene().getRoot();
+                        Label failed = new Label("Could not create a puzzle: " + e.getMessage()
+                            + "\nCheck the server and press Reset to try again.");
+                        failed.setStyle("-fx-text-fill: #FF5555; -fx-font-size: 14;");
+                        failed.setWrapText(true);
+                        root.setCenter(failed);
+                    }
+                });
             }
         }, "sudokupro-newgame");
         creator.setDaemon(true);
@@ -384,19 +420,22 @@ public class MainStage extends Application {
         // Bug 5 fix: increment generation so any already-running timer thread sees a changed
         // generation and exits. Mark new thread as daemon so it doesn't block JVM shutdown.
         final int myGeneration = ++timerGeneration;
+        clock.start();
+        if (pauseButton != null && pauseButton.isSelected()) {
+            pauseButton.setSelected(false);
+            pauseButton.setText("Pause");
+        }
         Thread t = new Thread(() -> {
-            long startTime = System.currentTimeMillis();
             // Read the board through the client each tick: undo/redo and server
             // resyncs REPLACE the local board instance mid-game.
             while (timerGeneration == myGeneration && client.board() != null
                     && !client.board().isSolved()) {
-                if (!isPaused) {
-                    long elapsed = System.currentTimeMillis() - startTime;
-                    long minutes = elapsed / 60000;
-                    long seconds = (elapsed % 60000) / 1000;
-                    String time = String.format("Time: %02d:%02d", minutes, seconds);
-                    Platform.runLater(() -> timerLabel.setText(time));
-                }
+                // The clock itself knows about pausing, so the label simply shows
+                // what it says. Skipping the repaint while paused (the old
+                // behaviour) left the underlying count running and made the display
+                // leap forward by the length of the break the moment play resumed.
+                String time = "Time: " + clock.elapsedText();
+                Platform.runLater(() -> timerLabel.setText(time));
                 try {
                     Thread.sleep(timerInterval);
                 } catch (InterruptedException e) {
@@ -407,27 +446,34 @@ public class MainStage extends Application {
             }
             SudokuBoard board = client.board();
             if (board != null && board.isSolved() && timerGeneration == myGeneration) {
+                // Compute the finished time ONCE. Reading it back off the label after
+                // having just overwritten the label is what produced the shipped
+                // "Puzzle solved in in 04:12": the second substring(6) skipped
+                // "Solved" instead of "Time: ".
+                final String finalTime = clock.elapsedText();
                 Platform.runLater(() -> {
-                    timerLabel.setText("Solved in " + timerLabel.getText().substring(6));
-                    notify("game", "Puzzle solved in " + timerLabel.getText().substring(6));
+                    timerLabel.setText("Solved in " + finalTime);
+                    notify("game", "Puzzle solved in " + finalTime);
                     if (boardView != null) playVictoryAnimation(boardView.getView());
                     if (victorySound != null) victorySound.play();
                 });
             }
-        });
+        }, "sudokupro-timer");
         t.setDaemon(true);
         t.start();
     }
 
     private void togglePause() {
-        isPaused = !isPaused;
-        pauseButton.setText(isPaused ? "Resume" : "Pause");
-        pauseButton.setStyle(isPaused ?
+        boolean paused = !clock.isPaused();
+        if (paused) clock.pause(); else clock.resume();
+        pauseButton.setSelected(paused);
+        pauseButton.setText(paused ? "Resume" : "Pause");
+        pauseButton.setStyle(paused ?
             "-fx-background-color: #FF4500; -fx-text-fill: #FFFFFF;" :
             "-fx-background-color: #4B0082; -fx-text-fill: #FFFFFF;");
-        if (boardView != null) boardView.setPaused(isPaused);
-        notify("ui", "Game " + (isPaused ? "paused" : "resumed"));
-        logger.debug("Game {} by player {}", isPaused ? "paused" : "resumed", client.playerId());
+        if (boardView != null) boardView.setPaused(paused);
+        notify("ui", "Game " + (paused ? "paused" : "resumed"));
+        logger.debug("Game {} by player {}", paused ? "paused" : "resumed", client.playerId());
     }
 
     private void showLeaderboard() {
@@ -666,6 +712,12 @@ public class MainStage extends Application {
                         actions.put("Use " + type, () -> usePowerUp(type));
                     }
                 });
+                if (actions.isEmpty()) {
+                    // iterator().next() on an empty catalog threw NoSuchElementException
+                    // straight onto the FX thread, with no dialog and no message.
+                    notify("ui", "The shop has nothing in stock right now");
+                    return;
+                }
                 ChoiceDialog<String> dialog = new ChoiceDialog<>(actions.keySet().iterator().next(), actions.keySet());
                 dialog.setTitle("Power-Up Shop");
                 dialog.setHeaderText("You have " + wallet.path("gems").asInt() + " gems");
@@ -848,40 +900,47 @@ public class MainStage extends Application {
         resumer.start();
     }
 
+    /**
+     * Walks the current game's moves back through the UI, one per second.
+     *
+     * <p>Replay used to call the asynchronous {@code resetBoard()} and then
+     * immediately start pushing the old game's moves at the server. It raced its
+     * own reset, it aimed those moves at a freshly generated and completely
+     * different puzzle, and it took them from {@code getMoveHistory()}, a
+     * {@code push}ed deque that iterates newest-first — so even had it not raced,
+     * it would have replayed the wrong game backwards. It could not work, and the
+     * audit's "never works" was exact.
+     *
+     * <p>It is now a review of what you did: chronological, driven by one FX
+     * {@link Timeline} rather than a thread racing an async reset, mutating
+     * nothing on the server, and stoppable by pressing Replay again.
+     */
     private void replayGame(Stage primaryStage) {
-        try {
-            SudokuBoard board = client.board();
-            if (board == null) return;
-            // Capture history before reset (getMoveHistory() returns a defensive Deque copy)
-            Deque<SudokuBoard.Move> moveHistory = board.getMoveHistory();
-            resetBoard(primaryStage);
-            Thread replayThread = new Thread(() -> {
-                for (SudokuBoard.Move move : moveHistory) {
-                    try {
-                        if (!isPaused) {
-                            com.xai.sudokupro.model.EnhancedMove em = new com.xai.sudokupro.model.EnhancedMove(
-                                move.row(), move.col(), move.oldVal(), move.newVal(), move.source());
-                            client.applyMove(em);
-                            Platform.runLater(() -> {
-                                if (boardView != null) boardView.refresh();
-                                updateStats();
-                            });
-                            Thread.sleep(1000);
-                        }
-                    } catch (Exception e) {
-                        logger.error("Replay failed for move {}: {}", move, e.getMessage(), e);
-                        break;
-                    }
-                }
-                notify("ui", "Replay completed");
-            });
-            replayThread.setDaemon(true);
-            replayThread.start();
-            logger.info("Replay started for player {}", client.playerId());
-        } catch (Exception e) {
-            logger.error("Failed to start replay: {}", e.getMessage(), e);
-            notify("error", "Replay failed: " + e.getMessage());
+        if (replayTimeline != null) {
+            replayTimeline.stop();
+            replayTimeline = null;
+            notify("ui", "Replay stopped");
+            return;
         }
+        ReplaySession session = ReplaySession.of(client.board());
+        if (session.isEmpty()) {
+            notify("ui", "Nothing to replay yet — play a few moves first");
+            return;
+        }
+        replayTimeline = new Timeline(new KeyFrame(Duration.seconds(1), event -> {
+            if (!session.hasNext()) {
+                if (replayTimeline != null) replayTimeline.stop();
+                replayTimeline = null;
+                notify("ui", "Replay complete — " + session.size() + " moves");
+                return;
+            }
+            var move = session.next();
+            if (boardView != null) boardView.highlightCell(move.row(), move.col());
+            notify("ui", session.progressText() + " — " + MoveLabels.describe(move));
+        }));
+        replayTimeline.setCycleCount(session.size() + 1);
+        replayTimeline.play();
+        logger.info("Replay started for player {} ({} moves)", client.playerId(), session.size());
     }
 
     private void showSettings() {
@@ -913,6 +972,47 @@ public class MainStage extends Application {
         settingsStage.show();
     }
 
+    /** Paints the connection indicator. Must run on the FX thread. */
+    private void showConnectionState(ConnectionState state) {
+        if (connectionLabel == null) return;
+        switch (state) {
+            case CONNECTED -> {
+                connectionLabel.setText("Live");
+                connectionLabel.setStyle("-fx-text-fill: #55FF55; -fx-font-size: 14;");
+                reconnectButton.setDisable(true);
+            }
+            case RECONNECTING -> {
+                connectionLabel.setText("Reconnecting…");
+                connectionLabel.setStyle("-fx-text-fill: #FFD700; -fx-font-size: 14;");
+                reconnectButton.setDisable(false);
+            }
+            case FAILED -> {
+                connectionLabel.setText("Offline");
+                connectionLabel.setStyle("-fx-text-fill: #FF5555; -fx-font-size: 14;");
+                reconnectButton.setDisable(false);
+            }
+            case DISCONNECTED -> {
+                connectionLabel.setText("Idle");
+                connectionLabel.setStyle("-fx-text-fill: #AAAAAA; -fx-font-size: 14;");
+                reconnectButton.setDisable(client.board() == null);
+            }
+        }
+    }
+
+    /** The player's manual way back onto the gameplay channel — a blocking handshake, so off the FX thread. */
+    private void reconnectNow() {
+        reconnectButton.setDisable(true);
+        runOffFx("sudokupro-reconnect", () -> {
+            try {
+                client.reconnect();
+                notify("game", "Reconnected — you are back in the game");
+            } catch (Exception e) {
+                notify("error", "Reconnect failed: " + e.getMessage());
+                Platform.runLater(() -> reconnectButton.setDisable(false));
+            }
+        });
+    }
+
     private void updateStats() {
         SudokuBoard board = client.board();
         if (board == null) return;
@@ -941,16 +1041,24 @@ public class MainStage extends Application {
     }
 
     private void sendChatMessage(String message) {
-        if (message.trim().isEmpty()) return;
-        String chatMessage = String.format("[%s] %s: %s",
-            LocalDateTime.now().format(DateTimeFormatter.ofPattern("HH:mm:ss")), client.playerId(), message);
+        String text = message.trim();
+        if (text.isEmpty()) return;
         try {
-            client.sendChat(chatMessage);
-            Platform.runLater(() -> chatList.getItems().add(chatMessage));
+            // Send the message, not a rendered line: the server puts the sender in
+            // the envelope's `from` and every receiver labels it again, so shipping
+            // "[12:04:31] ann: hi" over the wire showed peers "ann: [12:04:31] ann: hi".
+            client.sendChat(text);
+            Platform.runLater(() -> addChatLine(ChatLine.renderNow(client.playerId(), text)));
             chatInput.clear();
         } catch (Exception e) {
             notify("error", "Chat failed: " + e.getMessage());
         }
+    }
+
+    /** Appends one chat line, keeping the transcript bounded like the event panel. */
+    private void addChatLine(String line) {
+        chatList.getItems().add(line);
+        if (chatList.getItems().size() > 500) chatList.getItems().remove(0);
     }
 
     private void loadActiveEvents() {
@@ -1006,6 +1114,8 @@ public class MainStage extends Application {
 
     @Override
     public void stop() {
+        timerGeneration++;                       // retires the running timer thread
+        if (replayTimeline != null) replayTimeline.stop();
         if (backgroundMusic != null) backgroundMusic.stop();
         if (victorySound != null) victorySound.stop();
         if (client != null) client.close();

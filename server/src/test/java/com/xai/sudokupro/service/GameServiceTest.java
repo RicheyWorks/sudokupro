@@ -17,6 +17,7 @@ import org.springframework.data.redis.core.RedisTemplate;
 import org.springframework.data.redis.core.ValueOperations;
 
 import java.util.List;
+import java.util.Set;
 
 import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.ArgumentMatchers.any;
@@ -359,29 +360,127 @@ class GameServiceTest {
      * grew alongside it, until the pod ran out of memory. Eviction also picked an
      * arbitrary hash-order entry while calling it "oldest", so it could discard the game
      * someone was actively playing.
+     *
+     * <p><b>Why this replaced the previous version.</b> That test read 300 distinct games
+     * against a cap hard-wired at 10,000 and then asserted
+     * {@code after >= before && after <= before + 300} — a range the count cannot leave
+     * whatever the code does, because eviction was never even reached. It passed with
+     * {@code trimActiveGames()} deleted outright and with the "least recently used" victim
+     * replaced by an arbitrary one. The cap is now a field, so these tests drive it down to
+     * a size a unit test can cross and assert the eviction that actually happens:
+     * which entry goes, that the size stops growing, and that the survivors are intact.
      */
     @Test
-    void repeatedReadsOfDistinctGamesDoNotGrowTheCacheWithoutBound() {
-        // Every id resolves from the "database", so each read is a cache miss + insert.
+    void theCacheEvictsTheLeastRecentlyUsedGameWhenItIsFull() {
+        everyGameResolvesFromTheDatabase();
+        assertEquals(10_000, GameService.DEFAULT_MAX_ACTIVE_GAMES, "the shipped cap");
+        setCacheCap(4);
+
+        // Fill the cache to exactly its cap, oldest-first: g1 g2 g3 g4.
+        for (String id : List.of("g1", "g2", "g3", "g4")) gameService.getGame(id);
+        assertEquals(4, gameService.getActiveGamesCount());
+
+        // Re-read g1. It is now the MOST recently used, so g2 becomes the oldest.
+        gameService.getGame("g1");
+
+        // One more distinct game must evict exactly one entry, and it must be g2.
+        gameService.getGame("g5");
+
+        assertEquals(4, gameService.getActiveGamesCount(),
+            "the cache must not grow past its cap");
+        assertEquals(Set.of("g1", "g3", "g4", "g5"), Set.copyOf(cachedGameIds()),
+            "the least recently used game (g2) is the one that must go — g1 was just read");
+        assertEquals(4, trackedGameMonitors(),
+            "the evicted game's per-game lock monitor must be reclaimed with it");
+    }
+
+    /** Eviction has to actually remove the entry, not merely stop counting it. */
+    @Test
+    void anEvictedGameIsGoneFromTheCacheAndReloadedIntactOnTheNextRead() {
+        everyGameResolvesFromTheDatabase();
+        setCacheCap(2);
+
+        gameService.getGame("keep");
+        gameService.getGame("doomed");
+        gameService.getGame("newcomer");   // pushes the cache over its cap of 2
+
+        assertFalse(cachedGameIds().contains("keep"),
+            "'keep' was the least recently used and must have been removed outright");
+        assertEquals(2, gameService.getActiveGamesCount());
+
+        // Reading it back must go to the store and return that game's own board — not a
+        // stale neighbour, and not a board belonging to whichever id happened to survive.
+        SudokuBoard reloaded = gameService.getGame("keep");
+        assertEquals("keep", reloaded.getGameId());
+        assertEquals("owner-of-keep", reloaded.getPlayerId());
+        assertEquals(2, gameService.getActiveGamesCount(),
+            "reloading an evicted game must not push the cache past its cap either");
+    }
+
+    /** Sustained reads of distinct games hold the cache at its cap indefinitely. */
+    @Test
+    void sustainedReadsOfDistinctGamesHoldTheCacheAtItsCap() {
+        everyGameResolvesFromTheDatabase();
+        setCacheCap(8);
+
+        for (int i = 0; i < 200; i++) {
+            gameService.getGame("read-only-" + i);
+            assertTrue(gameService.getActiveGamesCount() <= 8,
+                "cache overflowed on read " + i + ": " + gameService.getActiveGamesCount());
+        }
+
+        assertEquals(8, gameService.getActiveGamesCount());
+        // With a pure-LRU stream of distinct reads, the survivors are the last eight ids.
+        assertEquals(Set.of("read-only-192", "read-only-193", "read-only-194", "read-only-195",
+                            "read-only-196", "read-only-197", "read-only-198", "read-only-199"),
+            Set.copyOf(cachedGameIds()));
+        assertTrue(trackedGameMonitors() <= 8,
+            "per-game lock monitors must be reclaimed alongside the cache entries, got "
+                + trackedGameMonitors());
+    }
+
+    // ---- helpers for the cache/eviction tests ----
+
+    /**
+     * Makes every game id resolve, so each first read is a cache miss followed by an insert.
+     * Boards are stamped with an id-derived owner so a reload can be told apart from a
+     * neighbouring entry.
+     */
+    private void everyGameResolvesFromTheDatabase() {
         when(gameRepository.findByGameId(anyString())).thenAnswer(inv -> {
-            SudokuBoard b = new SudokuBoard(1, false, false, 0, inv.getArgument(0));
-            b.setPlayerId("reader");
+            String id = inv.getArgument(0);
+            SudokuBoard b = new SudokuBoard(1, false, false, 0, id);
+            b.setPlayerId("owner-of-" + id);
             return b;
         });
-
-        int before = gameService.getActiveGamesCount();
-        for (int i = 0; i < 300; i++) {
-            gameService.getGame("read-only-" + i);
-        }
-        int after = gameService.getActiveGamesCount();
-
-        // The cap is large, so assert the mechanism rather than a magic number: the cache
-        // is bounded and the lock manager has not accumulated one monitor per game read.
-        assertTrue(after >= before, "reads populate the cache");
-        assertTrue(after <= before + 300, "cache cannot exceed what was read");
-        assertDoesNotThrow(() -> gameService.getGame("read-only-0"),
-            "a previously read game must still be resolvable after many further reads");
     }
+
+    /** Drives the cache cap down to a size a unit test can cross. */
+    private void setCacheCap(int cap) {
+        try {
+            java.lang.reflect.Field f = GameService.class.getDeclaredField("maxActiveGames");
+            f.setAccessible(true);
+            f.setInt(gameService, cap);
+        } catch (ReflectiveOperationException e) {
+            throw new IllegalStateException("test setup: cannot set the cache cap", e);
+        }
+    }
+
+    private java.util.Set<String> cachedGameIds() {
+        return new java.util.HashSet<>(gameService.getActiveGames().keySet());
+    }
+
+    /** Per-game lock monitors retained by the service's GameLockManager. */
+    private int trackedGameMonitors() {
+        try {
+            java.lang.reflect.Field f = GameService.class.getDeclaredField("gameLocks");
+            f.setAccessible(true);
+            return ((GameLockManager) f.get(gameService)).trackedGameCount();
+        } catch (ReflectiveOperationException e) {
+            throw new IllegalStateException("test setup: cannot reach the lock manager", e);
+        }
+    }
+
 
     /** Ending a game must reclaim its cache entry rather than leaving it pinned. */
     @Test

@@ -77,6 +77,15 @@ def ok(msg):
         print(f"  [ ok] {msg}", flush=True)
 
 
+def note(msg):
+    """A neutral line that is neither a passed check nor a finding — used when a suite
+    deliberately does not apply to the configuration in force. Printed loudly so a skipped
+    suite can never be mistaken for a passing one, which is the failure mode the JUnit
+    Docker-gated tests had for months."""
+    with _lock:
+        print(f"  [note] {msg}", flush=True)
+
+
 def check(cond, ident, detail, okmsg):
     if cond:
         ok(okmsg)
@@ -258,6 +267,16 @@ class Player:
             finding("BOT-REGISTRATION-FAILED",
                     f"could not create the account {self.name}: {st} {str(resp)[:120]}")
         return self
+
+    def try_register(self):
+        """Attempt registration and return (status, body) WITHOUT recording a finding.
+
+        register() treats a non-201 as a bug, which is right for a bot that needs an
+        account. The throttle suite needs the opposite: a refusal there is the feature
+        working, so it must not pollute the findings list."""
+        return self.call("POST", "/api/auth/register",
+                         {"username": self.name, "password": self.password},
+                         anonymous=True)
 
     def login(self):
         st, sess = self.call("GET", "/api/session")
@@ -642,7 +661,7 @@ def s_hints(cfg):
         if solution is None:
             continue
         before = p.gems()
-        st, resp = p.call("GET", f"/api/game/hint?gameId={state['gameId']}")
+        st, resp = p.call("POST", f"/api/game/hint?gameId={state['gameId']}")
         if st == 402:
             break
         if st != 200 or not isinstance(resp, dict):
@@ -752,7 +771,7 @@ def s_persistence(cfg):
             await sess.drain(0.8)
 
         # Take a hint too, so hintCount has something to lose.
-        p.call("GET", f"/api/game/hint?gameId={gid}")
+        p.call("POST", f"/api/game/hint?gameId={gid}")
         _, before = p.board(gid)
         p.call("POST", f"/api/game/{gid}/save")
 
@@ -812,7 +831,7 @@ def s_isolation(cfg):
               f"player B got {st} from {method} {path} on player A's board",
               f"B is refused {path.rsplit('/', 1)[-1]} on A's board ({st})")
 
-    st, _ = b.call("GET", f"/api/game/hint?gameId={gid}")
+    st, _ = b.call("POST", f"/api/game/hint?gameId={gid}")
     check(st not in (200,), "ISOLATION-FOREIGN-HINT-ALLOWED",
           f"player B took a hint on player A's board ({st}) — the charge lands on A",
           f"B cannot take a hint on A's board ({st})")
@@ -849,7 +868,7 @@ def s_economy(cfg):
     results = []
 
     def take(gid):
-        st, _ = p.call("GET", f"/api/game/hint?gameId={gid}")
+        st, _ = p.call("POST", f"/api/game/hint?gameId={gid}")
         with _lock:
             results.append(st)
 
@@ -1429,6 +1448,729 @@ def s_hostile_input(cfg):
           f"the server is unhealthy after hostile input ({st})",
           "the server is still healthy after hostile input")
 
+
+# ──────────────────────────────────────────────────────────────────────────────
+# A stateful, realistic player — the simulation half of the engine
+# ──────────────────────────────────────────────────────────────────────────────
+
+class Ledger:
+    """
+    Every gem movement the simulation believes should have happened.
+
+    The point is reconciliation: at the end of a run, the server's balance for each
+    player must equal their starting bonus plus the sum of what we recorded. Any drift
+    is currency created or destroyed by the server, which is the whole class of bug the
+    import mint and the concurrent-hint oversell belonged to. Spot-checking a balance
+    after one action cannot see slow leaks; a ledger can.
+    """
+
+    def __init__(self):
+        self.entries = defaultdict(list)      # player -> [(reason, delta)]
+
+    def record(self, player, reason, delta):
+        with _lock:
+            self.entries[player].append((reason, delta))
+
+    def expected(self, player):
+        return sum(d for _, d in self.entries[player])
+
+    def explain(self, player):
+        return ", ".join(f"{r}{d:+d}" for r, d in self.entries[player]) or "(no activity)"
+
+
+LEDGER = Ledger()
+
+
+class SimPlayer(Player):
+    """
+    A player with memory and habits, rather than a one-shot request.
+
+    Real players do not play one perfect game and stop. They abandon boards, come back
+    to them, make mistakes, take hints when stuck, undo, keep several games going, and
+    hold more than one tab open. Every bug this project has found in the persistence,
+    economy and realtime layers lived in exactly those transitions — a board evicted
+    between two visits, a hint charged on one connection and forgotten on another. This
+    class exists to generate those transitions on purpose.
+    """
+
+    def __init__(self, name=None):
+        super().__init__(name)
+        self.games = {}            # gameId -> {"solution": grid, "state": BoardState}
+        self.solved = 0
+        self.abandoned = 0
+        self.hints_taken = 0
+        self.starting_gems = None
+
+    def bootstrap(self):
+        self.register()
+        self.login()
+        self.starting_gems = self.gems()
+        return self
+
+    def start_game(self, difficulty=None):
+        state = self.new_game(difficulty or random.choice([1, 2, 3, 4]))
+        if not state:
+            return None
+        solution = solve(givens_of(state))
+        if solution is None:
+            finding("SIM-UNSOLVABLE-BOARD",
+                    f"the server issued {state['gameId']} with no solution")
+            return None
+        self.games[state["gameId"]] = {"solution": solution, "state": state}
+        return state
+
+    async def play_some(self, game_id, cells, mistakes=0):
+        """Plays `cells` correct moves and `mistakes` deliberate wrong ones."""
+        entry = self.games.get(game_id)
+        if not entry:
+            return None
+        solution = entry["solution"]
+        async with Session(self, game_id) as sess:
+            board = await sess.sync()
+            if not board:
+                return None
+            grid = grid_of(board)
+            empties = [(r, c) for r in range(9) for c in range(9) if grid[r][c] == 0]
+            random.shuffle(empties)
+
+            # Deliberate mistakes first: a wrong-but-plausible digit the server must refuse.
+            for (r, c) in empties[:mistakes]:
+                wrong = next((v for v in range(1, 10)
+                              if v != solution[r][c] and legal(grid, r, c, v)), None)
+                if wrong:
+                    await sess.move(r, c, 0, wrong)
+                    await asyncio.sleep(0.01)
+
+            for (r, c) in empties[:cells]:
+                await sess.move(r, c, 0, solution[r][c])
+                await asyncio.sleep(0.008)
+            await sess.drain(0.6)
+            final = await sess.sync()
+            if final:
+                entry["state"] = final
+            return final
+
+
+@suite("L23 a realistic play session survives interleaved abandon, resume and eviction")
+def s_realistic_session(cfg):
+    """
+    The transition graph real players generate, which one-shot suites never reach.
+
+    Each simulated player keeps several games in flight, plays a bit of each, abandons
+    them under cache pressure, comes back, and finishes. Every visit re-reads the board
+    and checks it against what we last saw — so a board that quietly loses moves between
+    two visits is caught at the visit, not at the end.
+    """
+    async def run():
+        players = [SimPlayer().bootstrap() for _ in range(max(2, cfg.players // 2))]
+        drift = []
+
+        async def live(p):
+            ids = []
+            for _ in range(3):
+                st = p.start_game()
+                if st:
+                    ids.append(st["gameId"])
+            if not ids:
+                return
+
+            # Round 1: a few moves in each, then walk away.
+            for gid in ids:
+                await p.play_some(gid, cells=6, mistakes=1)
+                p.call("POST", f"/api/game/{gid}/save")
+
+            snapshots = {}
+            for gid in ids:
+                st, board = p.board(gid)
+                if st == 200 and isinstance(board, dict):
+                    snapshots[gid] = (filled(grid_of(board)), board.get("moveCount"))
+
+            # Pressure: enough unrelated games to push the saved ones out of the cache.
+            for _ in range(cfg.eviction_pressure):
+                p.new_game(1)
+
+            # Round 2: come back and verify nothing was lost, then finish one.
+            for gid in ids:
+                st, board = p.board(gid)
+                if st != 200 or not isinstance(board, dict):
+                    drift.append((gid, f"unreadable after eviction: {st}"))
+                    continue
+                now = (filled(grid_of(board)), board.get("moveCount"))
+                if gid in snapshots and now != snapshots[gid]:
+                    drift.append((gid, f"{snapshots[gid]} -> {now}"))
+                if not consistent(grid_of(board)):
+                    drift.append((gid, "board holds duplicates"))
+
+            finish = ids[0]
+            await p.play_some(finish, cells=81)
+            st, board = p.board(finish)
+            if isinstance(board, dict) and board.get("solved"):
+                p.call("POST", f"/api/game/{finish}/end")
+                p.solved += 1
+
+        await asyncio.gather(*[live(p) for p in players])
+
+        check(not drift, "SIM-STATE-DRIFT",
+              f"{len(drift)} games changed or became unreadable across an "
+              f"abandon/eviction/resume cycle: {drift[:4]}",
+              f"{len(players)} players kept 3 games each across eviction with no drift")
+        check(sum(p.solved for p in players) > 0, "SIM-NO-COMPLETIONS",
+              "no simulated player managed to finish a game",
+              f"{sum(p.solved for p in players)} games finished after being abandoned and resumed")
+
+    asyncio.run(run())
+
+
+@suite("L24 the gem ledger reconciles exactly after a full session")
+def s_economy_ledger(cfg):
+    """
+    Double-entry accounting against the server.
+
+    Every action with a documented price is recorded, then the final balance is compared
+    with starting + sum(ledger). A spot check after one action cannot see a slow leak;
+    this can. It is deliberately strict — an exact match, not a range — because the whole
+    point is that currency must be conserved to the gem.
+    """
+    async def run():
+        players = [SimPlayer().bootstrap() for _ in range(max(2, cfg.players // 3))]
+        hint_cost = 5
+
+        async def act(p):
+            for _ in range(2):
+                st = p.start_game(difficulty=2)
+                if not st:
+                    continue
+                gid = st["gameId"]
+
+                # A couple of hints, each with a known price.
+                for _ in range(2):
+                    before = p.gems()
+                    code, _ = p.call("POST", f"/api/game/hint?gameId={gid}")
+                    after = p.gems()
+                    if code == 200:
+                        LEDGER.record(p.name, "hint", -(before - after))
+                        p.hints_taken += 1
+                        if before - after != hint_cost:
+                            finding("LEDGER-HINT-PRICE",
+                                    f"a hint moved the balance by {before - after}, not {hint_cost}")
+                    elif code == 402:
+                        if after != before:
+                            finding("LEDGER-REFUSED-HINT-CHARGED",
+                                    f"a refused hint still moved the balance by {before - after}")
+
+                # Finish and collect.
+                before = p.gems()
+                await p.play_some(gid, cells=81)
+                stt, board = p.board(gid)
+                if isinstance(board, dict) and board.get("solved"):
+                    p.call("POST", f"/api/game/{gid}/end")
+                    LEDGER.record(p.name, "solve", p.gems() - before)
+
+        await asyncio.gather(*[act(p) for p in players])
+
+        for p in players:
+            actual = p.gems()
+            expected = p.starting_gems + LEDGER.expected(p.name)
+            check(actual == expected, "LEDGER-DOES-NOT-RECONCILE",
+                  f"{p.name}: server says {actual} gems, the ledger says "
+                  f"{expected} (started {p.starting_gems}; {LEDGER.explain(p.name)}) — "
+                  "currency is being created or destroyed outside the documented prices",
+                  f"{p.name}: balance reconciles exactly at {actual} gems")
+
+    asyncio.run(run())
+
+
+@suite("L25 every mutating endpoint is idempotent or explicitly refuses a replay")
+def s_idempotency(cfg):
+    """
+    Replaying a request must never compound its effect.
+
+    This is the shape of the /end replay farm: an endpoint that was safe once and a
+    currency printer when repeated. Anything that changes state needs a defined answer to
+    "what if the client retried?" — because clients DO retry, on flaky networks, on
+    double-clicks, and on load-balancer timeouts.
+    """
+    p = SimPlayer().bootstrap()
+    st = p.start_game(difficulty=1)
+    if not st:
+        return
+    gid = st["gameId"]
+
+    # save: repeatable, no side effect on the balance
+    before = p.gems()
+    codes = [p.call("POST", f"/api/game/{gid}/save")[0] for _ in range(5)]
+    check(p.gems() == before, "IDEMPOTENCY-SAVE-COSTS",
+          f"five saves moved the balance {before} -> {p.gems()}",
+          f"five saves left the balance unchanged (codes {sorted(set(codes))})")
+
+    # resume: repeatable, and must keep handing back the same board
+    boards = []
+    for _ in range(4):
+        code, b = p.call("POST", f"/api/game/{gid}/resume")
+        if code == 200 and isinstance(b, dict):
+            boards.append(tuple(tuple(row) for row in grid_of(b)))
+    check(len(set(boards)) <= 1, "IDEMPOTENCY-RESUME-DIVERGES",
+          f"four resumes returned {len(set(boards))} different boards",
+          "repeated resumes return the same board")
+
+    # end on an UNSOLVED game: must not pay, however many times it is called
+    before = p.gems()
+    for _ in range(5):
+        p.call("POST", f"/api/game/{gid}/end")
+    check(p.gems() == before, "IDEMPOTENCY-END-UNSOLVED-PAYS",
+          f"ending an unsolved game five times moved the balance {before} -> {p.gems()}",
+          "ending an unsolved game pays nothing, however often")
+
+    # register: a duplicate must be refused, not silently create a second row
+    code, _ = p.call("POST", "/api/auth/register",
+                     {"username": p.name, "password": p.password}, anonymous=True)
+    check(code in (400, 409), "IDEMPOTENCY-DUPLICATE-REGISTER",
+          f"re-registering an existing username returned {code}; a second row for one "
+          "username makes every later lookup throw and locks the player out",
+          f"a duplicate registration is refused ({code})")
+
+
+@suite("L26 the REST and WebSocket views of a board never disagree")
+def s_view_agreement(cfg):
+    """
+    Two windows onto one board must show the same thing.
+
+    The web client reads over REST on load and over the socket while playing; the desktop
+    client does the same. If the two ever diverge, one of them is showing the player a
+    board the server does not have — which is how a "lost" move or a phantom entry
+    actually reaches someone.
+    """
+    async def run():
+        p = SimPlayer().bootstrap()
+        st = p.start_game(difficulty=3)
+        if not st:
+            return
+        gid = st["gameId"]
+        solution = p.games[gid]["solution"]
+        mismatches = []
+
+        async with Session(p, gid) as sess:
+            board = await sess.sync()
+            grid = grid_of(board) if board else None
+            if grid is None:
+                return
+            empties = [(r, c) for r in range(9) for c in range(9) if grid[r][c] == 0]
+            random.shuffle(empties)
+
+            for i, (r, c) in enumerate(empties[:14]):
+                await sess.move(r, c, 0, solution[r][c])
+                await asyncio.sleep(0.05)
+                await sess.drain(0.25)
+
+                ws_board = await sess.sync()
+                code, rest_board = p.board(gid)
+                if not ws_board or code != 200 or not isinstance(rest_board, dict):
+                    continue
+                if grid_of(ws_board) != grid_of(rest_board):
+                    mismatches.append(i)
+                if ws_board.get("moveCount") != rest_board.get("moveCount"):
+                    mismatches.append(f"{i}:moveCount")
+
+        check(not mismatches, "VIEW-DISAGREEMENT",
+              f"the REST and WebSocket views disagreed at {len(mismatches)} points "
+              f"during a single game: {mismatches[:5]}",
+              "REST and WebSocket agreed on the board after every move")
+
+    asyncio.run(run())
+
+
+@suite("L27 two sessions on one game stay consistent (the multi-tab case)")
+def s_multi_tab(cfg):
+    """
+    One player, two open tabs — an ordinary thing to do, and a genuine concurrency test.
+
+    Both sockets are the same account on the same board, so every move from either must
+    land exactly once and both must converge on the same grid. Losing one, or applying it
+    twice, shows up here and nowhere else.
+    """
+    async def run():
+        p = SimPlayer().bootstrap()
+        st = p.start_game(difficulty=2)
+        if not st:
+            return
+        gid = st["gameId"]
+        solution = p.games[gid]["solution"]
+
+        async with Session(p, gid) as tab_a, Session(p, gid) as tab_b:
+            await asyncio.sleep(0.3)
+            board = await tab_a.sync()
+            if not board:
+                return
+            grid = grid_of(board)
+            empties = [(r, c) for r in range(9) for c in range(9) if grid[r][c] == 0]
+            random.shuffle(empties)
+            chosen = empties[:12]
+
+            # Alternate tabs, so ordering across two sockets is exercised.
+            for i, (r, c) in enumerate(chosen):
+                tab = tab_a if i % 2 == 0 else tab_b
+                await tab.move(r, c, 0, solution[r][c])
+                await asyncio.sleep(0.02)
+
+            await tab_a.drain(1.0)
+            await tab_b.drain(1.0)
+            a_board = await tab_a.sync()
+            b_board = await tab_b.sync()
+
+            if a_board and b_board:
+                check(grid_of(a_board) == grid_of(b_board), "MULTITAB-DIVERGENCE",
+                      "two sessions on the same game show different boards",
+                      "both sessions converged on the same board")
+                landed = sum(1 for (r, c) in chosen
+                             if grid_of(a_board)[r][c] == solution[r][c])
+                check(landed == len(chosen), "MULTITAB-MOVES-LOST",
+                      f"only {landed}/{len(chosen)} moves survived being sent across two "
+                      "sessions of the same game",
+                      f"all {landed} moves from two alternating sessions landed")
+                check(a_board.get("moveCount") == b_board.get("moveCount"),
+                      "MULTITAB-COUNTER-DIVERGENCE",
+                      f"moveCount differs between sessions: {a_board.get('moveCount')} "
+                      f"vs {b_board.get('moveCount')}",
+                      "both sessions report the same move count")
+
+    asyncio.run(run())
+
+
+@suite("L28 the server degrades correctly when Redis disappears")
+def s_redis_fault_injection(cfg):
+    """
+    Redis going away must degrade the service, not break it.
+
+    The codebase is explicit that every Redis touch falls back to a local path — that is
+    why the ONE unguarded read (pass 9) was a finding. The only way to know the fallbacks
+    still work is to actually remove Redis mid-session and keep playing. This suite is
+    skipped unless --fault-injection is passed, because it manipulates a shared service.
+    """
+    if not cfg.fault_injection:
+        ok("fault injection not requested (pass --fault-injection to exercise it)")
+        return
+
+    import subprocess
+
+    def redis_running():
+        return subprocess.run(["redis-cli", "ping"], capture_output=True,
+                              timeout=5).stdout.strip() == b"PONG"
+
+    if not redis_running():
+        ok("Redis is not reachable from here — skipping fault injection")
+        return
+
+    async def run():
+        p = SimPlayer().bootstrap()
+        st = p.start_game(difficulty=2)
+        if not st:
+            return
+        gid = st["gameId"]
+        await p.play_some(gid, cells=5)
+        _, before = p.board(gid)
+
+        subprocess.run(["redis-cli", "shutdown", "nosave"], capture_output=True, timeout=5)
+        time.sleep(2)
+        try:
+            code, during = p.board(gid)
+            check(code == 200, "REDIS-DOWN-READ-FAILS",
+                  f"reading a board with Redis down returned {code} — the database still "
+                  "has the row, so this must degrade, not fail",
+                  "a board is still readable with Redis down")
+            if isinstance(before, dict) and isinstance(during, dict):
+                check(grid_of(before) == grid_of(during), "REDIS-DOWN-BOARD-CHANGED",
+                      "the board changed when Redis went away",
+                      "the board is unchanged with Redis down")
+
+            new_state = p.new_game(1)
+            check(new_state is not None, "REDIS-DOWN-CANNOT-START-GAME",
+                  "a new game could not be created with Redis down",
+                  "a new game can still be created with Redis down")
+
+            if new_state:
+                p.games[new_state["gameId"]] = {
+                    "solution": solve(givens_of(new_state)), "state": new_state}
+                final = await p.play_some(new_state["gameId"], cells=81)
+                check(final is not None and final.get("solved"),
+                      "REDIS-DOWN-CANNOT-PLAY",
+                      "a full game could not be played to completion with Redis down",
+                      "a full game plays to completion with Redis down")
+
+            code, _ = p.call("GET", "/actuator/health/liveness")
+            check(code == 200, "REDIS-DOWN-LIVENESS-FAILS",
+                  f"liveness returned {code} with Redis down — a liveness probe must not "
+                  "depend on an external system, or a Redis blip crash-loops every pod",
+                  "liveness stays green with Redis down")
+        finally:
+            subprocess.Popen(["redis-server", "--daemonize", "yes", "--port", "6379",
+                              "--save", ""], stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL)
+            for _ in range(20):
+                time.sleep(0.5)
+                if redis_running():
+                    break
+            ok("Redis restarted for the remaining suites")
+
+        # And the service must recover once Redis is back.
+        time.sleep(2)
+        code, after = p.board(gid)
+        check(code == 200, "REDIS-RECOVERY-READ-FAILS",
+              f"reading the board after Redis came back returned {code}",
+              "the board is readable again after Redis recovers")
+
+    asyncio.run(run())
+
+
+@suite("L29 a burst of requests is rate-limited without breaking the session")
+def s_rate_limits(cfg):
+    """
+    Flood control must bound an abuser without harming an ordinary player.
+
+    The WebSocket has a documented token bucket (burst 40, refill 20/s) that exists
+    because a flood could previously lock a player out. What must NOT happen is the
+    limiter killing a session that goes slightly fast, or leaving the socket unusable
+    afterwards.
+    """
+    async def run():
+        p = SimPlayer().bootstrap()
+        st = p.start_game(difficulty=1)
+        if not st:
+            return
+        gid = st["gameId"]
+        solution = p.games[gid]["solution"]
+
+        async with Session(p, gid) as sess:
+            board = await sess.sync()
+            grid = grid_of(board) if board else None
+            if grid is None:
+                return
+            empties = [(r, c) for r in range(9) for c in range(9) if grid[r][c] == 0]
+
+            # A hard burst: far above the bucket, as fast as the socket accepts.
+            for i in range(200):
+                r, c = empties[i % len(empties)]
+                try:
+                    await sess.send({"type": "sync", "payload": ""})
+                except Exception:
+                    break
+            await sess.drain(1.5)
+
+            # The session must still be usable afterwards.
+            after = await sess.sync()
+            check(after is not None, "RATELIMIT-KILLS-SESSION",
+                  "the socket stopped responding after a burst — flood control must "
+                  "throttle, not disconnect a player who clicked quickly",
+                  "the session survived a 200-frame burst and still responds")
+
+            if after:
+                # And an ordinary-paced move must still be accepted.
+                target = next(((r, c) for r in range(9) for c in range(9)
+                               if grid_of(after)[r][c] == 0), None)
+                if target:
+                    r, c = target
+                    await sess.move(r, c, 0, solution[r][c])
+                    await asyncio.sleep(0.4)
+                    await sess.drain(0.6)
+                    final = await sess.sync()
+                    if final:
+                        check(grid_of(final)[r][c] == solution[r][c],
+                              "RATELIMIT-BLOCKS-LEGITIMATE-PLAY",
+                              "a normal move was refused after the burst subsided",
+                              "normal play resumes after the burst")
+
+        code, _ = p.call("GET", "/actuator/health")
+        check(code == 200, "RATELIMIT-DEGRADES-SERVER",
+              f"the server is unhealthy after a burst ({code})",
+              "the server stays healthy through a burst")
+
+    asyncio.run(run())
+
+
+@suite("L30 an authenticated player cannot reach the admin surface")
+def s_privilege(cfg):
+    """
+    Authentication is not authorization.
+
+    The admin endpoints expose the platform's economy and XP configuration. A test that
+    only checks the anonymous case proves a login is needed, not that a ROLE is — which
+    is exactly the gap a mutation audit found in the JUnit suite.
+    """
+    p = SimPlayer().bootstrap()
+    for path in ("/admin/constants", "/admin/constants/", "/ADMIN/constants",
+                 "/admin//constants", "/admin/./constants", "/admin/constants.json"):
+        code, _ = p.call("GET", path)
+        check(code != 200, "PRIVILEGE-ADMIN-REACHABLE",
+              f"an ordinary registered player reached {path} ({code}) — this exposes the "
+              "economy and XP configuration",
+              f"an ordinary player is refused {path} ({code})")
+
+    for path in ("/actuator/env", "/actuator/beans", "/actuator/configprops",
+                 "/actuator/heapdump", "/actuator/threaddump", "/actuator/mappings"):
+        code, _ = p.call("GET", path)
+        check(code != 200, "PRIVILEGE-ACTUATOR-EXPOSED",
+              f"{path} is readable by an ordinary player ({code}) — these leak "
+              "configuration, credentials and internal structure",
+              f"{path} is not exposed ({code})")
+
+
+@suite("L31 a long soak leaves the server as healthy as it started")
+def s_long_soak(cfg):
+    """
+    Sustained mixed load, then a health comparison against the baseline.
+
+    Short suites cannot see a leak or a slow degradation. This one runs a mixed workload —
+    new games, hints, saves, resumes, abandons, completions — across many players, then
+    checks that the server is still healthy, still fast, and still correct.
+    """
+    async def run():
+        players = [SimPlayer().bootstrap() for _ in range(cfg.players)]
+
+        t0 = time.time()
+        code, _ = players[0].call("GET", "/actuator/health")
+        baseline_latency = time.time() - t0
+
+        stats = {"games": 0, "solved": 0, "hints": 0, "saves": 0, "resumes": 0}
+
+        async def churn(p):
+            for _ in range(cfg.soak_rounds):
+                action = random.choices(
+                    ["play", "abandon", "hint", "resume", "save"],
+                    weights=[5, 2, 2, 2, 2])[0]
+                if action in ("play", "abandon") or not p.games:
+                    st = p.start_game()
+                    if not st:
+                        continue
+                    stats["games"] += 1
+                    gid = st["gameId"]
+                    if action == "play":
+                        await p.play_some(gid, cells=81)
+                        _, b = p.board(gid)
+                        if isinstance(b, dict) and b.get("solved"):
+                            p.call("POST", f"/api/game/{gid}/end")
+                            stats["solved"] += 1
+                    else:
+                        await p.play_some(gid, cells=random.randint(1, 10), mistakes=1)
+                        p.abandoned += 1
+                else:
+                    gid = random.choice(list(p.games))
+                    if action == "hint":
+                        p.call("POST", f"/api/game/hint?gameId={gid}")
+                        stats["hints"] += 1
+                    elif action == "save":
+                        p.call("POST", f"/api/game/{gid}/save")
+                        stats["saves"] += 1
+                    else:
+                        p.call("POST", f"/api/game/{gid}/resume")
+                        stats["resumes"] += 1
+
+        started = time.time()
+        await asyncio.gather(*[churn(p) for p in players])
+        elapsed = time.time() - started
+
+        print(f"  soak: {cfg.players} players x {cfg.soak_rounds} rounds — "
+              f"{stats['games']} games, {stats['solved']} solved, {stats['hints']} hints, "
+              f"{stats['saves']} saves, {stats['resumes']} resumes in {elapsed:.1f}s",
+              flush=True)
+
+        t0 = time.time()
+        code, _ = players[0].call("GET", "/actuator/health")
+        after_latency = time.time() - t0
+
+        check(code == 200, "SOAK-UNHEALTHY-AFTER",
+              f"the server is unhealthy after the soak ({code})",
+              "the server is still healthy after the soak")
+        check(after_latency < max(2.0, baseline_latency * 20), "SOAK-LATENCY-DEGRADED",
+              f"health latency went {baseline_latency*1000:.0f}ms -> "
+              f"{after_latency*1000:.0f}ms across the soak, which suggests the server is "
+              "accumulating work it never releases",
+              f"health latency stable ({baseline_latency*1000:.0f}ms -> "
+              f"{after_latency*1000:.0f}ms)")
+
+        # Every board any player still holds must be valid.
+        corrupt = 0
+        checked = 0
+        for p in players:
+            for gid in list(p.games)[:5]:
+                code, b = p.board(gid)
+                if code == 200 and isinstance(b, dict):
+                    checked += 1
+                    if not consistent(grid_of(b)):
+                        corrupt += 1
+        check(corrupt == 0, "SOAK-BOARD-CORRUPTED",
+              f"{corrupt}/{checked} boards hold duplicates after the soak",
+              f"all {checked} sampled boards are still valid after the soak")
+
+    asyncio.run(run())
+
+@suite("L32 account creation is throttled per address")
+def s_registration_throttle(cfg):
+    """
+    Registration used to be completely unthrottled: anyone could mint accounts as fast as
+    they could send requests. A throttle now caps them per client address.
+
+    This suite exists because the throttle first showed up here as *harness breakage* — the
+    simulator creates dozens of players and started getting 429s. The wrong response to that
+    is to raise the quota until the harness is happy and never test the feature; the right
+    one is to prove the limit actually fires, and to prove it does so without collateral
+    damage. So: run this suite against a server configured with a SMALL quota, and assert
+    both halves.
+
+    The quota in force is read from the server rather than assumed, because a harness run
+    deliberately raises it (see --registration-quota) and a hard-coded number here would
+    silently stop testing anything the moment the two drifted apart.
+    """
+    quota = cfg.registration_quota
+    if quota is None or quota > 40:
+        note(f"L32 skipped: the registration quota in force ({quota}) is too high to "
+             f"exercise cheaply — run with --registration-quota to enable")
+        return
+
+    # This address may already be saturated by earlier traffic in the same window — the
+    # simulator creates a lot of players. A pre-saturated counter cannot distinguish "the
+    # throttle works" from "the throttle is broken open", so say so rather than reporting a
+    # bug that is really a dirty fixture. Point the server at its own Redis database
+    # (spring.data.redis.database) to get a clean counter.
+    first, _ = Player().try_register()
+    if first == 429:
+        note("L32 skipped: this address is already throttled from earlier traffic in the "
+             "current window, so the suite cannot tell a working throttle from a broken "
+             "one — give the server its own Redis database and re-run")
+        return
+
+    accepted, throttled, other = (1 if first in (200, 201) else 0), 0, []
+    if first not in (200, 201, 429):
+        other.append(first)
+    for _ in range(quota + 2):
+        code, _body = Player().try_register()
+        if code in (200, 201):
+            accepted += 1
+        elif code == 429:
+            throttled += 1
+        else:
+            other.append(code)
+
+    check(throttled > 0, "REGISTRATION-UNTHROTTLED",
+          f"created {accepted} accounts from one address with no 429 — registration is "
+          f"unthrottled, so an attacker can mint accounts at request speed",
+          f"account creation is refused with 429 after {accepted} accounts")
+
+    check(accepted > 0, "REGISTRATION-FULLY-BLOCKED",
+          "every registration was refused — the throttle is rejecting legitimate first "
+          "signups, which is worse than not having one",
+          f"the first {accepted} legitimate signups still succeeded")
+
+    check(not other, "REGISTRATION-WRONG-STATUS",
+          f"registration returned unexpected statuses {sorted(set(other))} — a throttled "
+          f"request must be a clean 429, not a 500 or a redirect",
+          "every response was either a success or a clean 429")
+
+    # A throttled registrant must not break anyone else's session.
+    code, _ = Player().call("GET", "/actuator/health", anonymous=True)
+    check(code == 200, "REGISTRATION-THROTTLE-COLLATERAL",
+          f"health returned {code} while registration was throttled — the filter is "
+          f"rejecting traffic it should never see",
+          "unrelated endpoints are unaffected by the registration throttle")
+
 @suite("L12 the server stays healthy and never returns 5xx")
 def s_health(cfg):
     p = Player().register(); p.login()
@@ -1453,6 +2195,15 @@ def main():
     ap.add_argument("--hint-boards", type=int, default=8)
     ap.add_argument("--concurrent-hints", type=int, default=6)
     ap.add_argument("--eviction-pressure", type=int, default=12)
+    ap.add_argument("--soak-rounds", type=int, default=4)
+    ap.add_argument("--fault-injection", action="store_true",
+                    help="stop and restart Redis mid-run to exercise the degraded paths")
+    ap.add_argument("--registration-quota", type=int, default=None,
+                    help="the server's sudokupro.security.register.max-attempts value. "
+                         "Set it to enable L32, which proves account creation is throttled. "
+                         "A harness server normally raises the quota so the simulator can "
+                         "create its players; pass the raised value here and L32 will skip "
+                         "rather than pretend to have tested it.")
     ap.add_argument("--quick", action="store_true")
     ap.add_argument("--only", default=None)
     cfg = ap.parse_args()
@@ -1462,6 +2213,7 @@ def main():
         cfg.players, cfg.games_per_player = 3, 1
         cfg.boards_per_difficulty, cfg.hint_boards = 2, 3
         cfg.concurrent_hints, cfg.eviction_pressure = 3, 4
+        cfg.soak_rounds = 2
 
     print("=== SudokuPro LIVE engine — playing the real server to find bugs ===")
     print(f"    target={BASE}  players={cfg.players}  games/player={cfg.games_per_player}\n",

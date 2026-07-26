@@ -24,15 +24,25 @@ import java.util.Map;
 public interface GameRepository extends JpaRepository<SudokuBoard, Long> {
 
     @Query("SELECT b FROM SudokuBoard b WHERE b.chaosMode = true ORDER BY b.solveTimeSeconds DESC")
-    @Cacheable(value = "chaosModeGames", key = "#pageable.pageNumber")
+    @Cacheable(value = "chaosModeGames", key = "#pageable")
     List<SudokuBoard> findChaosModeGames(Pageable pageable);
 
     @Query("SELECT b FROM SudokuBoard b WHERE b.mirrorMode = true AND b.hintCount <= :maxHints ORDER BY b.solveTimeSeconds ASC")
-    @Cacheable(value = "fastMirrorGames", key = "#maxHints + '-' + #pageable.pageNumber")
+    @Cacheable(value = "fastMirrorGames", key = "#maxHints + '-' + #pageable")
     List<SudokuBoard> findFastMirrorGames(@Param("maxHints") int maxHints, Pageable pageable);
 
+    /**
+     * Deliberately NOT {@code @Cacheable}, though it used to be.
+     *
+     * <p>This is live, constantly-mutating game state, and it is the read-through path:
+     * {@code GameService.getGame} calls it to rehydrate a board that has been evicted from the
+     * per-pod {@code activeGames} map, and {@code DailyPuzzleService} calls it to decide
+     * whether a player has already joined today. Every writer goes through {@code save()},
+     * which no eviction covered — so a cached board would silently discard every move and hint
+     * made since the entry was filled, and hand the player back an older grid than the one
+     * they are looking at.
+     */
     @Query("SELECT b FROM SudokuBoard b WHERE b.gameId = :gameId")
-    @Cacheable(value = "gameById", key = "#gameId")
     SudokuBoard findByGameId(@Param("gameId") String gameId);
 
     @Query("SELECT b FROM SudokuBoard b WHERE b.playerId = :playerId ORDER BY b.startTime DESC, b.id DESC")
@@ -67,25 +77,27 @@ public interface GameRepository extends JpaRepository<SudokuBoard, Long> {
     List<SudokuBoard> findResumableByPlayerId(@Param("playerId") String playerId, Pageable pageable);
 
     @Query("SELECT b FROM SudokuBoard b WHERE b.cosmicDripLevel >= :minDrip ORDER BY b.cosmicDripLevel DESC, b.solveTimeSeconds ASC")
-    @Cacheable(value = "cosmicDripGames", key = "#minDrip + '-' + #pageable.pageNumber")
+    @Cacheable(value = "cosmicDripGames", key = "#minDrip + '-' + #pageable")
     List<SudokuBoard> findCosmicDripGames(@Param("minDrip") int minDrip, Pageable pageable);
 
     @Query("SELECT b FROM SudokuBoard b WHERE b.startTime BETWEEN :start AND :end AND b.solved = true ORDER BY b.solveTimeSeconds ASC")
-    @Cacheable(value = "fastestSolves", key = "#start + '-' + #end + '-' + #pageable.pageNumber")
+    @Cacheable(value = "fastestSolves", key = "#start + '-' + #end + '-' + #pageable")
     List<SudokuBoard> findFastestSolvesInPeriod(@Param("start") LocalDateTime start, @Param("end") LocalDateTime end, Pageable pageable);
 
     @Query("SELECT b FROM SudokuBoard b WHERE b.hintCount = 0 AND b.usedUndo = false AND b.solved = true ORDER BY b.solveTimeSeconds ASC")
-    @Cacheable(value = "perfectClears", key = "#pageable.pageNumber")
+    @Cacheable(value = "perfectClears", key = "#pageable")
     List<SudokuBoard> findPerfectClears(Pageable pageable);
 
     @Query("SELECT b FROM SudokuBoard b WHERE b.moveCount >= :minMoves AND b.cosmicDripLevel > 0 ORDER BY b.moveCount DESC")
-    @Cacheable(value = "longCosmicGames", key = "#minMoves + '-' + #pageable.pageNumber")
+    @Cacheable(value = "longCosmicGames", key = "#minMoves + '-' + #pageable")
     List<SudokuBoard> findLongCosmicGames(@Param("minMoves") int minMoves, Pageable pageable);
 
     @Transactional(readOnly = true)
     @Query(value = "SELECT b.* FROM sudoku_boards b WHERE b.start_time > :since AND b.solved = false " +
            "ORDER BY CAST(b.time_limit_seconds AS FLOAT) - EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP - b.start_time)) ASC", nativeQuery = true)
-    @Cacheable(value = "activeUnfinishedGames", key = "#since + '-' + #pageable.pageNumber")
+    // Not cached: AntiCheatScheduler passes a now-relative cutoff, so the key differs on every
+    // call. The cache could never hit — it would only add one dead entry per 60-second tick,
+    // each holding up to 500 board entities.
     List<SudokuBoard> findActiveUnfinishedGames(@Param("since") LocalDateTime since, Pageable pageable);
 
     /**
@@ -98,34 +110,34 @@ public interface GameRepository extends JpaRepository<SudokuBoard, Long> {
     long countActiveUnfinishedGames(@Param("since") LocalDateTime since);
 
     @Query("SELECT b FROM SudokuBoard b WHERE b.hintCount >= :minHints AND b.solved = false ORDER BY b.hintCount DESC")
-    @Cacheable(value = "hintHeavyStrugglers", key = "#minHints + '-' + #pageable.pageNumber")
+    @Cacheable(value = "hintHeavyStrugglers", key = "#minHints + '-' + #pageable")
     List<SudokuBoard> findHintHeavyStrugglers(@Param("minHints") int minHints, Pageable pageable);
 
     @Query("SELECT b FROM SudokuBoard b WHERE b.startTime > :since AND b.chaosMode = true AND b.cosmicDripLevel >= :minDrip " +
            "ORDER BY b.cosmicDripLevel DESC, b.moveCount DESC")
-    @Cacheable(value = "activeChaosDripMasters", key = "#since + '-' + #minDrip + '-' + #pageable.pageNumber")
+    @Cacheable(value = "activeChaosDripMasters", key = "#since + '-' + #minDrip + '-' + #pageable")
     List<SudokuBoard> findActiveChaosDripMasters(@Param("since") LocalDateTime since, @Param("minDrip") int minDrip, Pageable pageable);
 
     @Query("SELECT b FROM SudokuBoard b WHERE b.startTime BETWEEN :start AND :end AND b.mirrorMode = true AND b.solved = true " +
            "ORDER BY (CASE WHEN b.moveCount > 0 THEN b.solveTimeSeconds / b.moveCount ELSE b.solveTimeSeconds END) ASC")
-    @Cacheable(value = "efficientMirrorSolves", key = "#start + '-' + #end + '-' + #pageable.pageNumber")
+    @Cacheable(value = "efficientMirrorSolves", key = "#start + '-' + #end + '-' + #pageable")
     List<SudokuBoard> findEfficientMirrorSolvesInPeriod(@Param("start") LocalDateTime start, @Param("end") LocalDateTime end, Pageable pageable);
 
     @Transactional(readOnly = true)
     @Query(value = "SELECT b.* FROM sudoku_boards b " +
            "WHERE b.start_time > :since AND b.solved = true " +
            "ORDER BY b.cosmic_drip_level DESC, b.solve_time_seconds ASC", nativeQuery = true)
-    @Cacheable(value = "autoSolvedCosmicGames", key = "#since + '-' + #pageable.pageNumber")
+    @Cacheable(value = "autoSolvedCosmicGames", key = "#since + '-' + #pageable")
     List<SudokuBoard> findAutoSolvedCosmicGames(@Param("since") LocalDateTime since, Pageable pageable);
 
     @Query("SELECT b FROM SudokuBoard b WHERE b.startTime < :cutoff AND b.solved = false AND b.hintCount <= :maxHints " +
            "ORDER BY b.startTime ASC")
-    @Cacheable(value = "abandonedLowHintGames", key = "#cutoff + '-' + #maxHints + '-' + #pageable.pageNumber")
+    @Cacheable(value = "abandonedLowHintGames", key = "#cutoff + '-' + #maxHints + '-' + #pageable")
     List<SudokuBoard> findAbandonedLowHintGames(@Param("cutoff") LocalDateTime cutoff, @Param("maxHints") int maxHints, Pageable pageable);
 
     @Query("SELECT b FROM SudokuBoard b WHERE b.startTime > :since AND b.hintCount > 0 AND b.usedUndo = true " +
            "ORDER BY (b.hintCount + CASE WHEN b.usedUndo = true THEN 1 ELSE 0 END) DESC")
-    @Cacheable(value = "assistedGames", key = "#since + '-' + #pageable.pageNumber")
+    @Cacheable(value = "assistedGames", key = "#since + '-' + #pageable")
     List<SudokuBoard> findAssistedGames(@Param("since") LocalDateTime since, Pageable pageable);
 
     @Transactional(readOnly = true)
@@ -135,12 +147,12 @@ public interface GameRepository extends JpaRepository<SudokuBoard, Long> {
 
     @Query("SELECT b FROM SudokuBoard b WHERE b.startTime BETWEEN :start AND :end AND b.moveCount >= :minMoves " +
            "AND b.cosmicDripLevel >= :minDrip ORDER BY b.solveTimeSeconds ASC")
-    @Cacheable(value = "efficientCosmicMarathons", key = "#start + '-' + #end + '-' + #minMoves + '-' + #minDrip + '-' + #pageable.pageNumber")
+    @Cacheable(value = "efficientCosmicMarathons", key = "#start + '-' + #end + '-' + #minMoves + '-' + #minDrip + '-' + #pageable")
     List<SudokuBoard> findEfficientCosmicMarathons(@Param("start") LocalDateTime start, @Param("end") LocalDateTime end,
                                                    @Param("minMoves") int minMoves, @Param("minDrip") int minDrip, Pageable pageable);
 
     @Query("SELECT b FROM SudokuBoard b WHERE b.startTime > :since AND b.timeLimitSeconds > 0 AND b.solved = false " +
            "ORDER BY b.startTime DESC")
-    @Cacheable(value = "timedOutGames", key = "#since + '-' + #pageable.pageNumber")
+    @Cacheable(value = "timedOutGames", key = "#since + '-' + #pageable")
     List<SudokuBoard> findTimedOutGames(@Param("since") LocalDateTime since, Pageable pageable);
 }

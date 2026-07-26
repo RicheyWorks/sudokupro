@@ -1,0 +1,59 @@
+/* Manga Mode — ink on paper, no colour needed to read it. */
+.root {
+    -fx-background-color: #F7F5F0;
+    -fx-font-family: "Arial";
+}
+.title-fade {
+    -fx-fill: #111111;
+}
+.button, .toggle-button {
+    -fx-background-color: #FFFFFF;
+    -fx-text-fill: #111111;
+    -fx-border-color: #111111;
+    -fx-border-width: 2;
+    -fx-background-radius: 0;
+    -fx-border-radius: 0;
+    -fx-padding: 6 12 6 12;
+}
+.button:hover, .toggle-button:hover {
+    -fx-background-color: #E6E2D8;
+}
+.toggle-button:selected {
+    -fx-background-color: #111111;
+    -fx-text-fill: #FFFFFF;
+}
+.label {
+    -fx-text-fill: #111111;
+}
+.text-field, .password-field {
+    -fx-background-color: #FFFFFF;
+    -fx-text-fill: #111111;
+    -fx-prompt-text-fill: #777777;
+    -fx-border-color: #111111;
+}
+.check-box {
+    -fx-text-fill: #111111;
+}
+.check-box .box {
+    -fx-background-color: #FFFFFF;
+    -fx-border-color: #111111;
+}
+.combo-box {
+    -fx-background-color: #FFFFFF;
+    -fx-text-fill: #111111;
+}
+.combo-box .list-cell {
+    -fx-text-fill: #111111;
+    -fx-background-color: #FFFFFF;
+}
+.list-view {
+    -fx-background-color: #FFFFFF;
+    -fx-control-inner-background: #FFFFFF;
+}
+.list-cell {
+    -fx-text-fill: #111111;
+    -fx-background-color: #FFFFFF;
+}
+.progress-bar > .bar {
+    -fx-accent: #111111;
+}

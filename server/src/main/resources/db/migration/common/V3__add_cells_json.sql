@@ -5,4 +5,19 @@
 -- flags, move sources, pencil marks, conflicts) and is rebuilt into the live
 -- grid by the entity's @PostLoad callback. Nullable: rows written before this
 -- migration have no snapshot and simply cannot be resumed.
-alter table sudoku_boards add column cells_json text;
+--
+-- IF NOT EXISTS (added 2026-07-26 with FlywayMigrationTest): this was a plain
+-- ADD COLUMN, so the migration failed outright on any database that already had the
+-- column. That is not hypothetical. application-dev.properties disables Flyway and
+-- runs Hibernate ddl-auto=update, so every dev/staging database already has
+-- cells_json (SudokuBoard maps it) while its Flyway history still stops at V2 — the
+-- state the shared development database in this environment is in right now. The
+-- first time such a database is pointed at the Flyway-managed configuration, V3
+-- aborted with 'column "cells_json" of relation "sudoku_boards" already exists' and
+-- the application could not start. Nothing caught it because FlywayMigrationTest was
+-- gated on Docker and silently disabled itself everywhere Docker was absent.
+--
+-- OPERATORS: this edit changes the file's Flyway checksum. A database that already
+-- applied the previous version of V3 must be repaired once (`flyway repair`) before
+-- its next migrate, or validate-on-migrate will refuse to run.
+alter table sudoku_boards add column if not exists cells_json text;

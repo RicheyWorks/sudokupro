@@ -90,23 +90,86 @@ public class ThemeManager {
     // Applying themes
     // =====================================================================
 
+    /**
+     * Resolves a bundled theme index to something a {@code Scene} can actually load.
+     *
+     * <p>Returns empty when the stylesheet is not on the classpath — which was not a
+     * hypothetical: the client shipped with {@code src/main/resources} entirely
+     * absent, so all four bundled themes resolved to null in every build.
+     */
+    Optional<String> stylesheetUrl(int themeIndex) {
+        // floorMod, not %: a negative index (a ComboBox with nothing selected reports
+        // -1) used to throw ArrayIndexOutOfBoundsException out of a UI event handler.
+        return resolveResource(THEMES[Math.floorMod(themeIndex, THEMES.length)]);
+    }
+
+    /**
+     * A classpath stylesheet as a loadable URL, or empty when it is not there.
+     *
+     * <p>Empty is the important half. Handing the caller the raw classpath path as a
+     * "fallback" is what the old code did, and JavaFX cannot load a bare path as a
+     * stylesheet — so the fallback looked like one and was a no-op.
+     */
+    Optional<String> resolveResource(String classpathPath) {
+        URL url = getClass().getResource(classpathPath);
+        return url == null ? Optional.empty() : Optional.of(url.toExternalForm());
+    }
+
+    /** The saved custom CSS, if the player has one. */
+    Optional<String> customStylesheet() {
+        String css = prefs.getProperty(PREF_CUSTOM_CSS);
+        return css == null || css.isBlank() ? Optional.empty() : Optional.of(css);
+    }
+
+    /**
+     * What the saved preference resolves to: custom CSS, then a shared or preset
+     * theme, then the named bundled theme, then the default.
+     *
+     * <p>Split out from {@code applyUserPreferredTheme} so the resolution order can
+     * be tested without a {@code Scene} — nothing about picking a stylesheet needs
+     * a JavaFX toolkit, and requiring one is why none of this was ever covered.
+     */
+    Optional<String> preferredStylesheet() {
+        Optional<String> custom = customStylesheet();
+        if (custom.isPresent()) return custom;
+        String preferredTheme = prefs.getProperty(PREF_THEME, "");
+        // Case-insensitive: preset and shared themes are keyed by their display name
+        // ("Midnight Cosmos"), and this lookup used to lower-case the saved value
+        // first — so a saved preset could never match its own key and always fell
+        // through to the default.
+        Optional<String> named = lookupIgnoringCase(sharedThemes, preferredTheme)
+            .or(() -> lookupIgnoringCase(PRESET_THEMES, preferredTheme));
+        if (named.isPresent()) return named;
+        int themeIndex = getThemeIndexFromName(preferredTheme.toLowerCase());
+        return stylesheetUrl(themeIndex != -1 ? themeIndex : DEFAULT_THEME_INDEX);
+    }
+
+    private static Optional<String> lookupIgnoringCase(Map<String, String> themes, String name) {
+        if (name == null || name.isBlank()) return Optional.empty();
+        for (Map.Entry<String, String> entry : themes.entrySet()) {
+            if (entry.getKey().equalsIgnoreCase(name)) return Optional.of(entry.getValue());
+        }
+        return Optional.empty();
+    }
+
     public void applyTheme(Scene scene, int themeIndex) {
         validateScene(scene);
-        int normalizedIndex = themeIndex % THEMES.length;
         try {
-            URL url = getClass().getResource(THEMES[normalizedIndex]);
-            if (url == null) {
-                logger.warn("Stylesheet not found on classpath: {}", THEMES[normalizedIndex]);
-                applyDefaultTheme(scene);
-                return;
-            }
-            scene.getStylesheets().clear();
-            scene.getStylesheets().add(url.toExternalForm());
-            logger.debug("Applied theme '{}' (index {}) to scene", THEME_NAMES[normalizedIndex], normalizedIndex);
+            int normalizedIndex = Math.floorMod(themeIndex, THEMES.length);
+            stylesheetUrl(themeIndex).ifPresentOrElse(
+                css -> {
+                    setStylesheet(scene, css);
+                    logger.debug("Applied theme '{}' (index {}) to scene",
+                        THEME_NAMES[normalizedIndex], normalizedIndex);
+                },
+                // Keep whatever is already on the scene. The old code cleared the
+                // stylesheet list and then had nothing to put back, so a missing
+                // theme file did not fall back — it stripped the window bare.
+                () -> logger.warn("Stylesheet not on the classpath ({}); keeping the current styling",
+                    THEMES[normalizedIndex]));
         } catch (Exception e) {
-            logger.error("Failed to apply theme '{}': {}", THEME_NAMES[normalizedIndex], e.getMessage(), e);
+            logger.error("Failed to apply theme index {}: {}", themeIndex, e.getMessage(), e);
             notifier.notify("error", "Theme switch failed: " + e.getMessage());
-            applyDefaultTheme(scene);
         }
     }
 
@@ -114,27 +177,18 @@ public class ThemeManager {
     public void applyUserPreferredTheme(Scene scene) {
         validateScene(scene);
         try {
-            String customCss = prefs.getProperty(PREF_CUSTOM_CSS);
-            String preferredTheme = prefs.getProperty(PREF_THEME, "").toLowerCase();
-            if (customCss != null && !customCss.isBlank()) {
-                scene.getStylesheets().clear();
-                scene.getStylesheets().add(customCss);
-                logger.debug("Applied locally saved custom theme");
-            } else if (sharedThemes.containsKey(preferredTheme)) {
-                scene.getStylesheets().clear();
-                scene.getStylesheets().add(sharedThemes.get(preferredTheme));
-            } else if (PRESET_THEMES.containsKey(preferredTheme)) {
-                scene.getStylesheets().clear();
-                scene.getStylesheets().add(PRESET_THEMES.get(preferredTheme));
-            } else {
-                int themeIndex = getThemeIndexFromName(preferredTheme);
-                applyTheme(scene, themeIndex != -1 ? themeIndex : DEFAULT_THEME_INDEX);
-            }
+            preferredStylesheet().ifPresentOrElse(
+                css -> setStylesheet(scene, css),
+                () -> logger.warn("No stylesheet available for the saved preference; keeping the current styling"));
         } catch (Exception e) {
             logger.error("Failed to apply preferred theme: {}", e.getMessage(), e);
             notifier.notify("error", "Failed to load preferred theme: " + e.getMessage());
-            applyDefaultTheme(scene);
         }
+    }
+
+    private void setStylesheet(Scene scene, String css) {
+        scene.getStylesheets().clear();
+        scene.getStylesheets().add(css);
     }
 
     public ComboBox<String> createThemeSelector(Scene scene) {
@@ -153,12 +207,21 @@ public class ThemeManager {
             int selectedIndex = themeSelector.getSelectionModel().getSelectedIndex();
             String selectedTheme = themeSelector.getValue();
             if (selectedIndex >= THEMES.length) {
+                // Persist the choice. Without this, setOnHidden's
+                // applyUserPreferredTheme — which fires as soon as the popup closes,
+                // i.e. immediately after the selection — reverted every preset and
+                // shared theme to the previously saved one. Those entries were in
+                // the list but could not actually be chosen.
                 if ("Custom Theme".equals(selectedTheme)) {
                     applyCustomTheme(scene);
                 } else if (sharedThemes.containsKey(selectedTheme)) {
                     applySharedTheme(scene, selectedTheme);
+                    rememberNamedTheme(selectedTheme);
+                    notifier.notify("ui", "Theme switched to: " + selectedTheme);
                 } else if (PRESET_THEMES.containsKey(selectedTheme)) {
                     applyPresetTheme(scene, selectedTheme);
+                    rememberNamedTheme(selectedTheme);
+                    notifier.notify("ui", "Theme switched to: " + selectedTheme);
                 }
             } else {
                 applyTheme(scene, selectedIndex);
@@ -189,37 +252,51 @@ public class ThemeManager {
         }
     }
 
+    // Each of these used to fall back to THEMES[DEFAULT_THEME_INDEX] — the raw
+    // classpath PATH "/css/cyber-grid.css", not a URL. JavaFX cannot resolve a bare
+    // path as a stylesheet, so the "fallback" logged a warning and left the scene
+    // with its stylesheet list cleared and nothing in it. The fallback is now the
+    // resolved default theme.
+
     private void applyCustomTheme(Scene scene) {
-        scene.getStylesheets().clear();
-        scene.getStylesheets().add(prefs.getProperty(PREF_CUSTOM_CSS, THEMES[DEFAULT_THEME_INDEX]));
-        logger.debug("Applied custom theme");
+        customStylesheet().ifPresentOrElse(
+            css -> {
+                setStylesheet(scene, css);
+                logger.debug("Applied custom theme");
+            },
+            () -> applyTheme(scene, DEFAULT_THEME_INDEX));
     }
 
     private void applySharedTheme(Scene scene, String themeName) {
-        scene.getStylesheets().clear();
-        scene.getStylesheets().add(sharedThemes.getOrDefault(themeName, THEMES[DEFAULT_THEME_INDEX]));
-        logger.debug("Applied shared theme '{}'", themeName);
+        String css = sharedThemes.get(themeName);
+        if (css != null) {
+            setStylesheet(scene, css);
+            logger.debug("Applied shared theme '{}'", themeName);
+        } else {
+            applyTheme(scene, DEFAULT_THEME_INDEX);
+        }
     }
 
     private void applyPresetTheme(Scene scene, String themeName) {
-        scene.getStylesheets().clear();
-        scene.getStylesheets().add(PRESET_THEMES.getOrDefault(themeName, THEMES[DEFAULT_THEME_INDEX]));
-        logger.debug("Applied preset theme '{}'", themeName);
+        String css = PRESET_THEMES.get(themeName);
+        if (css != null) {
+            setStylesheet(scene, css);
+            logger.debug("Applied preset theme '{}'", themeName);
+        } else {
+            applyTheme(scene, DEFAULT_THEME_INDEX);
+        }
     }
 
     private void updateUserPreference(int themeIndex) {
-        String newTheme = THEME_NAMES[themeIndex].toLowerCase().replace(" ", "-");
-        prefs.setProperty(PREF_THEME, newTheme);
-        prefs.remove(PREF_CUSTOM_CSS);
-        savePrefs();
-        logger.debug("Updated local theme preference to '{}'", newTheme);
+        rememberNamedTheme(THEME_NAMES[themeIndex].toLowerCase().replace(" ", "-"));
     }
 
-    private void applyDefaultTheme(Scene scene) {
-        URL url = getClass().getResource(THEMES[DEFAULT_THEME_INDEX]);
-        scene.getStylesheets().clear();
-        if (url != null) scene.getStylesheets().add(url.toExternalForm());
-        logger.warn("Applied default theme '{}' due to error", THEME_NAMES[DEFAULT_THEME_INDEX]);
+    /** Saves the chosen theme name and drops any custom CSS that would otherwise win. */
+    void rememberNamedTheme(String themeName) {
+        prefs.setProperty(PREF_THEME, themeName);
+        prefs.remove(PREF_CUSTOM_CSS);
+        savePrefs();
+        logger.debug("Updated local theme preference to '{}'", themeName);
     }
 
     private int getThemeIndexFromName(String themeName) {
@@ -388,7 +465,7 @@ public class ThemeManager {
         String pref = prefs.getProperty(PREF_THEME, "");
         if (sharedThemes.containsKey(pref)) return pref;
         if (PRESET_THEMES.containsKey(pref)) return pref;
-        int index = getThemeIndexFromName(pref);
+        int index = getThemeIndexFromName(pref.toLowerCase());
         return index != -1 ? THEME_NAMES[index] : THEME_NAMES[DEFAULT_THEME_INDEX];
     }
 
@@ -454,11 +531,16 @@ public class ThemeManager {
         if (isCycling) {
             Thread cycler = new Thread(() -> {
                 int index = 0;
-                List<String> allThemes = new ArrayList<>(Arrays.asList(THEMES));
+                // Resolved URLs, not classpath paths: cycling used to add the raw
+                // "/css/cyber-grid.css" strings, which JavaFX cannot load, so every
+                // bundled step of the cycle showed an unstyled window.
+                List<String> allThemes = new ArrayList<>();
+                for (int i = 0; i < THEMES.length; i++) stylesheetUrl(i).ifPresent(allThemes::add);
                 String customCss = prefs.getProperty(PREF_CUSTOM_CSS);
                 if (customCss != null) allThemes.add(customCss);
                 allThemes.addAll(sharedThemes.values());
                 allThemes.addAll(PRESET_THEMES.values());
+                if (allThemes.isEmpty()) return;
                 while (isCycling) {
                     final int currentIndex = index % allThemes.size();
                     Platform.runLater(() -> {
@@ -491,8 +573,7 @@ public class ThemeManager {
             fileChooser.setInitialFileName("sudokupro_theme.css");
             File file = fileChooser.showSaveDialog(currentScene.getWindow());
             if (file != null) {
-                String css = prefs.getProperty(PREF_CUSTOM_CSS, THEMES[DEFAULT_THEME_INDEX])
-                    .replace("data:text/css,", "");
+                String css = customStylesheet().orElse("").replace("data:text/css,", "");
                 try (FileWriter writer = new FileWriter(file)) {
                     writer.write(css);
                 }

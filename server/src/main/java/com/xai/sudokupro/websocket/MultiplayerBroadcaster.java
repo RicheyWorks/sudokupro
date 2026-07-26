@@ -7,6 +7,7 @@ import com.xai.sudokupro.service.AnalyticsService;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
 
 import java.util.List;
@@ -14,6 +15,7 @@ import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Consumer;
 
 @Component
@@ -39,6 +41,7 @@ public class MultiplayerBroadcaster implements com.xai.sudokupro.model.MoveBroad
 
     private final AtomicInteger activeClientCount = new AtomicInteger(0);
     private final AtomicInteger messageRateCounter = new AtomicInteger(0);
+    private final AtomicLong healthPingsSent = new AtomicLong(0);
 
     @Autowired
     public MultiplayerBroadcaster(GameSessionRegistry sessionRegistry,
@@ -123,8 +126,41 @@ public class MultiplayerBroadcaster implements com.xai.sudokupro.model.MoveBroad
 
     // ---- Health / monitoring --------------------------------------------
 
+    /**
+     * Server-side keep-alive for every open socket.
+     *
+     * <p>This method existed and was never called by anything — a grep for its name found
+     * exactly one hit, its own declaration. The client has always had a {@code case
+     * 'health'} arm waiting for it, so both halves of a heartbeat were written and the wire
+     * between them was missing. The consequence is the failure mode a front-end pass
+     * measured directly: a black-holed connection stays {@code readyState === OPEN} and
+     * fires no event, so a client can sit on a dead socket indefinitely believing it is
+     * connected. The client now runs its own idle watchdog, but a watchdog that has to
+     * probe is strictly worse than a server that speaks first — the probe costs a
+     * round-trip per idle client and only fires after the idle threshold.
+     *
+     * <p>A periodic frame also keeps proxies and load balancers from reaping the connection
+     * as idle, which is the ordinary reason long-lived sockets die in production.
+     *
+     * <p>Exceptions are swallowed on purpose. A heartbeat that throws would be a heartbeat
+     * that stops: an exception escaping a {@code @Scheduled} method cancels no future runs
+     * for {@code fixedRate}, but it does log a stack trace every interval forever, and one
+     * unwritable session must not deny the ping to all the others.
+     */
+    @Scheduled(fixedRateString = "${sudokupro.ws.health-ping-ms:20000}")
     public void broadcastHealthPing() {
-        sessionRegistry.broadcastToAll(Map.of("type", "health", "from", SERVER, "payload", "PING"));
+        try {
+            sessionRegistry.broadcastToAll(
+                Map.of("type", "health", "from", SERVER, "payload", "PING"));
+            healthPingsSent.incrementAndGet();
+        } catch (RuntimeException e) {
+            logger.warn("Health ping broadcast failed (non-fatal): {}", e.getMessage());
+        }
+    }
+
+    /** Count of successful heartbeat broadcasts — exposed so the wiring is observable. */
+    public long getHealthPingsSent() {
+        return healthPingsSent.get();
     }
 
     public int getActiveClientCount() {

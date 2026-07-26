@@ -34,7 +34,12 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
     "spring.jpa.database-platform=org.hibernate.dialect.H2Dialect",
     "spring.jpa.hibernate.ddl-auto=create-drop",
     "spring.flyway.enabled=false",
-    "sudokupro.ui.enabled=false"
+    "sudokupro.ui.enabled=false",
+    // These suites mint fixture accounts in bulk from a single (mock) client address,
+    // which is exactly what RegistrationAttemptLimiter exists to stop in production.
+    // Lift the quota here so the throttle does not turn fixture setup into 429s; the
+    // throttle itself is exercised for real by security/RegistrationThrottleTest.
+    "sudokupro.security.register.max-attempts=1000000"
 })
 class SecurityRulesTest {
 

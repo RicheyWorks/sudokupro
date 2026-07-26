@@ -25,7 +25,31 @@ public interface UserRepository extends JpaRepository<User, Long>,
         EconomyAnalyticsRepository,
         RetentionStatsRepository {
 
-    @Cacheable(value = "userByUsername", key = "#username")
+    /**
+     * Deliberately NOT {@code @Cacheable}, though it used to be.
+     *
+     * <p>This is the lookup behind authentication ({@code AccountService.loadUserByUsername}),
+     * registration, password change, wallet provisioning, friends and duels. Caching it was
+     * safe only while {@code @EnableCaching} was absent and the annotation was inert. Armed,
+     * it breaks two things immediately:
+     *
+     * <ul>
+     *   <li>It caches {@code Optional.empty()}. {@code AccountService.register} looks the name
+     *       up (miss, "no such user" cached), then writes with {@code save()}. The account is
+     *       then in the database and absent from the cache, so the very next login gets
+     *       {@code UsernameNotFoundException} → 401, for the whole TTL.</li>
+     *   <li>{@code EconomyService.walletFor} is a check-then-insert over the same lookup. A
+     *       cached empty makes it insert again, hit the V9 unique index, and then fail its own
+     *       recovery read — "wallet vanished after a unique-constraint conflict", a 500 on an
+     *       ordinary hint request.</li>
+     * </ul>
+     *
+     * <p>The three {@code @CacheEvict}s that existed covered only the bulk {@code @Modifying}
+     * updates below; every other writer goes through {@code save()}, which no annotation
+     * intercepts. Making the eviction story complete would mean tracking every writer of a JPA
+     * entity through a heap cache, for a single indexed single-row lookup. Not worth it — so
+     * the cache is gone rather than half-correct.
+     */
     Optional<User> findByUsername(String username);
 
     /**
@@ -43,9 +67,6 @@ public interface UserRepository extends JpaRepository<User, Long>,
      */
     @Transactional
     @org.springframework.data.jpa.repository.Modifying(clearAutomatically = true, flushAutomatically = true)
-    // findByUsername is @Cacheable, and a bulk UPDATE bypasses the persistence context
-    // entirely — without this evict the very next read would serve the pre-charge balance.
-    @org.springframework.cache.annotation.CacheEvict(value = "userByUsername", key = "#username")
     @Query("UPDATE User u SET u.gems = u.gems - :cost WHERE u.username = :username AND u.gems >= :cost")
     int deductGemsIfAffordable(@Param("username") String username, @Param("cost") int cost);
 
@@ -64,7 +85,6 @@ public interface UserRepository extends JpaRepository<User, Long>,
      */
     @Transactional
     @org.springframework.data.jpa.repository.Modifying(clearAutomatically = true, flushAutomatically = true)
-    @org.springframework.cache.annotation.CacheEvict(value = "userByUsername", key = "#username")
     @Query("UPDATE User u SET u.gems = u.gems + :amount, u.xp = u.xp + :xp WHERE u.username = :username")
     int creditGemsAndXp(@Param("username") String username,
                         @Param("amount") int amount,
@@ -73,7 +93,6 @@ public interface UserRepository extends JpaRepository<User, Long>,
     /** Targeted level write, so recomputing level never rewrites the gem balance. */
     @Transactional
     @org.springframework.data.jpa.repository.Modifying(clearAutomatically = true, flushAutomatically = true)
-    @org.springframework.cache.annotation.CacheEvict(value = "userByUsername", key = "#username")
     @Query("UPDATE User u SET u.level = :level WHERE u.username = :username AND u.level < :level")
     int updateLevel(@Param("username") String username, @Param("level") int level);
 
@@ -109,6 +128,15 @@ public interface UserRepository extends JpaRepository<User, Long>,
          + "ORDER BY u.duelRating DESC, u.duelWins DESC, u.id ASC")
     List<User> findDuelLadder(org.springframework.data.domain.Pageable pageable);
 
+    /**
+     * Accounts anti-cheat currently holds a flag against, most recently flagged first.
+     *
+     * <p>Deliberately NOT {@code @Cacheable}: this is a moderation read, and a stale answer
+     * means acting on a flag that has since been cleared (or missing one just raised).
+     */
+    @Query("SELECT u FROM User u WHERE u.cheatFlagCount > 0 ORDER BY u.lastFlaggedAt DESC, u.id ASC")
+    List<User> findFlaggedPlayers();
+
     @Query("SELECT u FROM User u WHERE u.streak >= :streakThreshold")
     @Cacheable(value = "usersByStreak", key = "#streakThreshold")
     List<User> findByStreakGreaterThanEqual(@Param("streakThreshold") int streakThreshold);
@@ -125,9 +153,13 @@ public interface UserRepository extends JpaRepository<User, Long>,
     @Cacheable(value = "usersByLevelRange", key = "#minLevel + '-' + #maxLevel")
     List<User> findByLevelBetween(@Param("minLevel") int minLevel, @Param("maxLevel") int maxLevel);
 
+    /**
+     * Not cached. Both callers ({@code MetricsScheduler}, {@code RedisSyncScheduler}) pass
+     * {@code LocalDateTime.now().minus(...)}, so the key was different on every single call:
+     * the cache could never produce a hit, only accumulate one dead entry per scheduler tick.
+     */
     @Transactional(readOnly = true)
     @Query("SELECT COUNT(u) FROM User u WHERE u.lastLogin >= :cutoff")
-    @Cacheable(value = "activeUserCount", key = "#cutoff")
     long countActiveUsersSince(@Param("cutoff") LocalDateTime cutoff);
 
     @Query("SELECT u FROM User u WHERE u.themePreference = :themePreference")
@@ -248,11 +280,11 @@ public interface UserRepository extends JpaRepository<User, Long>,
 
     @EntityGraph(attributePaths = {"matchHistory"})
     @Query("SELECT u FROM User u WHERE u.cosmicDrip >= :minDrip AND u.lastLogin >= :since ORDER BY u.cosmicDrip DESC, u.hypeMeter DESC")
-    @Cacheable(value = "activeCosmicDrippers", key = "#minDrip + '-' + #since + '-' + #pageable.pageNumber")
+    @Cacheable(value = "activeCosmicDrippers", key = "#minDrip + '-' + #since + '-' + #pageable")
     List<User> findActiveCosmicDrippers(@Param("minDrip") int minDrip, @Param("since") LocalDateTime since, Pageable pageable);
 
     @Query("SELECT u FROM User u WHERE u.hypeMeter >= :minHype AND u.fanCount >= :minFans ORDER BY u.hypeMeter DESC, u.cosmicDrip DESC")
-    @Cacheable(value = "hypeFanIcons", key = "#minHype + '-' + #minFans + '-' + #pageable.pageNumber")
+    @Cacheable(value = "hypeFanIcons", key = "#minHype + '-' + #minFans + '-' + #pageable")
     List<User> findHypeFanIcons(@Param("minHype") int minHype, @Param("minFans") int minFans, Pageable pageable);
 
     @Transactional(readOnly = true)
@@ -263,7 +295,7 @@ public interface UserRepository extends JpaRepository<User, Long>,
     @EntityGraph(attributePaths = {"matchHistory"})
     @Query("SELECT u FROM User u WHERE u.lastLogin BETWEEN :start AND :end AND SIZE(u.matchHistory) >= :minMatches " +
            "ORDER BY u.duelWins DESC, u.cosmicDrip DESC")
-    @Cacheable(value = "matchHeavyPlayers", key = "#start + '-' + #end + '-' + #minMatches + '-' + #pageable.pageNumber")
+    @Cacheable(value = "matchHeavyPlayers", key = "#start + '-' + #end + '-' + #minMatches + '-' + #pageable")
     List<User> findMatchHeavyPlayersInPeriod(@Param("start") LocalDateTime start, @Param("end") LocalDateTime end, 
                                              @Param("minMatches") int minMatches, Pageable pageable);
 
@@ -272,7 +304,7 @@ public interface UserRepository extends JpaRepository<User, Long>,
            "WHERE u.last_login > :since AND EXISTS (SELECT 1 FROM user_match_history mh WHERE mh.user_id = u.id AND mh.match_won = true) " +
            "AND u.points BETWEEN :minPoints AND :maxPoints " +
            "ORDER BY u.hype_meter DESC, u.cosmic_drip DESC", nativeQuery = true)
-    @Cacheable(value = "activeDuelWinnersByPoints", key = "#since + '-' + #minPoints + '-' + #maxPoints + '-' + #pageable.pageNumber")
+    @Cacheable(value = "activeDuelWinnersByPoints", key = "#since + '-' + #minPoints + '-' + #maxPoints + '-' + #pageable")
     List<User> findActiveDuelWinnersByPoints(@Param("since") LocalDateTime since, @Param("minPoints") int minPoints, 
                                              @Param("maxPoints") int maxPoints, Pageable pageable);
 
@@ -285,7 +317,7 @@ public interface UserRepository extends JpaRepository<User, Long>,
     @EntityGraph(attributePaths = {"friends"})
     @Query("SELECT u FROM User u WHERE SIZE(u.friends) >= :minFriends AND u.lastLogin > :since " +
            "ORDER BY u.hypeMeter DESC, u.cosmicDrip DESC")
-    @Cacheable(value = "activeSocialPlayers", key = "#minFriends + '-' + #since + '-' + #pageable.pageNumber")
+    @Cacheable(value = "activeSocialPlayers", key = "#minFriends + '-' + #since + '-' + #pageable")
     List<User> findActiveSocialPlayers(@Param("minFriends") int minFriends, @Param("since") LocalDateTime since, Pageable pageable);
 
     @Transactional(readOnly = true)
@@ -296,13 +328,13 @@ public interface UserRepository extends JpaRepository<User, Long>,
 
     @Query("SELECT u FROM User u WHERE u.powerUps[:powerUp] >= :minCount AND u.lastLogin > :since " +
            "ORDER BY u.powerUps[:powerUp] DESC, u.points DESC")
-    @Cacheable(value = "powerUpActiveUsers", key = "#powerUp + '-' + #minCount + '-' + #since + '-' + #pageable.pageNumber")
+    @Cacheable(value = "powerUpActiveUsers", key = "#powerUp + '-' + #minCount + '-' + #since + '-' + #pageable")
     List<User> findPowerUpActiveUsers(@Param("powerUp") String powerUp, @Param("minCount") int minCount, 
                                       @Param("since") LocalDateTime since, Pageable pageable);
 
     @Query("SELECT u FROM User u WHERE u.cosmicDrip > :minDrip AND u.points > :minPoints AND u.lastLogin < :cutoff " +
            "ORDER BY u.cosmicDrip DESC, u.points DESC")
-    @Cacheable(value = "dripPointInactiveUsers", key = "#minDrip + '-' + #minPoints + '-' + #cutoff + '-' + #pageable.pageNumber")
+    @Cacheable(value = "dripPointInactiveUsers", key = "#minDrip + '-' + #minPoints + '-' + #cutoff + '-' + #pageable")
     List<User> findDripPointInactiveUsers(@Param("minDrip") int minDrip, @Param("minPoints") int minPoints, 
                                           @Param("cutoff") LocalDateTime cutoff, Pageable pageable);
 }

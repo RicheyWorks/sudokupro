@@ -37,6 +37,7 @@ public class LeaderboardService {
     private static final int TIER_SILVER_THRESHOLD = 5000; // Points for Silver tier
     private static final int TIER_GOLD_THRESHOLD = 10000; // Points for Gold tier
     private static final int TIER_COSMIC_THRESHOLD = 25000; // Points for Cosmic tier
+    private static final int MAX_SCORE_DELTA_ENTRIES = 10_000; // Hard cap on the in-memory delta window
 
     private final UserRepository userRepository;
     private final LeaderboardRepository leaderboardRepository;
@@ -46,7 +47,17 @@ public class LeaderboardService {
     // Fix 1: eventEngine was referenced (getPlayerEventScores) but never declared — compile error.
     private final EventEngine eventEngine;
 
-    private final Map<String, Integer> scoreDeltas = new ConcurrentHashMap<>(); // Player ID -> recent points delta
+    /**
+     * Player ID -> points gained during the current delta window.
+     *
+     * <p>Bug fix: this map used to grow without bound. It gained a permanent entry for every
+     * player that ever scored and was never cleared or capped, so a long-lived process leaked
+     * one entry per lifetime player. The window is now reset by {@link #refreshLeaderboard()}
+     * (which is what makes the value a "recent" delta rather than a lifetime total), and
+     * hard-capped at {@link #MAX_SCORE_DELTA_ENTRIES} so that a deployment that never calls
+     * refresh still cannot exhaust the heap.
+     */
+    private final Map<String, Integer> scoreDeltas = new ConcurrentHashMap<>();
 
     @Autowired
     public LeaderboardService(UserRepository userRepository, LeaderboardRepository leaderboardRepository,
@@ -61,8 +72,12 @@ public class LeaderboardService {
         logger.info("LeaderboardService initialized with cosmic dependencies");
     }
 
+    // Bug fix: "publicLeaderboard" was missing from this eviction list. getPublicLeaderboard()
+    // is @Cacheable("publicLeaderboard") and is the ONLY leaderboard exposed over HTTP
+    // (LeaderboardController), so once warm it would have served the same rows forever while
+    // the internal boards refreshed correctly.
     @Transactional
-@CacheEvict(value = {"topPlayers", "leaderboardSummary"}, allEntries = true)
+@CacheEvict(value = {"topPlayers", "leaderboardSummary", "publicLeaderboard"}, allEntries = true)
 public void updateScore(Long userId, int points) {
     validateUserId(userId);
     validatePoints(points);
@@ -79,6 +94,11 @@ public void updateScore(Long userId, int points) {
         userRepository.save(user);
         int delta = user.getPoints() - oldPoints;
         scoreDeltas.merge(userId.toString(), delta, Integer::sum);
+        if (scoreDeltas.size() > MAX_SCORE_DELTA_ENTRIES) {
+            logger.warn("Score-delta window exceeded {} players — resetting it to bound heap usage",
+                MAX_SCORE_DELTA_ENTRIES);
+            scoreDeltas.clear();
+        }
         logger.debug("Score updated for user {}: +{} points, new total: {}, delta: {}", userId, points, user.getPoints(), delta);
         broadcastLeaderboardUpdate(user, delta);
     }, "score update for user " + userId);
@@ -88,7 +108,8 @@ public void updateScore(Long userId, int points) {
     public List<LeaderboardSnapshot> getTopPlayersByPointsPaged(int page, int size) {
         validatePagination(page, size);
         return safeFetch(() -> {
-            List<User> topPlayers = leaderboardRepository.findTopUsersByPoints(PageRequest.of(page, size));
+            List<User> topPlayers = withoutFlaggedPlayers(
+                leaderboardRepository.findTopUsersByPoints(PageRequest.of(page, size)));
             List<LeaderboardSnapshot> snapshots = mapToSnapshots(topPlayers, page, size, "points");
             logLeaderboardFetch("points", snapshots.size());
             return snapshots;
@@ -99,8 +120,8 @@ public void updateScore(Long userId, int points) {
     public List<LeaderboardSnapshot> getTopPlayersByCosmicDripPaged(int page, int size) {
         validatePagination(page, size);
         return safeFetch(() -> {
-            List<User> topPlayers = leaderboardRepository.findTopCosmicDrippers(
-                COSMIC_DRIP_THRESHOLD, PageRequest.of(page, size));
+            List<User> topPlayers = withoutFlaggedPlayers(leaderboardRepository.findTopCosmicDrippers(
+                COSMIC_DRIP_THRESHOLD, PageRequest.of(page, size)));
             List<LeaderboardSnapshot> snapshots = mapToSnapshots(topPlayers, page, size, "cosmicDrip");
             logLeaderboardFetch("cosmic drip", snapshots.size());
             return snapshots;
@@ -111,8 +132,8 @@ public void updateScore(Long userId, int points) {
     public List<LeaderboardSnapshot> getTopPlayersByHypePaged(int page, int size) {
         validatePagination(page, size);
         return safeFetch(() -> {
-            List<User> topPlayers = leaderboardRepository.findHypeLegends(
-                HYPE_METER_THRESHOLD, PageRequest.of(page, size));
+            List<User> topPlayers = withoutFlaggedPlayers(leaderboardRepository.findHypeLegends(
+                HYPE_METER_THRESHOLD, PageRequest.of(page, size)));
             List<LeaderboardSnapshot> snapshots = mapToSnapshots(topPlayers, page, size, "hypeMeter");
             logLeaderboardFetch("hype meter", snapshots.size());
             return snapshots;
@@ -123,7 +144,8 @@ public void updateScore(Long userId, int points) {
     public List<LeaderboardSnapshot> getTopDuelistsPaged(int page, int size) {
         validatePagination(page, size);
         return safeFetch(() -> {
-            List<User> topPlayers = leaderboardRepository.findTopDuelists(PageRequest.of(page, size));
+            List<User> topPlayers = withoutFlaggedPlayers(
+                leaderboardRepository.findTopDuelists(PageRequest.of(page, size)));
             List<LeaderboardSnapshot> snapshots = mapToSnapshots(topPlayers, page, size, "duelWins");
             logLeaderboardFetch("duel wins", snapshots.size());
             return snapshots;
@@ -185,6 +207,7 @@ public void updateScore(Long userId, int points) {
                 topPlayers = leaderboardRepository.findTopUsersByPoints(
                     PageRequest.of(page, size, Sort.by(Sort.Direction.DESC, "points")));
             }
+            topPlayers = withoutFlaggedPlayers(topPlayers);
             List<LeaderboardSnapshot> snapshots = mapToSnapshots(topPlayers, page, size, "points");
             logLeaderboardFetch("recent activity", snapshots.size());
             return snapshots;
@@ -200,7 +223,8 @@ public void updateScore(Long userId, int points) {
                 .filter(e -> e.getKey().endsWith("-" + eventId))
                 .collect(Collectors.toMap(
                     e -> e.getKey().substring(0, e.getKey().indexOf("-" + eventId)),
-                    Map.Entry::getValue
+                    Map.Entry::getValue,
+                    (a, b) -> a
                 ));
             // Fix 3 (cont.): same guard for event leaderboard player IDs.
             List<Long> eventPlayerIds = eventScores.keySet().stream()
@@ -212,11 +236,15 @@ public void updateScore(Long userId, int points) {
                     }
                 })
                 .collect(Collectors.toList());
-            List<User> topPlayers = userRepository.findAllById(eventPlayerIds).stream()
+            List<User> topPlayers = withoutFlaggedPlayers(userRepository.findAllById(eventPlayerIds)).stream()
                 .sorted((u1, u2) -> Integer.compare(
                     eventScores.getOrDefault(u2.getId().toString(), 0), 
                     eventScores.getOrDefault(u1.getId().toString(), 0)))
-                .skip(page * size)
+                // (long) cast: page and size are both caller-supplied ints. page * size in int
+                // arithmetic overflows to a negative offset for large pages, and
+                // Stream.skip(negative) throws IllegalArgumentException — a 500 where an empty
+                // page is the correct answer.
+                .skip((long) page * size)
                 .limit(size)
                 .collect(Collectors.toList());
             List<LeaderboardSnapshot> snapshots = mapToSnapshots(topPlayers, page, size, "eventScore", eventScores);
@@ -225,6 +253,11 @@ public void updateScore(Long userId, int points) {
         }, "top event players for event " + eventId);
     }
 
+    /**
+     * The one board that cannot filter flagged players: {@link UserSummary} is a projection
+     * with no id, so there is no key to match against the suspicion map. Left as-is rather
+     * than widened here — it is a stats summary, not a ranked player list served to players.
+     */
     @Cacheable(value = "leaderboardSummary", key = "'summary-' + #page + '-' + #size")
     public List<UserSummary> getLeaderboardSummaryPaged(int page, int size) {
         validatePagination(page, size);
@@ -270,17 +303,24 @@ public void updateScore(Long userId, int points) {
     public List<LeaderboardSnapshot> getPublicLeaderboard(int limit) {
         validateLimit(limit);
         return safeFetch(() -> {
-            List<User> topPlayers = leaderboardRepository.findTopUsersByPoints(PageRequest.of(0, limit));
+            List<User> topPlayers = withoutFlaggedPlayers(
+                leaderboardRepository.findTopUsersByPoints(PageRequest.of(0, limit)));
             List<LeaderboardSnapshot> snapshots = mapToSnapshots(topPlayers, 0, limit, "points");
             logLeaderboardFetch("public", snapshots.size());
             return snapshots;
         }, "public leaderboard");
     }
 
-    /** Evicts all leaderboard caches so the next read returns fresh data. */
+    /**
+     * Evicts all leaderboard caches so the next read returns fresh data, and starts a new
+     * score-delta window. Clearing the deltas here is what gives {@code pointsDelta} its
+     * documented "recent" meaning — without it the field was a monotonically growing lifetime
+     * total held in an unbounded map.
+     */
     @CacheEvict(value = {"topPlayers", "leaderboardSummary", "publicLeaderboard"}, allEntries = true)
     public void refreshLeaderboard() {
-        logger.info("Leaderboard caches evicted");
+        scoreDeltas.clear();
+        logger.info("Leaderboard caches evicted and score-delta window reset");
     }
 
     private void validateLimit(int limit) {
@@ -313,26 +353,84 @@ public void updateScore(Long userId, int points) {
         return mapToSnapshots(users, page, size, sortBy, Collections.emptyMap());
     }
 
-    private List<LeaderboardSnapshot> mapToSnapshots(List<User> users, int page, int size, String sortBy, 
-                                                    Map<String, Integer> eventScores) {
-        return users.stream()
-            .map(u -> {
-                String playerId = u.getId().toString();
-                int rank = page * size + users.indexOf(u) + 1;
-                int sortValue;
-                switch (sortBy) {
-                    case "cosmicDrip": sortValue = u.getCosmicDrip(); break;
-                    case "hypeMeter": sortValue = u.getHypeMeter(); break;
-                    case "duelWins": sortValue = u.getDuelWins(); break;
-                    case "eventScore": sortValue = eventScores.getOrDefault(playerId, 0); break;
-                    default: sortValue = u.getPoints(); break;
-                }
-                return new LeaderboardSnapshot(
-                    u.getUsername(), sortValue, rank, getTier(u.getPoints()),
-                    u.getCosmicDrip(), u.getHypeMeter(), u.getDuelWins(),
-                    scoreDeltas.getOrDefault(playerId, 0));
-            })
+    /**
+     * Drops players the anti-cheat pipeline has flagged. Every board that returns player rows
+     * runs its result through this before ranking it.
+     *
+     * <p>Bug fix: only {@link #getTopPlayersCombinedPaged(int, int)} did this. The points,
+     * cosmic-drip, hype and duel boards did not, nor did the recent, event or public boards —
+     * and the public board is the only one {@code LeaderboardController} exposes over HTTP.
+     * A cheater the pipeline had already caught therefore kept their slot on every board a
+     * player actually looks at, which is worse than no enforcement at all: the anti-cheat
+     * dashboard reports the catch while the product still displays the cheater.
+     *
+     * <p>"Flagged" is defined as a suspicion score strictly above {@link #SUSPICION_THRESHOLD}
+     * in {@link AntiCheatEngine#getCheatSuspicionScores()}. That is the pipeline's own shared
+     * state, verified rather than assumed: {@code AntiCheatEngine.flagPlayer} sets no
+     * persistent marker (there is no flag column on {@link User} — it halves the player's
+     * cosmicDrip and returns), and {@code AntiCheatScheduler}'s {@code flaggedPlayers} counter
+     * is private to that bean. The suspicion map is what all eight of the scheduler's
+     * detectors gate on, what {@code MetricsScheduler} counts suspicious players from, and
+     * what the combined board already used — including its strict {@code >} boundary, so a
+     * score of exactly 75.0 is not flagged.
+     *
+     * <p>Consequence to be aware of: a page containing flagged players comes back shorter than
+     * {@code size} rather than being topped up from the next page. Filtering after the SQL
+     * LIMIT is the only option available — suspicion scores live in memory, not in the
+     * database — and it is the same trade-off the combined board has always made.
+     */
+    private List<User> withoutFlaggedPlayers(List<User> users) {
+        if (users.isEmpty()) {
+            return users;
+        }
+        Map<String, Double> suspicionScores = antiCheatEngine.getCheatSuspicionScores();
+        // A player with no suspicion entry defaults to 0.0, i.e. unflagged. Defaulting the
+        // other way would empty every board the moment the engine restarted.
+        List<User> clean = users.stream()
+            .filter(u -> u.getId() == null
+                      || suspicionScores.getOrDefault(u.getId().toString(), 0.0) <= SUSPICION_THRESHOLD)
             .collect(Collectors.toList());
+        if (clean.size() != users.size()) {
+            logger.info("Excluded {} flagged player(s) from a leaderboard page", users.size() - clean.size());
+        }
+        return clean;
+    }
+
+    /**
+     * Two bug fixes live here.
+     *
+     * <p>1. The rank used to be {@code page * size + users.indexOf(u) + 1}. {@code indexOf}
+     * returns the <em>first</em> position that equals the element, so whenever the result list
+     * contained the same entity twice — precisely what a collection {@code @EntityGraph} fetch
+     * can produce — both occurrences were numbered identically and a rank was skipped. It was
+     * also an O(n^2) scan. The row's actual position is used instead.
+     *
+     * <p>2. {@code page * size} was int arithmetic over two caller-supplied ints, so a large
+     * page wrapped to a negative offset and produced negative ranks. The offset is computed in
+     * {@code long} and saturated at {@link Integer#MAX_VALUE}.
+     */
+    private List<LeaderboardSnapshot> mapToSnapshots(List<User> users, int page, int size, String sortBy,
+                                                    Map<String, Integer> eventScores) {
+        long offset = (long) page * size;
+        List<LeaderboardSnapshot> snapshots = new ArrayList<>(users.size());
+        for (int i = 0; i < users.size(); i++) {
+            User u = users.get(i);
+            String playerId = u.getId().toString();
+            int rank = (int) Math.min(Integer.MAX_VALUE, offset + i + 1);
+            int sortValue;
+            switch (sortBy) {
+                case "cosmicDrip": sortValue = u.getCosmicDrip(); break;
+                case "hypeMeter": sortValue = u.getHypeMeter(); break;
+                case "duelWins": sortValue = u.getDuelWins(); break;
+                case "eventScore": sortValue = eventScores.getOrDefault(playerId, 0); break;
+                default: sortValue = u.getPoints(); break;
+            }
+            snapshots.add(new LeaderboardSnapshot(
+                u.getUsername(), sortValue, rank, getTier(u.getPoints()),
+                u.getCosmicDrip(), u.getHypeMeter(), u.getDuelWins(),
+                scoreDeltas.getOrDefault(playerId, 0)));
+        }
+        return snapshots;
     }
 
     private String getTier(int points) {

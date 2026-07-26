@@ -31,10 +31,39 @@ public record ServerConfig(String baseUrl, String username, String password) {
         return URI.create(baseUrl + path);
     }
 
-    /** ws:// or wss:// URI for the gameplay channel, optionally joining a game. */
+    /**
+     * ws:// or wss:// URI for the gameplay channel, optionally joining a game.
+     *
+     * <p>The id is percent-encoded. The server percent-DECODES the handshake's
+     * {@code gameId} parameter, so an unencoded client is only correct by accident —
+     * it happens to work for a bare UUID and for the colon in
+     * {@code daily-2026-07-26:someuser}, and stops working the moment an id contains
+     * a character that means something in a query string. Splicing raw text into a
+     * URI also hands {@link URI#create} a chance to throw
+     * {@code IllegalArgumentException} mid-game-switch, which is a much worse
+     * failure than an escaped character.
+     */
     public URI wsUri(String gameId) {
         String ws = baseUrl.replaceFirst("^http", "ws") + "/ws/game";
-        return URI.create(gameId == null ? ws : ws + "?gameId=" + gameId);
+        return URI.create(gameId == null ? ws : ws + "?gameId=" + encodeQueryValue(gameId));
+    }
+
+    private static final char[] HEX = "0123456789ABCDEF".toCharArray();
+
+    /** RFC 3986 percent-encoding of everything outside the unreserved set. */
+    static String encodeQueryValue(String raw) {
+        StringBuilder out = new StringBuilder(raw.length() + 8);
+        for (byte b : raw.getBytes(java.nio.charset.StandardCharsets.UTF_8)) {
+            int c = b & 0xFF;
+            boolean unreserved = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+                || (c >= '0' && c <= '9') || c == '-' || c == '.' || c == '_' || c == '~';
+            if (unreserved) {
+                out.append((char) c);
+            } else {
+                out.append('%').append(HEX[c >> 4]).append(HEX[c & 0xF]);
+            }
+        }
+        return out.toString();
     }
 
     private static String env(String key, String fallback) {

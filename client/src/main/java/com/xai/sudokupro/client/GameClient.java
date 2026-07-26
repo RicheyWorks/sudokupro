@@ -3,8 +3,10 @@ package com.xai.sudokupro.client;
 import com.fasterxml.jackson.databind.DeserializationFeature;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
+import com.xai.sudokupro.client.net.ConnectionException;
+import com.xai.sudokupro.client.net.ConnectionState;
 import com.xai.sudokupro.client.net.Envelope;
-import com.xai.sudokupro.client.net.GameSocket;
+import com.xai.sudokupro.client.net.GameChannel;
 import com.xai.sudokupro.client.net.ServerApi;
 import com.xai.sudokupro.model.EnhancedMove;
 import com.xai.sudokupro.model.SudokuBoard;
@@ -32,40 +34,107 @@ public class GameClient implements AutoCloseable {
         .registerModule(new JavaTimeModule())
         .disable(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES);
 
+    private final GameChannel channel;
+
     private volatile SudokuBoard board;
-    private volatile GameSocket socket;
 
     // Single-slot callbacks, rebound by MainStage when views are recreated.
     private volatile Runnable onBoardChanged = () -> {};
-    private volatile Consumer<String> onChat = s -> {};
+    private volatile java.util.function.BiConsumer<String, String> onChat = (from, text) -> {};
     private volatile Consumer<String> onEvent = s -> {};
     private volatile Notifier notifier = (t, m) -> {};
+    private volatile Consumer<ConnectionState> onConnectionState = s -> {};
 
     public GameClient(ServerApi api) {
+        this(api, null);
+    }
+
+    /**
+     * @param channel the gameplay channel, or null to build the production one over
+     *                {@code api}. Injected by tests, which have no WebSocket server.
+     */
+    public GameClient(ServerApi api, GameChannel channel) {
         this.api = api;
+        this.channel = channel != null ? channel : new GameChannel(api::openSocket, this::handleEnvelope);
+        this.channel.setOnNotice((type, message) -> notifier.notify(type, message));
+        this.channel.setOnState(state -> onConnectionState.accept(state));
+        // After a reconnect — or after a send that failed on the wire — the local
+        // board may have missed updates, so ask the server for the truth.
+        this.channel.setOnResyncNeeded(this::resyncQuietly);
+    }
+
+    /** The envelope sink a caller-supplied {@link GameChannel} must be wired to. */
+    public Consumer<Envelope> envelopeSink() {
+        return this::handleEnvelope;
     }
 
     // ---- wiring -------------------------------------------------------------
 
     public void setOnBoardChanged(Runnable r)      { this.onBoardChanged = r != null ? r : () -> {}; }
-    public void setOnChat(Consumer<String> c)      { this.onChat = c != null ? c : s -> {}; }
+    /** Receives {@code (speaker, text)} — rendering, including the speaker's name, is the UI's job. */
+    public void setOnChat(java.util.function.BiConsumer<String, String> c) {
+        this.onChat = c != null ? c : (from, text) -> {};
+    }
     public void setOnEvent(Consumer<String> c)     { this.onEvent = c != null ? c : s -> {}; }
     public void setNotifier(Notifier n)            { this.notifier = n != null ? n : (t, m) -> {}; }
+    public void setOnConnectionState(Consumer<ConnectionState> c) {
+        this.onConnectionState = c != null ? c : s -> {};
+    }
 
     public String playerId()   { return api.playerId(); }
     public SudokuBoard board() { return board; }
 
+    // ---- connection ---------------------------------------------------------
+
+    public ConnectionState connectionState() { return channel.state(); }
+
+    public boolean isConnected() { return channel.isConnected(); }
+
+    /**
+     * Rejoins the gameplay channel for the game that is on screen. This is the
+     * path that did not exist: nothing outside the six game-switch methods ever
+     * opened a socket, and each of those begins by closing the one you have, so a
+     * single failure anywhere in a switch left the session with no way back.
+     *
+     * <p>Blocking — call it off the FX thread.
+     */
+    public synchronized void reconnect() {
+        SudokuBoard current = board;
+        String target = current != null ? current.getGameId() : channel.gameId();
+        if (target == null) {
+            throw new ConnectionException("No game to reconnect to — start or resume a game first");
+        }
+        channel.connect(target);
+        resyncQuietly();
+        logger.info("Rejoined game {}", target);
+    }
+
     // ---- game lifecycle -------------------------------------------------------
+
+    /**
+     * Adopts a game the server just handed us: the channel is switched first, and
+     * the local board is replaced only once that succeeded.
+     *
+     * <p>Order is the whole point. Every switch used to tear the channel down
+     * before the REST call that might fail, so a refusal (spectating a competitive
+     * board), a blip, or a 500 left the client with no channel, no way to open one,
+     * and the previous game still on screen looking playable. Now a failed switch
+     * throws with the player exactly where they were — still connected, still
+     * playing the game they had.
+     */
+    private SudokuBoard adopt(BoardState state) {
+        channel.connect(state.gameId());
+        SudokuBoard adopted = state.toBoard();
+        this.board = adopted;
+        return adopted;
+    }
 
     /** Creates a game on the server, rebuilds local state, and (re)joins the gameplay channel. */
     public synchronized SudokuBoard newGame(int difficulty, boolean chaos, boolean mirror) {
-        closeSocket();
         BoardState state = api.newGame(difficulty, chaos, mirror);
-        board = state.toBoard();
-        socket = api.openSocket(state.gameId(), this::handleEnvelope,
-            () -> notifier.notify("ui", "Connection to game lost"));
+        SudokuBoard adopted = adopt(state);
         logger.info("Joined game {} (difficulty {})", state.gameId(), difficulty);
-        return board;
+        return adopted;
     }
 
     /** Re-fetches the authoritative state for the current game. */
@@ -105,13 +174,10 @@ public class GameClient implements AutoCloseable {
      * gameplay channel is (re)joined under the resumed gameId.
      */
     public synchronized SudokuBoard resumeGame(String gameId) {
-        closeSocket();
         BoardState state = api.resumeGame(gameId);
-        board = state.toBoard();
-        socket = api.openSocket(state.gameId(), this::handleEnvelope,
-            () -> notifier.notify("ui", "Connection to game lost"));
+        SudokuBoard adopted = adopt(state);
         logger.info("Resumed game {}", state.gameId());
-        return board;
+        return adopted;
     }
 
     // ---- moves ------------------------------------------------------------------
@@ -130,8 +196,11 @@ public class GameClient implements AutoCloseable {
                 "Invalid move: " + (move.newVal() == 0 ? "clear" : move.newVal())
                 + " at (" + (move.row() + 1) + "," + (move.col() + 1) + ")");
         }
+        // Send BEFORE the optimistic local update. Applying first meant that a
+        // refused send (dead channel) still mutated the local board, so the two
+        // sides diverged on the very move the player was told had failed.
+        channel.send("move", move);
         current.applyExternalMove(move);
-        requireSocket().send("move", move);
     }
 
     /**
@@ -139,13 +208,10 @@ public class GameClient implements AutoCloseable {
      * local state from the returned copy and (re)joins its gameplay channel.
      */
     public synchronized SudokuBoard joinDaily() {
-        closeSocket();
         BoardState state = api.joinDaily();
-        board = state.toBoard();
-        socket = api.openSocket(state.gameId(), this::handleEnvelope,
-            () -> notifier.notify("ui", "Connection to game lost"));
+        SudokuBoard adopted = adopt(state);
         logger.info("Joined daily puzzle game {}", state.gameId());
-        return board;
+        return adopted;
     }
 
     /** The caller's daily status: joined/completed/streak. */
@@ -164,13 +230,12 @@ public class GameClient implements AutoCloseable {
      * any mutation a spectator tries to send.
      */
     public synchronized SudokuBoard spectate(String gameId) {
-        closeSocket();
+        // The 403 that used to brick the session: the server refuses a read of a
+        // competitive board, and this call is where that refusal lands.
         BoardState state = api.getGame(gameId);
-        board = state.toBoard();
-        socket = api.openSocket(gameId, this::handleEnvelope,
-            () -> notifier.notify("ui", "Spectator connection lost"));
+        SudokuBoard adopted = adopt(state);
         logger.info("Spectating game {}", gameId);
-        return board;
+        return adopted;
     }
 
     // ---- duels -----------------------------------------------------------------
@@ -182,13 +247,10 @@ public class GameClient implements AutoCloseable {
 
     /** Accepts a duel and enters the race: local board + gameplay channel. */
     public synchronized SudokuBoard acceptDuel(String duelId) {
-        closeSocket();
         BoardState state = api.acceptDuel(duelId);
-        board = state.toBoard();
-        socket = api.openSocket(state.gameId(), this::handleEnvelope,
-            () -> notifier.notify("ui", "Connection to game lost"));
+        SudokuBoard adopted = adopt(state);
         logger.info("Duel {} accepted — playing game {}", duelId, state.gameId());
-        return board;
+        return adopted;
     }
 
     public void declineDuel(String duelId) {
@@ -220,22 +282,17 @@ public class GameClient implements AutoCloseable {
 
     /** Joins tournament puzzle n and rejoins the gameplay channel. */
     public synchronized SudokuBoard joinTournament(int puzzle) {
-        closeSocket();
-        BoardState state = api.joinTournament(puzzle);
-        board = state.toBoard();
-        socket = api.openSocket(state.gameId(), this::handleEnvelope,
-            () -> notifier.notify("ui", "Connection to game lost"));
-        return board;
+        return adopt(api.joinTournament(puzzle));
     }
 
     /** Server-side undo — the fresh board arrives as a "board" envelope. */
     public void undo() {
-        requireSocket().send("undo", "");
+        channel.send("undo", "");
     }
 
     /** Server-side redo — the fresh board arrives as a "board" envelope. */
     public void redo() {
-        requireSocket().send("redo", "");
+        channel.send("redo", "");
     }
 
     // ---- assists -----------------------------------------------------------------
@@ -258,8 +315,17 @@ public class GameClient implements AutoCloseable {
 
     // ---- social ---------------------------------------------------------------------
 
+    /**
+     * Sends chat text as text.
+     *
+     * <p>The UI used to pass in a fully rendered line — {@code "[12:04:31] ann: hi"} —
+     * and the server relays chat with the sender's name in the envelope's
+     * {@code from} field, which the receiving client also prepends. Everyone except
+     * the sender saw {@code "ann: [12:04:31] ann: hi"}. Rendering belongs to the
+     * display side; the wire carries the message.
+     */
     public void sendChat(String text) {
-        requireSocket().send("chat", text);
+        channel.send("chat", text);
     }
 
     public List<LeaderboardEntry> leaderboard(int limit) {
@@ -292,7 +358,7 @@ public class GameClient implements AutoCloseable {
                     board = mapper.treeToValue(envelope.payload(), BoardState.class).toBoard();
                     onBoardChanged.run();
                 }
-                case "chat" -> onChat.accept(envelope.from() + ": " + envelope.payloadText());
+                case "chat" -> onChat.accept(envelope.from(), envelope.payloadText());
                 case "hint" -> notifier.notify("hint", envelope.payloadText());
                 case "error" -> {
                     notifier.notify("error", envelope.payload() != null
@@ -322,11 +388,10 @@ public class GameClient implements AutoCloseable {
         };
     }
 
-    /** After a server-rejected move, pull the authoritative board so the UI heals. */
+    /** After a server-rejected move, or a reconnect, pull the authoritative board so the UI heals. */
     private void resyncQuietly() {
         try {
-            GameSocket s = socket;
-            if (s != null && s.isOpen()) s.send("sync", "");
+            if (channel.isConnected()) channel.send("sync", "");
         } catch (Exception e) {
             logger.debug("Resync request failed: {}", e.getMessage());
         }
@@ -340,26 +405,14 @@ public class GameClient implements AutoCloseable {
         return current;
     }
 
-    private GameSocket requireSocket() {
-        GameSocket s = socket;
-        if (s == null || !s.isOpen()) throw new IllegalStateException("Gameplay channel is not connected");
-        return s;
-    }
-
     private void closeSocket() {
-        GameSocket s = socket;
-        socket = null;
-        if (s != null) {
-            try {
-                s.close();
-            } catch (Exception e) {
-                logger.debug("Socket close failed: {}", e.getMessage());
-            }
-        }
+        channel.close();
     }
 
     @Override
     public void close() {
-        closeSocket();
+        // shutdown(), not close(): also stops the reconnect scheduler, so nothing
+        // is left holding a thread once the window is gone.
+        channel.shutdown();
     }
 }

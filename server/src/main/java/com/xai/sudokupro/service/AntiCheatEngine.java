@@ -216,23 +216,65 @@ public class AntiCheatEngine {
         return Collections.unmodifiableMap(new HashMap<>(suspicionScoreMap));
     }
 
+    /**
+     * Records an anti-cheat flag against {@code playerId} and applies the drip penalty.
+     *
+     * <p>This used to halve {@code cosmicDrip} and return. Nothing recorded that the account
+     * had been flagged at all: the only "flag" was an entry in
+     * {@link AntiCheatScheduler}'s {@code flaggedPlayers} map — one bean, one pod, erased by
+     * any restart or rolling deploy and never visible to the other replicas. So the penalty
+     * was durable and recurring (the scheduler re-flags every 60 seconds, halving the balance
+     * again each time) while the decision behind it was not recorded anywhere a human could
+     * read, and "is this player flagged, and since when?" had no answer after a redeploy.
+     *
+     * <p>The flag now lives on the {@code users} row: a count that accumulates, a first
+     * sighting that is never overwritten, and a last sighting that advances. It is queryable
+     * via {@link com.xai.sudokupro.repository.UserRepository#findFlaggedPlayers()} and cleared
+     * by {@link #clearPlayerSuspicion(String)}, which is the moderation "false positive" path.
+     *
+     * <p>Scope note: this is additive. The in-memory {@code suspicionScoreMap} exposed by
+     * {@link #getCheatSuspicionScores()} and its threshold are the enforcement signal consumed
+     * elsewhere and are deliberately left exactly as they were.
+     */
     public synchronized void flagPlayer(String playerId) {
-        if (playerId == null || playerId.isBlank() || "anonymous".equals(playerId)) {
-            logger.debug("Skipping flag for non-persistent playerId: {}", playerId);
-            return;
-        }
-        long userId;
-        try {
-            userId = Long.parseLong(playerId);
-        } catch (NumberFormatException e) {
-            logger.warn("Cannot flag player with non-numeric playerId '{}' — no DB record to penalize", playerId);
-            return;
-        }
+        Long userId = persistentUserId(playerId);
+        if (userId == null) return;
         userRepository.findById(userId).ifPresent(user -> {
             user.setCosmicDrip(Math.max(0, user.getCosmicDrip() / 2));
+            user.recordCheatFlag(LocalDateTime.now());
             userRepository.save(user);
-            logger.info("Flagged player {}: cosmicDrip halved to {}", playerId, user.getCosmicDrip());
+            logger.info("Flagged player {} (flag #{}, first seen {}): cosmicDrip halved to {}",
+                playerId, user.getCheatFlagCount(), user.getFirstFlaggedAt(), user.getCosmicDrip());
         });
+    }
+
+    /**
+     * Whether a durable anti-cheat flag is currently held against {@code playerId}.
+     *
+     * <p>Reads the database rather than any in-process map on purpose: the point of the
+     * persisted flag is that it answers correctly on a pod that did not make the decision.
+     */
+    public boolean isFlagged(String playerId) {
+        Long userId = persistentUserId(playerId);
+        if (userId == null) return false;
+        return userRepository.findById(userId).map(User::isCheatFlagged).orElse(false);
+    }
+
+    /**
+     * Resolves a playerId to a persistent user id, or null when there is no row behind it
+     * (anonymous play, daily/duel template pseudo-players, blank ids).
+     */
+    private Long persistentUserId(String playerId) {
+        if (playerId == null || playerId.isBlank() || "anonymous".equals(playerId)) {
+            logger.debug("Skipping flag operation for non-persistent playerId: {}", playerId);
+            return null;
+        }
+        try {
+            return Long.parseLong(playerId);
+        } catch (NumberFormatException e) {
+            logger.debug("Non-numeric playerId '{}' has no DB record to flag", playerId);
+            return null;
+        }
     }
 
     /** Returns a snapshot of per-player move rates (moves counted in current window). */
@@ -283,7 +325,20 @@ public class AntiCheatEngine {
         lastMoveTimestamps.remove(playerId);
         cosmicStreaks.remove(playerId);
         cosmicMoveRates.remove(playerId);
-        logger.info("Cleared suspicion data for player {}", playerId);
+        // The moderation "false positive" path (AntiCheatScheduler.clearFlaggedPlayer) is the
+        // only caller. Clearing only the in-memory signal would leave the durable flag set
+        // forever, so an exonerated player would still read as flagged to every other pod
+        // and to whoever looks at the record next.
+        Long userId = persistentUserId(playerId);
+        if (userId != null) {
+            userRepository.findById(userId).ifPresent(user -> {
+                if (user.isCheatFlagged()) {
+                    user.clearCheatFlags();
+                    userRepository.save(user);
+                }
+            });
+        }
+        logger.info("Cleared suspicion data and anti-cheat flags for player {}", playerId);
     }
 
     private int estimateDifficulty(SudokuBoard board) {

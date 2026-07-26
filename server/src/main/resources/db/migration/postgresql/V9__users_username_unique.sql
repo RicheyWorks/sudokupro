@@ -24,23 +24,48 @@
 -- password hash), then the one carrying the most progress, then the lowest id — a
 -- duplicate is by definition a row created by the losing side of a race, so it holds at
 -- most a few seconds of state.
-with ranked as (
-    select id,
-           row_number() over (
-               partition by username
-               order by (password_hash is not null) desc,
-                        (points + gems + xp) desc,
-                        id asc
-           ) as row_rank
-    from users
-    where username is not null
-)
-delete from users
-where id in (select id from ranked where row_rank > 1);
+--
+-- Guarded on the table's existence (2026-07-26, with FlywayMigrationTest). This file used
+-- to reference `users` unconditionally, so on a pre-Flyway install that never created a
+-- users table — the server-runs-games-only case V4's own comment promises "still migrates
+-- cleanly", and which V4/V5/V6 all guard with IF EXISTS — the whole chain died here with
+-- 'ERROR: relation "users" does not exist'. V2 through V8 committed, V9 did not, and the
+-- application could not start. Nothing caught it because FlywayMigrationTest was gated on
+-- Docker and silently disabled itself everywhere Docker was absent.
+--
+-- The statements live in a PL/pgSQL block so they are only parsed when reached: PL/pgSQL
+-- plans lazily, so the early RETURN means `users` is never resolved when it is absent.
+--
+-- OPERATORS: this edit changes the file's Flyway checksum. A database that already applied
+-- the previous version of V9 must be repaired once (`flyway repair`) before its next
+-- migrate, or validate-on-migrate will refuse to run.
 
--- Partial index: any legacy row with a NULL username is left alone rather than colliding
--- with other NULLs (Postgres treats NULLs as distinct in a unique index anyway, but being
--- explicit keeps the intent readable).
-create unique index if not exists ux_users_username
-    on users (username)
-    where username is not null;
+DO $$
+BEGIN
+    IF to_regclass('users') IS NULL THEN
+        RAISE NOTICE 'users table does not exist - nothing to dedupe or constrain.';
+        RETURN;
+    END IF;
+
+    WITH ranked AS (
+        SELECT id,
+               row_number() OVER (
+                   PARTITION BY username
+                   ORDER BY (password_hash IS NOT NULL) DESC,
+                            (points + gems + xp) DESC,
+                            id ASC
+               ) AS row_rank
+        FROM users
+        WHERE username IS NOT NULL
+    )
+    DELETE FROM users
+    WHERE id IN (SELECT id FROM ranked WHERE row_rank > 1);
+
+    -- Partial index: any legacy row with a NULL username is left alone rather than colliding
+    -- with other NULLs (Postgres treats NULLs as distinct in a unique index anyway, but being
+    -- explicit keeps the intent readable).
+    CREATE UNIQUE INDEX IF NOT EXISTS ux_users_username
+        ON users (username)
+        WHERE username IS NOT NULL;
+END
+$$;

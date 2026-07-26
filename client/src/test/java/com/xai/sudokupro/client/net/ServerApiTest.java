@@ -103,6 +103,60 @@ class ServerApiTest {
         assertEquals("Authentication failed — check username/password.", e.getMessage());
     }
 
+    /**
+     * 401 and 403 bodies used to be thrown away in favour of a canned sentence, so
+     * the one specific, actionable thing the server said — why it refused —
+     * never reached the player. The server is specific: "Competitive games cannot be
+     * spectated", "this board belongs to someone else", "Too many failed logins".
+     * All of it was replaced with "Access denied (403) for /api/game/…".
+     */
+    @Test
+    void forbiddenBodyReachesTheUser() throws IOException {
+        server = startServer();
+        server.createContext("/api/session", ex ->
+            respond(ex, 200, "{\"playerId\":\"richmond\",\"csrfHeaderName\":\"X-XSRF-TOKEN\",\"csrfToken\":\"tok-123\"}"));
+        server.createContext("/api/game/daily-2026-07-26:ann", ex ->
+            respond(ex, 403, "{\"detail\":\"Competitive games cannot be spectated\"}"));
+        server.start();
+
+        ServerApi api = new ServerApi(configFor(server));
+        api.connect();
+        ApiException e = assertThrows(ApiException.class, () -> api.getGame("daily-2026-07-26:ann"));
+
+        assertEquals(403, e.status());
+        assertEquals("Competitive games cannot be spectated", e.getMessage());
+    }
+
+    @Test
+    void unauthorizedBodyReachesTheUserAlongsideTheHint() throws IOException {
+        server = startServer();
+        server.createContext("/api/session", ex ->
+            respond(ex, 401, "{\"detail\":\"Too many failed logins — locked out for 5 minutes\"}"));
+        server.start();
+
+        ServerApi api = new ServerApi(configFor(server));
+        ApiException e = assertThrows(ApiException.class, api::connect);
+
+        assertEquals(401, e.status());
+        assertTrue(e.getMessage().startsWith("Too many failed logins"), e.getMessage());
+    }
+
+    /** A 403 with an unhelpful body still gets the generic sentence rather than nothing. */
+    @Test
+    void forbiddenWithNoDetailStillExplainsWhichCallWasRefused() throws IOException {
+        server = startServer();
+        server.createContext("/api/session", ex ->
+            respond(ex, 200, "{\"playerId\":\"richmond\",\"csrfHeaderName\":\"X-XSRF-TOKEN\",\"csrfToken\":\"tok-123\"}"));
+        server.createContext("/api/game/g9", ex -> respond(ex, 403, ""));
+        server.start();
+
+        ServerApi api = new ServerApi(configFor(server));
+        api.connect();
+        ApiException e = assertThrows(ApiException.class, () -> api.getGame("g9"));
+
+        assertTrue(e.getMessage().contains("/api/game/g9"), e.getMessage());
+    }
+
     @Test
     void nonAuthErrorSurfacesTheServersProblemDetail() throws IOException {
         server = startServer();

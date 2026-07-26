@@ -16,12 +16,25 @@
     /* --cell-peer was #15152e: a 5/255 delta against --cell, a 1.16:1 ratio that was
        simply not visible. The peer highlight covers 20 cells and is the main navigational
        aid on the board, so it needs to actually register. */
-    --cell:#101026; --cell-given:#191938; --cell-sel:#2a2450; --cell-peer:#1d1d3a;
+    /* --cell-given was #191938: a lightness step of 9/255 over --cell, which disappears
+       entirely in greyscale, leaving gold-vs-lilac as the only signal for which digits are
+       clues. Widened so the fill itself distinguishes them. */
+    --cell:#101026; --cell-given:#26264b; --cell-sel:#2a2450; --cell-peer:#1d1d3a;
     --radius:14px; --shadow:0 10px 40px rgba(0,0,0,.45);
   }
   * { box-sizing:border-box; }
-  html,body { height:100%; overflow-x:hidden; }
+  /* `html,body { height:100% }` combined with overflow-x:hidden turned <body> into its own
+     scroll container of exactly one viewport: the document stopped scrolling
+     (window.scrollY was pinned at 0 no matter what), and everything below the fold — the
+     number pad, the event log — could only be reached by scrolling the body element
+     itself. Measured at 375x700: page content 1112px tall, documentElement.scrollHeight
+     700, pad sitting at y=869 outside the viewport with window.scrollTo() a no-op. It also
+     breaks scroll restoration and is the classic cause of iOS Safari's broken momentum
+     scrolling. Setting overflow-x on <body> alone propagates it to the viewport (CSS
+     Overflow §3.3) and leaves the document as the scroller, which is what we want. */
+  html { height:100%; }
   body {
+    overflow-x:hidden;
     margin:0; color:var(--text);
     font-family:'Segoe UI',system-ui,-apple-system,Roboto,Helvetica,Arial,sans-serif;
     background:
@@ -48,8 +61,16 @@
     position:absolute; width:1px; height:1px; padding:0; margin:-1px;
     overflow:hidden; clip:rect(0 0 0 0); white-space:nowrap; border:0;
   }
-  button:focus-visible, .cell:focus-visible, select:focus-visible, input:focus-visible {
-    outline:2px solid var(--cyan); outline-offset:2px;
+  button:focus-visible, select:focus-visible, input:focus-visible,
+  summary:focus-visible, [tabindex]:focus-visible {
+    outline:3px solid var(--cyan); outline-offset:2px;
+  }
+  /* #board has overflow:hidden (it clips the rounded corners), so an outward focus ring on
+     any edge cell was cut off — the top row, bottom row and both outer columns showed no
+     focus indicator at all. Draw it inside the cell instead, and pair it with a white
+     inner ring so it stays visible over the gold/purple cell fills. */
+  .cell:focus-visible {
+    outline:3px solid #fff; outline-offset:-3px; z-index:2;
   }
   @media (prefers-reduced-motion: reduce) {
     *, *::before, *::after {
@@ -107,25 +128,50 @@
      scrolled sideways on every phone (measured 396-398px against a 320-390px viewport,
      with the Exit button's right edge off-screen at x=395.7). minmax(0,1fr) plus a
      truncating value lets the tracks actually shrink. */
-  #hud { display:grid; grid-template-columns:repeat(5,minmax(0,1fr)); gap:6px; width:100%; }
-  .stat { background:#12122a; border:1px solid var(--line); border-radius:12px; padding:8px 6px; text-align:center; min-width:0; }
+  /* Seven stats across five columns left a 5 + 2 split with three empty holes punched in
+     the second row, and squeezed the player's name down to "wt5f…" while three tracks sat
+     unused. Give the name its own full-width row and put the six numeric stats in one
+     tidy row of six. */
+  #hud { display:grid; grid-template-columns:repeat(6,minmax(0,1fr)); gap:6px; width:100%; }
+  #hud .stat:first-child { grid-column:1 / -1; }
+  .stat { background:#12122a; border:1px solid var(--line); border-radius:12px; padding:8px 4px; text-align:center; min-width:0; }
   .stat .k { font-size:10px; letter-spacing:1px; text-transform:uppercase; color:var(--muted); }
-  .stat .v { font-size:18px; font-weight:700; color:var(--cyan); margin-top:2px;
+  /* 18px ellipsised the clock to "00:…" in a 58px track. 17px with tabular figures fits
+     mm:ss exactly, and keeps the digits from jittering as the seconds tick. */
+  .stat .v { font-size:17px; font-weight:700; color:var(--cyan); margin-top:2px;
+             font-variant-numeric:tabular-nums;
              overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  #hudPlayer { font-size:19px; }
   .stat .v.gold { color:var(--gold); }
+  /* Words, not coloured dots — see setConnBadge(). Sized down so "Down" fits the
+     narrowest HUD track without ellipsising. */
+  #hudConn { font-size:14px; letter-spacing:.5px; }
   #hudConn.live { color:var(--good); } #hudConn.down { color:var(--bad); }
+  #hudConn.idle { color:var(--muted); }
 
-  .controls { display:flex; gap:8px; margin-top:12px; align-items:stretch; flex-wrap:wrap; }
-  .controls select { flex:1.2 1 120px; min-width:0; }
-  .controls button { flex:1 1 88px; min-width:0; }
+  /* 44px floors everywhere a finger lands. The control buttons were 11px+11px padding
+     around a 14px line = ~40px tall, under the WCAG 2.5.5 / platform 44px minimum, and
+     they are the row you hit most often on a phone (Undo / Redo / Hint). */
+  /* One row per .controls group, always. As flex-wrap the third row's four buttons and the
+     first row's select+New+Daily overflowed their 309px of panel at 375px wide and dropped
+     a single orphan button onto a line of its own ("Daily" alone, then "Exit" alone) —
+     ~90px of dead vertical space each, above the fold on a phone. Auto-flow columns can't
+     wrap, so each group stays one row at every width. */
+  .controls { display:grid; grid-auto-flow:column; grid-auto-columns:minmax(0,1fr);
+              gap:8px; margin-top:12px; align-items:stretch; }
+  .controls select, .controls button { min-width:0; min-height:44px; }
+  .controls button { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 
   @media (max-width:420px) {
-    #hud { grid-template-columns:repeat(4,minmax(0,1fr)); }
-    #hud .stat:first-child { grid-column:1 / -1; }  /* the name gets its own row */
+    #hud { grid-template-columns:repeat(3,minmax(0,1fr)); }  /* name row + 2 clean rows of 3 */
+    .controls button { font-size:13px; padding-left:4px; padding-right:4px; }
     /* Nine buttons across a 320px screen gave 28px tap targets, well under the 44px
-       minimum. Five columns brings them to ~55px. */
-    #nums { grid-template-columns:repeat(5,1fr) !important; }
+       minimum. A 3x3 keypad brings them to ~100x47 and, unlike five columns, leaves no
+       ragged four-button second row. */
+    #nums { grid-template-columns:repeat(3,1fr) !important; }
     .num { padding:14px 0 !important; }
+    /* 12px of side padding inside an ~85px track clipped "Medium" against the arrow. */
+    .controls select { padding-left:8px; padding-right:2px; font-size:14px; }
   }
 
   /* Board */
@@ -135,6 +181,10 @@
     background:var(--line-strong); border:3px solid var(--accent); border-radius:10px; overflow:hidden;
     box-shadow:var(--shadow);
   }
+  /* role="row" wrappers exist purely for ARIA (a grid's children must be rows).
+     display:contents keeps the 81 cells as direct participants in #board's grid, so the
+     layout is unchanged. */
+  .grid-row { display:contents; }
   .cell {
     position:relative; display:flex; align-items:center; justify-content:center;
     font-size:clamp(18px,5.2vw,26px); font-weight:600; color:var(--accent-2);
@@ -145,12 +195,26 @@
   .cell.peer { background:var(--cell-peer); }
   .cell.same { background:#22203f; color:#fff; }
   .cell.sel { background:var(--cell-sel); box-shadow:inset 0 0 0 2px var(--cyan); color:#fff; }
-  /* Conflict carries a glyph as well as colour — red-on-gold-on-purple is not separable
-     under deuteranopia, and colour alone fails WCAG 1.4.1. */
-  .cell.conflict { color:var(--bad) !important; }
-  .cell.conflict::after {
-    content:""; position:absolute; inset:0; background:radial-gradient(circle at 50% 50%, rgba(255,107,125,.28), transparent 70%);
+  /* Conflict must be readable without colour: red-on-gold-on-purple is not separable
+     under deuteranopia, and colour alone fails WCAG 1.4.1. The old rule was a red tint
+     plus a red radial glow — two colours and no shape. Now the digit is underlined and a
+     wedge is cut into the top-left corner, both of which survive greyscale. */
+  .cell.conflict { color:var(--bad) !important; text-decoration:underline wavy currentColor 1.5px;
+                   text-underline-offset:2px; }
+  .cell.conflict::before {
+    content:""; position:absolute; top:0; left:0; width:0; height:0; pointer-events:none;
+    border-top:9px solid var(--bad); border-right:9px solid transparent;
   }
+  .cell.conflict::after {
+    content:""; position:absolute; inset:0; pointer-events:none;
+    background:radial-gradient(circle at 50% 50%, rgba(255,107,125,.28), transparent 70%);
+  }
+  /* Given vs player entry must not rest on gold-versus-lilac alone. Two non-colour cues
+     carry it: a clear weight step (500 against 800 — it was 600/800, barely a difference)
+     and a lighter cell fill. A dotted baseline was tried and dropped: at 26px it reads as
+     dirt under every clue on the board. */
+  .cell { font-weight:500; }
+  .cell.given { font-weight:800; }
   /* A rejected move: the server validates and wipes the optimistic value faster than a
      frame, so the only feedback used to be a toast reading "Server: Invalid move" with no
      indication of which cell. Flash the cell itself instead. */
@@ -213,13 +277,20 @@
   #utils { display:grid; grid-template-columns:1fr 1fr; gap:8px; margin-top:8px; }
   .num { position:relative; padding:14px 0; font-size:clamp(15px,4vw,19px); font-weight:700;
     background:#181834; border:1px solid var(--line-strong); border-radius:9px; }
-  .num:hover:not(:disabled) { background:#22224a; }
+  .num:hover:not(:disabled):not([aria-disabled="true"]) { background:#22224a; }
   /* 8.5px was unreadable and the badge visually collided with the digit — "4" over "1"
      read as "41". 11px with a little breathing room. */
   .num .rem { position:absolute; top:3px; right:5px; font-size:11px; line-height:1;
     color:var(--muted); font-weight:600; }
-  .num.done, .num:disabled { opacity:.32; cursor:default; }
-  .util { padding:13px 0; font-size:15px; }
+  /* A finished digit stays focusable (aria-disabled, not disabled) so it cannot yank focus
+     out of the pad the moment the ninth copy lands — see renderPad(). It is dimmed AND
+     struck through, so "all placed" is not signalled by opacity alone. */
+  .num.done, .num:disabled, .num[aria-disabled="true"] { opacity:.38; cursor:default; }
+  .num[aria-disabled="true"]::before {
+    content:""; position:absolute; left:18%; right:18%; top:50%; height:2px;
+    background:currentColor; opacity:.8;
+  }
+  .util { padding:13px 0; font-size:15px; min-height:44px; }
   #btnNotes.on { background:linear-gradient(180deg,var(--cyan),#2aa8c4); color:#03202a; }
 
   /* Toast + log */
@@ -258,7 +329,7 @@
   /* Stats modal: tabs + ranked rows */
   .tabs { display:flex; gap:6px; margin-bottom:12px; }
   .tabs button { flex:1; padding:8px 6px; font-size:12.5px; background:#12122a;
-    border:1px solid var(--line); color:var(--muted); }
+    border:1px solid var(--line); color:var(--muted); min-height:44px; }
   .tabs button.on { background:linear-gradient(180deg,var(--accent-2),var(--accent)); color:#fff; border-color:transparent; }
   .rank-row { display:flex; align-items:center; gap:10px; padding:8px 10px; border-radius:9px;
     background:#12122a; border:1px solid var(--line); margin-bottom:6px; font-size:13px; }
@@ -334,7 +405,15 @@
       <div class="hintline" id="hintline"></div>
     </div>
 
-    <div id="boardWrap"><div id="board" role="grid" aria-label="Sudoku board"></div></div>
+    <p id="boardHelp" class="sr-only">
+      Sudoku grid, 9 rows by 9 columns. Use the arrow keys to move between cells,
+      Home and End for the first and last column, Page Up and Page Down for the first and
+      last row. Type 1 to 9 to enter a digit, and 0, Backspace or Delete to clear a cell.
+      Press N to toggle notes mode. Control Z undoes, Control Y redoes.
+    </p>
+    <div id="boardWrap">
+      <div id="board" role="grid" aria-label="Sudoku board" aria-describedby="boardHelp"></div>
+    </div>
     <div id="pad"></div>
 
     <details class="logbox">

@@ -7,6 +7,34 @@ on: [push, pull_request]
 jobs:
   test:
     runs-on: ubuntu-latest
+    # Most server tests run on H2 via the test profile. Two classes cannot:
+    # FlywayMigrationTest runs the real V1-V9 chain (PL/pgSQL DO blocks, ADD GENERATED
+    # AS IDENTITY, partial unique indexes — none of which H2 can check) and
+    # CrossReplicaBroadcastTest needs real Redis pub/sub to prove a broadcast on one pod
+    # reaches a session on another. Both used to be @Testcontainers(disabledWithoutDocker),
+    # which meant they silently disabled themselves here and everywhere else, and both
+    # subsystems shipped unverified. Real services now back them, and an outage is a red
+    # build rather than a skip.
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: sudoku123
+          POSTGRES_DB: sudokupro
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+      redis:
+        image: redis:7
+        ports: ['6379:6379']
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
     steps:
       - uses: actions/checkout@v4
 
@@ -17,10 +45,45 @@ jobs:
           distribution: 'temurin'
           cache: maven
 
-      # Full suite across all modules (model/server/client) — server tests run
-      # on H2 via the test profile, no services needed.
+      # Full suite across all modules (model/server/client). DB_PASSWORD/REDIS_* are the
+      # same environment variables application.properties reads, so nothing test-specific
+      # is hard-coded; the H2 test profile overrides the datasource for every other test.
+      # sudokupro.it.optional is deliberately NOT set: the services above are guaranteed,
+      # so an unreachable one must fail the build.
       - name: Build and test
+        env:
+          DB_HOST: localhost
+          DB_PORT: '5432'
+          DB_USERNAME: postgres
+          DB_PASSWORD: sudoku123
+          REDIS_HOST: localhost
+          REDIS_PORT: '6379'
         run: mvn -B verify
+
+      # Belt and braces for the exact failure this replaced: a test that counts as passing
+      # while never executing. If either class is missing from the reports, or reports a
+      # skip, or ran zero tests, the build fails and says so.
+      - name: Prove the real-service tests actually executed
+        if: always()
+        run: |
+          set -euo pipefail
+          status=0
+          for cls in com.xai.sudokupro.db.FlywayMigrationTest \
+                     com.xai.sudokupro.websocket.CrossReplicaBroadcastTest; do
+            report="server/target/surefire-reports/TEST-${cls}.xml"
+            if [ ! -f "$report" ]; then
+              echo "::error::${cls} produced no surefire report — it did not run at all"
+              status=1; continue
+            fi
+            tests=$(grep -o 'tests="[0-9]*"' "$report" | head -1 | grep -o '[0-9]*')
+            skipped=$(grep -o 'skipped="[0-9]*"' "$report" | head -1 | grep -o '[0-9]*')
+            echo "${cls}: tests=${tests} skipped=${skipped}"
+            if [ "${tests:-0}" -eq 0 ] || [ "${skipped:-0}" -ne 0 ]; then
+              echo "::error::${cls} ran ${tests} test(s) with ${skipped} skipped — this subsystem must be verified, not skipped"
+              status=1
+            fi
+          done
+          exit $status
 
   # The three out-of-process harnesses. The JUnit suite above cannot reach what
   # these do: the engine drives the real model through whole games looking for

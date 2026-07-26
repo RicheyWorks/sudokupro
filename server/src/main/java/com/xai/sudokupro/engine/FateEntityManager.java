@@ -1,5 +1,6 @@
 package com.xai.sudokupro.engine;
 
+import com.xai.sudokupro.model.EnhancedMove;
 import com.xai.sudokupro.model.SudokuBoard;
 import com.xai.sudokupro.service.AISolverService;
 import com.xai.sudokupro.service.GameService;
@@ -14,17 +15,32 @@ import org.springframework.stereotype.Component;
 import java.lang.management.ManagementFactory;
 import java.time.LocalTime;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 
+/**
+ * Flavour layer: a bestiary of "fate entities" that may comment on, or nudge, a game in
+ * progress. Nothing here is authoritative — but it runs inside the caller's request, so a
+ * misbehaving entity must never be able to fail that request.
+ */
 @Component
 public class FateEntityManager {
     private static final Logger logger = LoggerFactory.getLogger(FateEntityManager.class);
 
     // ✅ FIX: missing entropy threshold
     private static final long ENTROPY_THRESHOLD = 1024L;
+
+    /**
+     * Ceiling on the per-player tracking maps. Their keys are caller-supplied player ids
+     * and nothing ever removed an entry, so the two maps grew for the lifetime of the JVM
+     * with every id that had ever been seen. Same cap, and same reasoning, as
+     * {@code ChaosEngine.MAX_TRACKED_PLAYERS}.
+     */
+    public static final int MAX_TRACKED_PLAYERS = 10_000;
 
     private final ChaosEngine chaosEngine;
     private final GameService gameService;
@@ -33,7 +49,7 @@ public class FateEntityManager {
     private final MultiplayerBroadcaster multiplayerBroadcaster;
     private final MemoryBank memoryBank;
 
-    private final List<FateEntity> entities = new ArrayList<>();
+    private final List<FateEntity> entities;
     private final Map<String, Integer> playerStreaks = new ConcurrentHashMap<>();
     private final Map<String, Integer> playerFails = new ConcurrentHashMap<>();
 
@@ -41,27 +57,46 @@ public class FateEntityManager {
     public FateEntityManager(ChaosEngine chaosEngine, GameService gameService, SecureRandomGenerator rng,
                              AISolverService aiSolverService, MultiplayerBroadcaster multiplayerBroadcaster,
                              MemoryBank memoryBank) {
-        this.chaosEngine = chaosEngine;
-        this.gameService = gameService;
-        this.rng = rng;
-        this.aiSolverService = aiSolverService;
-        this.multiplayerBroadcaster = multiplayerBroadcaster;
-        this.memoryBank = memoryBank;
+        // Fail at wiring time rather than with an NPE from inside a player's move.
+        this.chaosEngine = Objects.requireNonNull(chaosEngine, "chaosEngine");
+        this.gameService = Objects.requireNonNull(gameService, "gameService");
+        this.rng = Objects.requireNonNull(rng, "rng");
+        this.aiSolverService = Objects.requireNonNull(aiSolverService, "aiSolverService");
+        this.multiplayerBroadcaster = Objects.requireNonNull(multiplayerBroadcaster, "multiplayerBroadcaster");
+        this.memoryBank = Objects.requireNonNull(memoryBank, "memoryBank");
 
-        registerEntities();
+        this.entities = Collections.unmodifiableList(registerEntities());
         logger.info("FateEntityManager initialized with {} entities", entities.size());
     }
 
+    /**
+     * Rolls every entity against the current game.
+     *
+     * <p>Each entity is isolated. The loop used to let any failure escape: one entity
+     * throwing (AIDoubter calls into the solver, EntropyDealer into the chaos engine)
+     * skipped every entity after it AND propagated out of a decorative subsystem into the
+     * player's move, turning a cosmetic feature into a failed request.
+     */
     public void evaluateAndTrigger(String playerId, SudokuBoard board) {
+        if (board == null) {
+            logger.debug("evaluateAndTrigger called with no board for {}; nothing to judge", playerId);
+            return;
+        }
         for (FateEntity entity : entities) {
-            if (entity.shouldTrigger(playerId, board)) {
-                entity.trigger(playerId, board);
-                logger.info("Entity {} triggered for {}", entity.getName(), playerId);
+            try {
+                if (entity.shouldTrigger(playerId, board)) {
+                    entity.trigger(playerId, board);
+                    logger.info("Entity {} triggered for {}", entity.getName(), playerId);
+                }
+            } catch (RuntimeException e) {
+                logger.warn("Fate entity {} failed for player {}: {}",
+                    entity.getName(), playerId, e.toString());
             }
         }
     }
 
-    private void registerEntities() {
+    private List<FateEntity> registerEntities() {
+        List<FateEntity> entities = new ArrayList<>();
         entities.add(new RedJester());
         entities.add(new DivineOverflow());
         entities.add(new CrashWarden());
@@ -82,10 +117,16 @@ public class FateEntityManager {
         entities.add(new EntropyDealer());
         entities.add(new LuckInverter());
         entities.add(new DeadlockMonk());
+        return entities;
     }
 
+    /**
+     * Entity chatter goes to the log, not to {@code System.out}: this runs on a request
+     * thread inside a server, where unbuffered stdout writes are both a global monitor and
+     * output nobody collects.
+     */
     private void speak(String message) {
-        System.out.println("🗣️  [FATE ENTITY]: " + message);
+        logger.info("[FATE ENTITY]: {}", message);
     }
 
     private abstract class FateEntity {
@@ -183,8 +224,16 @@ public class FateEntityManager {
         protected String getName() { return "AIDoubter"; }
         protected boolean shouldTrigger(String p, SudokuBoard b) { return rng.chance(0.03); }
         protected void trigger(String p, SudokuBoard b) {
-            String move = aiSolverService.getNextLogicalMove(b);
-            speak("AIDoubter questions: " + move);
+            // getNextLogicalMove() BILLS the board for a hint (board.incrementHintCount()).
+            // Nobody asked this entity for help: hintCount is exactly what disqualifies a
+            // perfect clear (isPerfectClear()) and what the hint analytics count, so a 3%
+            // flavour roll silently cost the player their flawless-solve bonus. The
+            // EnhancedMove variant answers the same question without charging for it.
+            EnhancedMove move = aiSolverService.getNextLogicalMoveAsEnhancedMove(b);
+            speak(move == null
+                ? "AIDoubter questions whether this board has an answer at all."
+                : String.format("AIDoubter questions: %d at row %d, col %d",
+                    move.newVal(), move.row() + 1, move.col() + 1));
         }
     }
 
@@ -215,14 +264,52 @@ public class FateEntityManager {
     }
 
     public void recordPlayerFail(String playerId) {
-        playerFails.put(playerId, playerFails.getOrDefault(playerId, 0) + 1);
+        increment(playerFails, playerId);
     }
 
     public void recordPlayerStreak(String playerId) {
-        playerStreaks.put(playerId, playerStreaks.getOrDefault(playerId, 0) + 1);
+        increment(playerStreaks, playerId);
     }
 
+    /**
+     * Clears a player's streak. Removes the entry rather than storing a zero: a reset for
+     * an id that was never tracked used to create a permanent entry, so this method alone
+     * could grow the map without bound. Readers use {@link #getPlayerStreak}, for which
+     * "absent" and "zero" are the same answer.
+     */
     public void resetPlayerStreak(String playerId) {
-        playerStreaks.put(playerId, 0);
+        if (playerId == null) return;
+        playerStreaks.remove(playerId);
+    }
+
+    public int getPlayerStreak(String playerId) {
+        return playerId == null ? 0 : playerStreaks.getOrDefault(playerId, 0);
+    }
+
+    public int getPlayerFails(String playerId) {
+        return playerId == null ? 0 : playerFails.getOrDefault(playerId, 0);
+    }
+
+    public int trackedStreakCount() { return playerStreaks.size(); }
+
+    public int trackedFailCount()   { return playerFails.size(); }
+
+    /**
+     * Atomic +1 for {@code playerId}, bounded by {@link #MAX_TRACKED_PLAYERS}.
+     *
+     * <p>Both counters used to be {@code map.put(id, map.getOrDefault(id, 0) + 1)}. Read,
+     * add, write is not atomic however thread-safe the map is: two concurrent losses or
+     * wins on the same player interleave and one of them vanishes. These are recorded from
+     * request threads, so concurrent updates for one player are the normal case, not a
+     * corner case.
+     */
+    private static void increment(Map<String, Integer> counters, String playerId) {
+        if (playerId == null || playerId.isBlank()) return;
+        if (counters.size() >= MAX_TRACKED_PLAYERS && !counters.containsKey(playerId)) {
+            logger.debug("Fate tracking is full ({} players); not tracking {}",
+                MAX_TRACKED_PLAYERS, playerId);
+            return;
+        }
+        counters.merge(playerId, 1, Integer::sum);
     }
 }

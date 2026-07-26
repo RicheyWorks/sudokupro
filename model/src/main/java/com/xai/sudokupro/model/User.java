@@ -109,6 +109,42 @@ public class User implements Serializable {
     @Min(value = 0, message = "Cosmic drip cannot be negative")
     private int cosmicDrip;
 
+    /**
+     * How many times anti-cheat has flagged this account, and when it first and last
+     * happened.
+     *
+     * <p>{@code AntiCheatEngine.flagPlayer} used to halve {@link #cosmicDrip} and return.
+     * Nothing recorded that a moderation decision had been taken: the only "flag" was an
+     * entry in {@code AntiCheatScheduler.flaggedPlayers}, a plain map inside one bean on one
+     * pod, erased by any restart and invisible to every other replica. The penalty was real
+     * and recurring (the scheduler re-flags every 60 seconds) while the reason for it was
+     * not recorded anywhere a human could read.
+     *
+     * <p>{@code firstFlaggedAt} is written once and never overwritten — "how long has this
+     * been going on" is the question a moderator asks, and a field rewritten on every
+     * scheduler pass always answers "about a minute".
+     */
+    /*
+     * The column definition is spelled out rather than left to Hibernate's default mapping,
+     * and the reason is a failure the migration tests caught the first time they ran for
+     * real. A primitive int maps to `integer not null` with NO database default. On the dev
+     * profile, which disables Flyway and lets ddl-auto own the schema, that means: any
+     * INSERT not naming this column fails with `null value in column "cheat_flag_count"
+     * violates not-null constraint`, and — worse — `ddl-auto=update` cannot add the column
+     * to an already-populated dev database at all, because PostgreSQL will not add a NOT
+     * NULL column with no default to a table that has rows. Hibernate always names the
+     * column on insert, which is exactly why this stays invisible until something else
+     * writes a row. The explicit default makes the Hibernate-generated schema agree with
+     * what V10 produces.
+     */
+    @Min(value = 0, message = "Cheat flag count cannot be negative")
+    @Column(name = "cheat_flag_count", nullable = false, columnDefinition = "integer not null default 0")
+    private int cheatFlagCount;
+
+    private LocalDateTime firstFlaggedAt;
+
+    private LocalDateTime lastFlaggedAt;
+
     // ObjectMapper is thread-safe after construction; a single shared instance is correct here.
     // It must NOT be injected via @Autowired because JPA creates User instances via its own
     // no-arg reflection path, completely bypassing Spring's constructor injection.
@@ -204,6 +240,35 @@ public class User implements Serializable {
     public void setHypeMeter(int hypeMeter) { this.hypeMeter = Math.max(0, hypeMeter); }
     public int getCosmicDrip() { return cosmicDrip; }
     public void setCosmicDrip(int cosmicDrip) { this.cosmicDrip = Math.max(0, cosmicDrip); }
+
+    public int getCheatFlagCount() { return cheatFlagCount; }
+    public void setCheatFlagCount(int cheatFlagCount) { this.cheatFlagCount = Math.max(0, cheatFlagCount); }
+    public LocalDateTime getFirstFlaggedAt() { return firstFlaggedAt; }
+    public void setFirstFlaggedAt(LocalDateTime firstFlaggedAt) { this.firstFlaggedAt = firstFlaggedAt; }
+    public LocalDateTime getLastFlaggedAt() { return lastFlaggedAt; }
+    public void setLastFlaggedAt(LocalDateTime lastFlaggedAt) { this.lastFlaggedAt = lastFlaggedAt; }
+
+    /** True when anti-cheat currently holds a flag against this account. */
+    public boolean isCheatFlagged() { return cheatFlagCount > 0; }
+
+    /**
+     * Records one anti-cheat flag. Keeps the first sighting, advances the last.
+     *
+     * <p>Lives on the entity rather than in the service so every writer produces the same
+     * shape — a count that only accumulates and a first-seen timestamp that never moves.
+     */
+    public void recordCheatFlag(LocalDateTime when) {
+        cheatFlagCount++;
+        if (firstFlaggedAt == null) firstFlaggedAt = when;
+        lastFlaggedAt = when;
+    }
+
+    /** Moderation "this was a false positive": wipes the flag record entirely. */
+    public void clearCheatFlags() {
+        cheatFlagCount = 0;
+        firstFlaggedAt = null;
+        lastFlaggedAt = null;
+    }
 
     // Helper Methods
     public void addPoints(int amount) {

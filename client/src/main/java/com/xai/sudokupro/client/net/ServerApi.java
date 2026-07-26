@@ -297,7 +297,7 @@ public class ServerApi {
      * Opens the authenticated gameplay WebSocket, joining {@code gameId}.
      * Envelopes are delivered on the HttpClient's executor threads.
      */
-    public GameSocket openSocket(String gameId, Consumer<Envelope> onEnvelope, Runnable onClose) {
+    public GameSocket openSocket(String gameId, Consumer<Envelope> onEnvelope, CloseListener onClose) {
         return GameSocket.open(httpClient, mapper, config.wsUri(gameId), basicAuth, onEnvelope, onClose);
     }
 
@@ -361,15 +361,45 @@ public class ServerApi {
         }
     }
 
+    /**
+     * Builds the message the player sees for a non-2xx response.
+     *
+     * <p>401 and 403 used to return a canned sentence and never look at the body,
+     * which threw away the only part the player could act on. The server is
+     * specific — "Competitive games cannot be spectated", "this board belongs to
+     * someone else", "Too many failed logins, try again in 5 minutes" — and all of
+     * it was replaced with "Access denied (403) for /api/game/daily-2026-07-26:ann",
+     * leaving the player to guess. The generic sentence is still worth keeping as
+     * context for 401, so the server's reason leads and the hint follows.
+     */
     private String errorDetail(int status, String body, URI uri) {
-        if (status == 401) return "Authentication failed — check username/password.";
-        if (status == 403) return "Access denied (403) for " + uri.getPath();
+        String serverDetail = detailFromBody(body);
+        if (status == 401) {
+            return serverDetail != null
+                ? serverDetail + " (check username/password)"
+                : "Authentication failed — check username/password.";
+        }
+        if (status == 403) {
+            return serverDetail != null
+                ? serverDetail
+                : "Access denied (403) for " + uri.getPath();
+        }
+        if (serverDetail != null) return serverDetail;
+        return "Server returned HTTP " + status + " for " + uri.getPath();
+    }
+
+    /** The server's {@code detail} field, or null when the body carries none. */
+    private String detailFromBody(String body) {
+        if (body == null || body.isBlank()) return null;
         try {
             JsonNode node = mapper.readTree(body);
-            if (node.has("detail")) return node.get("detail").asText();
+            if (node.has("detail")) {
+                String detail = node.get("detail").asText();
+                return detail.isBlank() ? null : detail;
+            }
         } catch (IOException ignored) {
-            // fall through to the generic message
+            // not JSON, or truncated — fall back to the generic message
         }
-        return "Server returned HTTP " + status + " for " + uri.getPath();
+        return null;
     }
 }

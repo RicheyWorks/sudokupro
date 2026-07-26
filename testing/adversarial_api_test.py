@@ -53,7 +53,7 @@ check("bob CAN read alice's board (spectating by design)", call(B,"GET",f"/api/g
 print("\n=== hint charged to the caller, not the board owner ===")
 before_a=call(A,"GET","/api/economy/wallet")[1]["gems"]
 before_b=call(B,"GET","/api/economy/wallet")[1]["gems"]
-hs,_=call(B,"GET",f"/api/game/hint?gameId={gid}")
+hs,_=call(B,"POST",f"/api/game/hint?gameId={gid}")
 after_a=call(A,"GET","/api/economy/wallet")[1]["gems"]
 after_b=call(B,"GET","/api/economy/wallet")[1]["gems"]
 print(f"  hint HTTP {hs}: alice {before_a}->{after_a}, bob {before_b}->{after_b}")
@@ -179,7 +179,7 @@ fc,_=call(A,"POST","/api/powerups/use/FREEZE?target=" + B["u"])
 check("FREEZE on a non-opponent is refused", fc, [402,403,409])
 
 print("\n=== unknown game ids map to 404, not 500 ===")
-hc,_=call(A,"GET","/api/game/hint?gameId=definitely-not-a-real-game")
+hc,_=call(A,"POST","/api/game/hint?gameId=definitely-not-a-real-game")
 check("hint on an unknown game is 404", hc, [404])
 
 print("\n=== un-friending a stranger does not provision a row ===")

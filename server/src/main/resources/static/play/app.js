@@ -27,27 +27,43 @@
   var lastWasClear = false;  // last outbound move was an erase (newVal 0)
   var lastMoveCell = null, lastMoveValue = 0;   // for flashing a server rejection
   var pending = [];          // moves made while the socket was down
+  var PENDING_LIMIT = 81;    // never more than one queued move per cell's worth
   var wsWanted = false, wsRetry = 0, wsRetryTimer = null;
   var lastFocus = null;      // element to restore focus to when a modal closes
   var cellEls = null;        // the 81 cell nodes, built once (see buildGrid)
 
   // ---- plumbing -------------------------------------------------------------
 
+  /** Every request gets a deadline; without one a hung socket left the UI spinning forever. */
+  var REQUEST_TIMEOUT_MS = 15000;
+
   async function api(method, path, body) {
-    var headers = { 'Authorization': auth, 'Accept': 'application/json' };
+    var headers = { 'Accept': 'application/json' };
+    if (auth) headers['Authorization'] = auth;
     if (body) headers['Content-Type'] = 'application/json';
     if (method !== 'GET' && csrfToken) headers[csrfHeader] = csrfToken;
     var resp;
+    // No fetch() in this file had a timeout. A TCP connection that is accepted and then
+    // never answered (a wedged pod, a captive portal) leaves the promise pending forever:
+    // the Load modal sat on "Loading…", guard() never released the button, and the only
+    // way out was a page reload. AbortController + a timer gives every call a deadline.
+    var ctrl = typeof AbortController === 'function' ? new AbortController() : null;
+    var timedOut = false;
+    var timer = ctrl ? setTimeout(function () { timedOut = true; ctrl.abort(); }, REQUEST_TIMEOUT_MS) : null;
     try {
       resp = await fetch(base + path, {
         method: method, headers: headers, credentials: 'include',
+        signal: ctrl ? ctrl.signal : undefined,
         body: body ? JSON.stringify(body) : undefined
       });
     } catch (e) {
       // "Failed to fetch" is plumbing, not a message for a player.
-      var ne = new Error(navigator.onLine ? 'Could not reach the server.'
-                                          : 'You appear to be offline.');
+      var ne = new Error(timedOut ? 'The server did not respond in time.'
+                                  : (navigator.onLine ? 'Could not reach the server.'
+                                                      : 'You appear to be offline.'));
       ne.status = 0; throw ne;
+    } finally {
+      if (timer) clearTimeout(timer);
     }
     if (!resp.ok) {
       // The old default was the literal string "HTTP 401", which is what users saw on a
@@ -106,19 +122,19 @@
     base = $('server').value.trim().replace(/\/+$/, '');
     var u = $('user').value.trim();
     if (!u || !$('pass').value) { status('Enter a username and password first.', 'err'); return; }
+    // Routed through api() so registration gets the same timeout and problem+json
+    // handling as everything else; the raw fetch here had neither.
+    var savedAuth = auth; auth = '';
     try {
-      var resp = await fetch(base + '/api/auth/register', {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ username: u, password: $('pass').value })
-      });
-      if (resp.status === 201) { status('Account created — press Log in & Play.', 'ok'); return; }
-      var err = await resp.json().catch(function () { return {}; });
-      status(err.detail || ('Registration failed (HTTP ' + resp.status + ')'), 'err');
-    } catch (e) { status(e.message, 'err'); }
+      await api('POST', '/api/auth/register', { username: u, password: $('pass').value });
+      status('Account created — press Log in & Play.', 'ok');
+    } catch (e) {
+      status(e.status === 409 ? 'That username is taken.' : e.message, 'err');
+    } finally { auth = savedAuth; }
   });
 
   $('loginForm').onsubmit = function (e) { e.preventDefault(); login(); };
-  async function login() {
+  var login = guard('btnLogin', async function () {
     base = $('server').value.trim().replace(/\/+$/, '');
     // btoa() throws InvalidCharacterError on any character above U+00FF, and this line
     // sat OUTSIDE the try below — so a username with an emoji or CJK character (which
@@ -147,16 +163,33 @@
         toast('Recommended difficulty: ' + diffName(rec.difficulty));
       } catch (e) { /* cosmetic */ }
     } catch (e) {
+      auth = '';   // a failed login must not leave stale credentials on later calls
       status(e.status === 429 ? 'Too many attempts — wait a minute.' : ('Login failed: ' + e.message), 'err');
     }
-  }
+  });
 
-  $('btnLogout').onclick = function () {
+  // "Exit" never told the server anything: it dropped the socket and reloaded the page, so
+  // the HttpSession created by GET /api/session stayed valid — the WebSocket handshake
+  // authenticates off that cookie, so anyone on the machine could reconnect a gameplay
+  // socket as the previous player just by opening /play again. Spring Security's logout is
+  // POST /logout and it needs the CSRF token; without the header it 403s and the session
+  // survives anyway.
+  $('btnLogout').onclick = guard('btnLogout', async function () {
     wsWanted = false;
-    if (wsRetryTimer) clearTimeout(wsRetryTimer);
-    if (socket) { try { socket.close(); } catch (e) {} }
+    if (wsRetryTimer) { clearTimeout(wsRetryTimer); wsRetryTimer = null; }
+    closeSocket();
+    stopTimer();
+    try {
+      await api('POST', '/logout');
+    } catch (e) {
+      // Never strand the player on a half-logged-out screen: report and reload regardless,
+      // which at least clears every credential this tab holds.
+      toast('Server logout failed: ' + e.message, 'bad');
+      await new Promise(function (r) { setTimeout(r, 900); });
+    }
+    auth = ''; csrfToken = null; me = null;
     location.reload();
-  };
+  });
 
   // There was no navigator.onLine handling anywhere: going offline mid-game produced no
   // message at all while moves silently failed to reach the server.
@@ -206,7 +239,11 @@
   $('btnHint').onclick = guard('btnHint', async function () {
     if (!gameId) { toast('Start a game first.'); return; }
     try {
-      var h = await api('GET', '/api/game/hint?gameId=' + encodeURIComponent(gameId));
+      // POST, not GET: buying a hint spends gems and raises the board's hint count, so it
+      // is not a safe method. As a GET the browser was free to replay it on a reload or a
+      // prefetch and spend the player's gems unasked. The server still answers the old GET
+      // (deprecated, and idempotent now) for already-shipped clients.
+      var h = await api('POST', '/api/game/hint?gameId=' + encodeURIComponent(gameId));
       $('hintline').textContent = '💡 ' + (h.hint || 'No hint available.');
       // Hints may mutate server state (e.g. a revealed cell) — pull authoritative board.
       setBoard(await api('GET', '/api/game/' + encodeURIComponent(gameId)), false);
@@ -250,6 +287,7 @@
     openModal('Saved games', '<div class="empty">Loading…</div>');
     try {
       var list = await api('GET', '/api/game/saved?limit=10');
+      if (Array.isArray(list)) list = list.filter(isBoardShape);
       if (!list || !list.length) {
         setModalBody('<div class="empty">No saved games yet.<br>Press 💾 Save during a game to keep it.</div>');
         return;
@@ -287,7 +325,7 @@
         var btn = document.createElement('button');
         btn.textContent = s.gameId === gameId ? 'Current' : 'Resume';
         btn.setAttribute('aria-label', 'Resume ' + name.textContent);
-        btn.onclick = function () { doResume(s.gameId); };
+        btn.onclick = function () { doResume(s.gameId, btn); };
         row.appendChild(meta); row.appendChild(btn);
         body.appendChild(row);
       });
@@ -298,7 +336,10 @@
     }
   });
 
-  async function doResume(id) {
+  async function doResume(id, btn) {
+    // Every Resume row fired straight into an unguarded async call: the modal stayed open
+    // with no feedback, and a double-tap sent two resumes for two different games.
+    if (btn) { if (btn.dataset.busy) return; btn.dataset.busy = '1'; btn.disabled = true; btn.classList.add('busy'); }
     try {
       var s = await api('POST', '/api/game/' + encodeURIComponent(id) + '/resume');
       closeModal();
@@ -306,7 +347,12 @@
       toast('Resumed', 'good');
       log('Resumed ' + id);
     } catch (e) {
-      toast(e.status === 409 ? 'That game is already finished.' : ('Resume failed: ' + e.message), 'bad');
+      if (e.status === 401) { handleAuthLoss(); return; }
+      toast(e.status === 409 ? 'That game is already finished.'
+          : e.status === 404 ? 'That save is gone.'
+          : ('Resume failed: ' + e.message), 'bad');
+    } finally {
+      if (btn) { delete btn.dataset.busy; btn.disabled = false; btn.classList.remove('busy'); }
     }
   }
 
@@ -316,6 +362,9 @@
   $('btnStats').onclick = function () { openStats('global'); };
 
   async function openStats(tab) {
+    // Re-entered on every tab click; the strip below is rebuilt, which destroys the button
+    // that was just activated. Put focus back on the equivalent new one.
+    var reentry = modalOpen();
     openModal('Stats', '');
     var body = document.createElement('div');
 
@@ -323,7 +372,9 @@
     tabs.className = 'tabs';
     [['global', '🌍 Points'], ['daily', '📅 Daily'], ['badges', '🏅 Badges']].forEach(function (t) {
       var b = document.createElement('button');
+      b.type = 'button';
       b.textContent = t[1];
+      b.setAttribute('aria-pressed', t[0] === tab ? 'true' : 'false');
       if (t[0] === tab) b.className = 'on';
       b.onclick = function () { openStats(t[0]); };
       tabs.appendChild(b);
@@ -334,6 +385,7 @@
     panel.innerHTML = '<div class="empty">Loading…</div>';
     body.appendChild(panel);
     setModalNode(body);
+    if (reentry) { var on = tabs.querySelector('button.on'); if (on) on.focus(); }
 
     try {
       if (tab === 'global') {
@@ -353,11 +405,17 @@
         renderBadges(panel, a);
       }
     } catch (e) {
+      if (e.status === 401) { handleAuthLoss(); return; }
       panel.innerHTML = '';
       var err = document.createElement('div');
       err.className = 'empty';
       err.textContent = 'Could not load: ' + e.message;
-      panel.appendChild(err);
+      var again = document.createElement('button');
+      again.className = 'secondary'; again.type = 'button';
+      again.textContent = 'Retry';
+      again.style.marginTop = '10px';
+      again.onclick = function () { openStats(tab); };
+      panel.appendChild(err); panel.appendChild(again);
     }
   }
 
@@ -422,7 +480,12 @@
   // on close, and the board's keyboard handler stayed live underneath — arrow keys moved
   // the selection behind the overlay and digit keys played moves into the hidden board.
   function openModal(title, html) {
-    lastFocus = document.activeElement;
+    // Only capture the return target on the FIRST open. openStats() re-enters openModal on
+    // every tab click, which overwrote lastFocus with the tab button — and setModalNode
+    // then destroyed that button, so closing the dialog called focus() on a detached node
+    // and focus fell to <body>. A keyboard user who looked at the Daily tab was dumped at
+    // the top of the document and had to Tab all the way back to the board.
+    if (!modalOpen()) lastFocus = document.activeElement;
     $('modalTitle').textContent = title;
     $('modalBody').innerHTML = html || '';
     $('modal').classList.add('show');
@@ -436,7 +499,9 @@
     if (!modalOpen()) return;
     $('modal').classList.remove('show');
     document.body.style.overflow = '';
-    if (lastFocus && lastFocus.focus) lastFocus.focus();
+    // isConnected guards against restoring focus to a node that has since been removed
+    // from the document, which silently drops focus to <body>.
+    if (lastFocus && lastFocus.focus && lastFocus.isConnected) lastFocus.focus();
     lastFocus = null;
   }
   $('modalClose').onclick = closeModal;
@@ -497,24 +562,34 @@
   function stopTimer() { if (timerId) { clearInterval(timerId); timerId = null; } }
   function elapsedSeconds() { return startMs ? Math.floor((Date.now() - startMs) / 1000) : 0; }
 
-  // ---- pencil marks survive a reload -----------------------------------------
-  // The server round-trips a pencilMarks array per cell, but the client never sent it,
-  // so notes vanished on save/resume and on any page refresh. Keyed by game id locally.
+  // ---- pencil marks ----------------------------------------------------------
+  // Notes are client-local (the server has no pencil-mark write channel on the socket).
+  // They are kept in memory per game id, so switching between two games with Load and
+  // coming back keeps each board's marks. They deliberately do NOT outlive the tab.
+
+  var notesByGame = {};        // gameId -> { "r,c": Set(digits) }
+  var NOTE_GAME_LIMIT = 12;    // bound the map: Load can cycle through many game ids
+  var noteGameOrder = [];
 
   function saveNotes() {
     if (!gameId) return;
-    try {
-      var o = {};
-      Object.keys(notes).forEach(function (k) { if (notes[k].size) o[k] = Array.from(notes[k]); });
-      localStorage.setItem('sp.notes.' + gameId, JSON.stringify(o));
-    } catch (e) { /* private mode / quota — notes stay in memory */ }
+    var o = {};
+    Object.keys(notes).forEach(function (k) { if (notes[k].size) o[k] = notes[k]; });
+    notesByGame[gameId] = o;
+    var at = noteGameOrder.indexOf(gameId);
+    if (at !== -1) noteGameOrder.splice(at, 1);
+    noteGameOrder.push(gameId);
+    while (noteGameOrder.length > NOTE_GAME_LIMIT) delete notesByGame[noteGameOrder.shift()];
   }
   function loadNotes() {
+    var stored = gameId ? notesByGame[gameId] : null;
     notes = {};
-    try {
-      var o = JSON.parse(localStorage.getItem('sp.notes.' + gameId) || '{}');
-      Object.keys(o).forEach(function (k) { notes[k] = new Set(o[k]); });
-    } catch (e) { /* ignore corrupt entry */ }
+    if (stored) Object.keys(stored).forEach(function (k) { notes[k] = new Set(stored[k]); });
+  }
+  function forgetNotes(id) {
+    delete notesByGame[id];
+    var at = noteGameOrder.indexOf(id);
+    if (at !== -1) noteGameOrder.splice(at, 1);
   }
 
   /** Speaks a message to assistive tech without showing it on screen. */
@@ -523,12 +598,25 @@
     if (el) el.textContent = msg;
   }
 
+  var connState = null;
   function setConnBadge(state) {
     var el = $('hudConn');
     if (!el) return;
+    var was = connState;
+    connState = state;
     el.className = 'v ' + state;
-    el.textContent = state === 'live' ? '●' : (state === 'down' ? '○' : '–');
-    el.title = state === 'live' ? 'Connected' : 'Disconnected — reconnecting';
+    // Was "●" / "○" / "–". Colour plus an unlabelled glyph is exactly the pattern WCAG
+    // 1.4.1 forbids: a screen reader read the live badge as "black circle" and the
+    // disconnected one as "white circle", and the two are near-identical shapes for
+    // anyone who cannot separate green from red. Words carry it instead.
+    el.textContent = state === 'live' ? 'Live' : (state === 'down' ? 'Down' : 'Idle');
+    el.title = state === 'live' ? 'Connected to the game channel'
+             : state === 'down' ? 'Disconnected — reconnecting'
+             : 'Not in a game';
+    if (was && was !== state) {
+      if (state === 'down') announce('Connection lost. Reconnecting.');
+      else if (state === 'live' && was === 'down') announce('Reconnected.');
+    }
   }
 
   /**
@@ -550,9 +638,12 @@
   /** Session loss: drop back to the login panel instead of leaving every button broken. */
   function handleAuthLoss() {
     wsWanted = false;
-    if (socket) { try { socket.close(); } catch (e) { /* already closed */ } }
+    if (wsRetryTimer) { clearTimeout(wsRetryTimer); wsRetryTimer = null; }
+    closeSocket();
     stopTimer(); closeModal();
-    board = null; gameId = null;
+    board = null; gameId = null; pending = [];
+    auth = ''; csrfToken = null;
+    setConnBadge('idle');
     $('game').style.display = 'none';
     $('login').style.display = '';
     status('Your session expired — please log in again.', 'err');
@@ -561,11 +652,21 @@
   // ---- board rendering ------------------------------------------------------
 
   function setBoard(state, fresh) {
+    if (!isBoardShape(state)) { toast('The server sent a board this client cannot read.', 'bad'); return; }
+    var switching = state.gameId !== gameId;
+    if (switching && pending.length) {
+      // Queued moves belong to the game they were made in. Pressing New (or resuming a
+      // different save) while the socket was down replayed them into the fresh puzzle,
+      // scribbling the old game's digits onto unrelated cells.
+      log('Discarded ' + pending.length + ' queued move(s) from the previous game');
+      pending = [];
+    }
     board = state;
     gameId = state.gameId;
     selected = null;
     wasSolved = false;
     cellEls = null;               // a different game: rebuild the grid nodes
+    padEls = null;
     if (fresh) { loadNotes(); startTimer(); $('hintline').textContent = ''; }
     $('hudMoves').textContent = state.moveCount;
     $('boardWrap').classList.toggle('solved', !!state.solved);
@@ -616,22 +717,51 @@
   function buildGrid() {
     var el = $('board');
     el.innerHTML = '';
+    el.setAttribute('role', 'grid');
+    el.setAttribute('aria-rowcount', '9');
+    el.setAttribute('aria-colcount', '9');
     cellEls = [];
     for (var r = 0; r < 9; r++) {
+      // role="grid" requires role="row" children; 81 gridcells hanging directly off the
+      // grid is invalid ARIA and NVDA/VoiceOver refuse to report "row n of 9, column m of
+      // 9" without it. The rows carry `display:contents` so the CSS grid still lays the
+      // 81 cells out itself.
+      var rowEl = document.createElement('div');
+      rowEl.className = 'grid-row';
+      rowEl.setAttribute('role', 'row');
+      rowEl.setAttribute('aria-rowindex', r + 1);
       for (var c = 0; c < 9; c++) {
         var d = document.createElement('div');
         d.setAttribute('role', 'gridcell');
-        d.setAttribute('aria-rowindex', r + 1);
         d.setAttribute('aria-colindex', c + 1);
         (function (rr, cc) {
-          d.onclick = function () { selected = [rr, cc]; render(); };
+          d.onclick = function () { select(rr, cc, true); };
           d.onfocus = function () {
-            if (!selected || selected[0] !== rr || selected[1] !== cc) { selected = [rr, cc]; render(); }
+            if (!selected || selected[0] !== rr || selected[1] !== cc) select(rr, cc, false);
           };
         })(r, c);
         cellEls.push(d);
-        el.appendChild(d);
+        rowEl.appendChild(d);
       }
+      el.appendChild(rowEl);
+    }
+  }
+
+  /**
+   * Moves the selection, and moves DOM focus with it.
+   *
+   * <p>Arrow keys only reassigned `selected` and re-rendered. Roving tabindex moved to the
+   * new cell but focus stayed on the old one, so: the visible focus ring and the cyan
+   * selection box sat on two different cells, a screen reader kept announcing the cell the
+   * player had left, and pressing Tab exited the grid from the wrong place. The board was
+   * playable by keyboard but unusable by anyone relying on the focus ring or on speech.
+   */
+  function select(r, c, alsoFocus) {
+    selected = [r, c];
+    render();
+    if (alsoFocus !== false && cellEls && cellEls[r * 9 + c] &&
+        document.activeElement !== cellEls[r * 9 + c]) {
+      cellEls[r * 9 + c].focus();
     }
   }
 
@@ -639,11 +769,19 @@
     if (!board) {
       // An empty #board rendered as a bare purple rectangle — the first thing a player
       // sees after logging in, and it reads as a crash.
-      $('board').innerHTML =
+      var bd = $('board');
+      // Drop the grid semantics while there is no grid: a role="grid" whose only child is
+      // a paragraph is invalid, and a screen reader announced "grid, 9 by 9" over an empty
+      // placeholder.
+      bd.setAttribute('role', 'group');
+      bd.removeAttribute('aria-rowcount');
+      bd.removeAttribute('aria-colcount');
+      bd.innerHTML =
         '<div class="board-empty">Press <b>New</b> for a fresh puzzle' +
         '<br>or <b>Daily</b> for today’s challenge</div>';
       $('pad').innerHTML = '';
       cellEls = null;
+      padEls = null;
       GAME_ONLY_BUTTONS.forEach(function (i) { var b = $(i); if (b) b.disabled = true; });
       return;
     }
@@ -669,7 +807,12 @@
         }
         var conflicted = !!bad[r + ',' + c];
         if (conflicted) cls += ' conflict';
-        d.className = cls;
+        var rejected = rejectMark && rejectMark.r === r && rejectMark.c === c
+                       && Date.now() < rejectMark.until;
+        if (rejected) cls += ' reject';
+        // Only touch className when it actually changed: reassigning it restarts the
+        // reject shake on every render, and render() runs several times per rejection.
+        if (d.className !== cls) d.className = cls;
 
         var key = r + ',' + c;
         if (cell.value !== 0) {
@@ -696,27 +839,38 @@
           'Row ' + (r + 1) + ' column ' + (c + 1) + ', ' +
           (cell.value ? cell.value + (cell.isGiven ? ' given' : '') : 'empty') +
           (notes[key] && notes[key].size ? ', notes ' + Array.from(notes[key]).sort().join(' ') : '') +
-          (conflicted ? ', conflict' : ''));
+          (conflicted ? ', conflict' : '') +
+          (rejected ? ', rejected' : ''));
       });
     });
     renderPad();
   }
 
-  function renderPad() {
-    var counts = {};
-    for (var v = 1; v <= 9; v++) counts[v] = 0;
-    board.cells.forEach(function (row) { row.forEach(function (cell) { if (cell.value) counts[cell.value]++; }); });
+  var padEls = null;   // { nums: [9 buttons], rems: [9 spans], notesBtn, eraseBtn }
 
-    var pad = $('pad'); pad.innerHTML = '';
+  /**
+   * Builds the pad once.
+   *
+   * <p>renderPad() used to do `pad.innerHTML = ''` and recreate all eleven buttons on
+   * every render — and render() runs on every move, every arrow key and every cell click.
+   * Destroying the focused element moves focus to <body>, so a keyboard or switch user who
+   * tabbed to the "5" key and pressed it was thrown out of the pad entirely and had to Tab
+   * all the way back in for each digit. It also reset the CSS transitions and made the
+   * pad flicker on touch.
+   */
+  function buildPad() {
+    var pad = $('pad');
+    pad.innerHTML = '';
+    padEls = { nums: [], rems: [] };
 
     var nums = document.createElement('div');
     nums.id = 'nums';
+    nums.setAttribute('role', 'group');
+    nums.setAttribute('aria-label', 'Digits');
     for (var d = 1; d <= 9; d++) {
       (function (val) {
         var b = document.createElement('button');
-        var left = Math.max(0, 9 - counts[val]);
-        b.className = 'num' + (counts[val] >= 9 ? ' done' : '');
-        // Digit + how many of it are still unplaced.
+        b.type = 'button';
         b.appendChild(document.createTextNode(String(val)));
         var rem = document.createElement('span');
         rem.className = 'rem';
@@ -724,13 +878,20 @@
         // so the accessible name was the concatenation — a screen reader announced the
         // "1" button with 4 remaining as "fourteen".
         rem.setAttribute('aria-hidden', 'true');
-        rem.textContent = String(left);
         b.appendChild(rem);
-        b.setAttribute('aria-label', val + ', ' + left + ' remaining');
-        // A completed digit was dimmed but still clickable, so tapping it fired a move
-        // the server then rejected with a toast.
-        b.disabled = counts[val] >= 9;
-        b.onclick = function () { play(val); };
+        b.onclick = function () {
+          // A completed digit was dimmed but still clickable, so tapping it fired a move
+          // the server then rejected with a red toast. It is marked aria-disabled rather
+          // than disabled: `disabled` removes the button from the tab order, and doing
+          // that to the button the player is standing on (placing the ninth 7 while
+          // focused on the 7 key) drops focus to <body> mid-solve.
+          if (b.getAttribute('aria-disabled') === 'true') {
+            toast('All nine ' + val + 's are placed.');
+            return;
+          }
+          play(val);
+        };
+        padEls.nums.push(b); padEls.rems.push(rem);
         nums.appendChild(b);
       })(d);
     }
@@ -740,20 +901,46 @@
     utils.id = 'utils';
 
     var notesBtn = document.createElement('button');
-    notesBtn.id = 'btnNotes';
-    notesBtn.className = 'util secondary' + (notesMode ? ' on' : '');
-    notesBtn.textContent = notesMode ? '✎ Notes: ON' : '✎ Notes';
+    notesBtn.id = 'btnNotes'; notesBtn.type = 'button';
     notesBtn.title = 'Notes mode (N)';
-    notesBtn.onclick = function () { notesMode = !notesMode; renderPad(); toast(notesMode ? 'Notes mode on' : 'Notes mode off'); };
+    notesBtn.onclick = function () {
+      notesMode = !notesMode; renderPad();
+      toast(notesMode ? 'Notes mode on' : 'Notes mode off');
+      announce(notesMode ? 'Notes mode on' : 'Notes mode off');
+    };
     utils.appendChild(notesBtn);
+    padEls.notesBtn = notesBtn;
 
     var erase = document.createElement('button');
-    erase.className = 'util secondary'; erase.textContent = '⌫ Erase';
-    erase.title = 'Erase (0 / Backspace)';
+    erase.className = 'util secondary'; erase.type = 'button';
+    erase.textContent = '⌫ Erase';
+    erase.title = 'Erase (0 / Backspace / Delete)';
+    erase.setAttribute('aria-label', 'Erase the selected cell');
     erase.onclick = function () { play(0); };
     utils.appendChild(erase);
+    padEls.eraseBtn = erase;
 
     pad.appendChild(utils);
+  }
+
+  function renderPad() {
+    if (!board) return;
+    if (!padEls) buildPad();
+    var counts = {};
+    for (var v = 1; v <= 9; v++) counts[v] = 0;
+    board.cells.forEach(function (row) { row.forEach(function (cell) { if (cell.value) counts[cell.value]++; }); });
+
+    for (var d = 1; d <= 9; d++) {
+      var b = padEls.nums[d - 1], done = counts[d] >= 9;
+      var left = Math.max(0, 9 - counts[d]);
+      b.className = 'num' + (done ? ' done' : '');
+      padEls.rems[d - 1].textContent = String(left);
+      b.setAttribute('aria-disabled', done ? 'true' : 'false');
+      b.setAttribute('aria-label', d + ', ' + (done ? 'all placed' : left + ' remaining'));
+    }
+    padEls.notesBtn.className = 'util secondary' + (notesMode ? ' on' : '');
+    padEls.notesBtn.textContent = notesMode ? '✎ Notes: ON' : '✎ Notes';
+    padEls.notesBtn.setAttribute('aria-pressed', notesMode ? 'true' : 'false');
   }
 
   function play(value) {
@@ -767,7 +954,11 @@
     if (notesMode && value !== 0 && cell.value === 0) {
       if (!notes[key]) notes[key] = new Set();
       if (notes[key].has(value)) notes[key].delete(value); else notes[key].add(value);
+      saveNotes();     // was missing: a toggled pencil mark was never handed to the store
       render();
+      announce((notes[key].has(value) ? 'Note ' + value + ' added at row '
+                                      : 'Note ' + value + ' removed at row ') +
+               (r + 1) + ' column ' + (c + 1));
       return;
     }
 
@@ -789,7 +980,11 @@
       // Queue rather than discard. This used to toast "Reconnecting…" and return, throwing
       // the player's move away — and because connectSocket() is async, a second click
       // within a couple of hundred milliseconds was thrown away too.
+      // Bounded: an unbounded queue grows for as long as the socket stays down (a player
+      // can hammer the pad indefinitely), and every entry is replayed on reconnect. Keep
+      // the most recent ones — an old queued move is superseded by a later one anyway.
       pending.push({ row: r, col: c, newVal: value });
+      while (pending.length > PENDING_LIMIT) pending.shift();
       toast('Offline — move queued, reconnecting…', 'bad');
       connectSocket();
       return;
@@ -850,12 +1045,11 @@
     // lived in a disabled ghost button and was silently reset by the next New game — for
     // a puzzle game that is the one number players actually want.
     $('boardWrap').dataset.time = fmtClock(secs);
-    var cells = $('board').children;
-    for (var i = 0; i < cells.length; i++) cells[i].classList.add('solvedflash');
+    if (cellEls) cellEls.forEach(function (el) { el.classList.add('solvedflash'); });
     toast('🎉 Solved in ' + fmtClock(secs) + '!', 'good');
     announce('Puzzle solved in ' + fmtClock(secs));
     log('Puzzle solved in ' + fmtClock(secs) + '.');
-    try { localStorage.removeItem('sp.notes.' + gameId); } catch (e) { /* ignore */ }
+    forgetNotes(gameId);
     refreshHud();
   }
 
@@ -873,61 +1067,175 @@
     if ((e.ctrlKey || e.metaKey) && (e.key === 'z' || e.key === 'Z')) { sendSimple('undo'); e.preventDefault(); return; }
     if ((e.ctrlKey || e.metaKey) && (e.key === 'y' || e.key === 'Y')) { sendSimple('redo'); e.preventDefault(); return; }
     if (e.ctrlKey || e.metaKey) return;
-    if (e.key === 'n' || e.key === 'N') { notesMode = !notesMode; renderPad(); return; }
+    if (e.key === 'n' || e.key === 'N') {
+      notesMode = !notesMode; renderPad();
+      announce(notesMode ? 'Notes mode on' : 'Notes mode off');
+      return;
+    }
+    if (!board) return;
     if (!selected) {
-      if (e.key.indexOf('Arrow') === 0) { selected = [0, 0]; render(); e.preventDefault(); }
+      if (e.key.indexOf('Arrow') === 0) { select(0, 0, true); e.preventDefault(); }
       return;
     }
     var r = selected[0], c = selected[1];
-    if (e.key === 'ArrowUp') { selected = [(r + 8) % 9, c]; render(); e.preventDefault(); }
-    else if (e.key === 'ArrowDown') { selected = [(r + 1) % 9, c]; render(); e.preventDefault(); }
-    else if (e.key === 'ArrowLeft') { selected = [r, (c + 8) % 9]; render(); e.preventDefault(); }
-    else if (e.key === 'ArrowRight') { selected = [r, (c + 1) % 9]; render(); e.preventDefault(); }
-    else if (e.key >= '1' && e.key <= '9') { play(Number(e.key)); }
+    if (e.key === 'ArrowUp') { select((r + 8) % 9, c, true); e.preventDefault(); }
+    else if (e.key === 'ArrowDown') { select((r + 1) % 9, c, true); e.preventDefault(); }
+    else if (e.key === 'ArrowLeft') { select(r, (c + 8) % 9, true); e.preventDefault(); }
+    else if (e.key === 'ArrowRight') { select(r, (c + 1) % 9, true); e.preventDefault(); }
+    // Home/End/PageUp/PageDown are part of the WAI-ARIA grid pattern and were missing.
+    else if (e.key === 'Home') { select(r, e.ctrlKey ? 0 : 0, true); e.preventDefault(); }
+    else if (e.key === 'End') { select(r, 8, true); e.preventDefault(); }
+    else if (e.key === 'PageUp') { select(0, c, true); e.preventDefault(); }
+    else if (e.key === 'PageDown') { select(8, c, true); e.preventDefault(); }
+    else if (e.key >= '1' && e.key <= '9') { play(Number(e.key)); e.preventDefault(); }
     else if (e.key === '0' || e.key === 'Backspace' || e.key === 'Delete') { play(0); e.preventDefault(); }
   });
 
   // ---- websocket ------------------------------------------------------------
 
-  function connectSocket() {
+  /**
+   * Detaches every handler from a socket before closing it.
+   *
+   * <p>Without this, connectSocket()'s own `socket.close()` fired the OLD socket's
+   * onclose, which — seeing wsWanted and a gameId — scheduled another connectSocket().
+   * That reconnect then closed the socket we had just opened, whose onclose scheduled
+   * another one, and so on: a permanent churn where the link badge flickered, `join` was
+   * re-broadcast to every peer on every cycle and the board never settled. It was
+   * triggered by ordinary use — Hint and New both call setBoard(), which calls
+   * connectSocket(), and every `online` event does too.
+   */
+  function closeSocket() {
+    var s = socket;
+    socket = null;
+    if (!s) return;
+    s.onopen = s.onmessage = s.onclose = s.onerror = null;
+    stopWatchdog();
+    probeSentMs = 0;
+    try { s.close(); } catch (e) { /* already closed */ }
+  }
+
+  function socketUrlFor(id) {
+    var origin = base || (location.protocol + '//' + location.host);
+    // encodeURIComponent escapes ':' as %3A. Daily and duel game ids are of the form
+    // `daily-<date>:<player>`, and the handshake interceptor reads the query parameter
+    // WITHOUT percent-decoding it, so the escaped form looked up a game that does not
+    // exist and the server closed the socket with "Unknown game" — the daily puzzle could
+    // be started over REST but never played. ':' is legal unescaped in a query string
+    // (RFC 3986 §3.4), so leave it, and keep everything else escaped.
+    return origin.replace(/^http/, 'ws') + '/ws/game?gameId=' +
+      encodeURIComponent(id).replace(/%3A/g, ':');
+  }
+
+  // ── Liveness watchdog ────────────────────────────────────────────────────
+  // onclose is not a reliable death notice. A socket whose TCP connection is black-holed
+  // — Wi-Fi dropping out, a laptop suspending, a proxy silently timing out the tunnel —
+  // stays readyState OPEN indefinitely and fires nothing. Reproduced in Chromium: after
+  // the network was cut the client sat on a dead socket for over 20 seconds with the HUD
+  // still reading connected, send() silently discarding every move. The server has no
+  // heartbeat of its own (MultiplayerBroadcaster.broadcastHealthPing exists but nothing
+  // ever calls it), so the client has to probe: `sync` is the one verb that always answers
+  // the sender, and its reply doubles as a desync repair.
+  var lastRxMs = 0, probeSentMs = 0, watchdogId = null;
+  var IDLE_PROBE_MS = 30000, PROBE_TIMEOUT_MS = 8000;
+
+  function startWatchdog() {
+    stopWatchdog();
+    watchdogId = setInterval(function () {
+      if (!socket || socket.readyState !== 1) return;
+      var now = Date.now();
+      if (probeSentMs) {
+        if (now - probeSentMs > PROBE_TIMEOUT_MS) {
+          log('No reply to liveness probe — forcing reconnect');
+          probeSentMs = 0;
+          setConnBadge('down');
+          connectSocket(true);
+        }
+        return;
+      }
+      if (now - lastRxMs > IDLE_PROBE_MS) { probeSentMs = now; requestSync(); }
+    }, 5000);
+  }
+  function stopWatchdog() { if (watchdogId) { clearInterval(watchdogId); watchdogId = null; } }
+
+  // Background tabs throttle setInterval to about once a minute, and a laptop that slept
+  // wakes up holding a socket the server closed long ago. Re-check the moment the tab
+  // comes back rather than waiting out the throttled tick.
+  document.addEventListener('visibilitychange', function () {
+    if (document.visibilityState !== 'visible' || !wsWanted || !gameId) return;
+    if (!socket || socket.readyState !== 1) connectSocket();
+    else { probeSentMs = Date.now(); requestSync(); }
+  });
+
+  function connectSocket(force) {
     if (wsRetryTimer) { clearTimeout(wsRetryTimer); wsRetryTimer = null; }
     if (!gameId) return;
     wsWanted = true;
-    if (socket) { try { socket.close(); } catch (e) { /* already closed */ } }
-    var origin = base || (location.protocol + '//' + location.host);
-    var wsUrl = origin.replace(/^http/, 'ws') + '/ws/game?gameId=' + encodeURIComponent(gameId);
-    socket = new WebSocket(wsUrl);
+    var url = socketUrlFor(gameId);
+    // Already connected (or connecting) to this very game: nothing to do. setBoard() runs
+    // on every Hint, so this used to tear down and re-handshake a perfectly good socket
+    // several times a minute, losing any frame in flight.
+    if (!force && socket && socket.url === url &&
+        (socket.readyState === 0 || socket.readyState === 1)) {
+      // Still healthy. Re-assert the badge: the `offline` listener paints it Down on the
+      // OS event alone, and if the socket survived (a brief Wi-Fi blip) nothing else would
+      // ever have painted it back — the HUD read "Down" for the rest of the session while
+      // moves were flowing normally.
+      if (socket.readyState === 1) { setConnBadge('live'); requestSync(); }
+      return;
+    }
+    closeSocket();
+    socket = new WebSocket(url);
 
     socket.onopen = function () {
       wsRetry = 0;
+      lastRxMs = Date.now(); probeSentMs = 0;
+      startWatchdog();
       setConnBadge('live');
       log('Game channel open');
       // Announce arrival — the client rendered join/leave envelopes but never sent one,
       // so peers in a shared game were never told anyone had arrived.
       try { socket.send(JSON.stringify({ type: 'join', payload: '' })); } catch (e) { /* racing close */ }
-      // Re-derive queued moves against the authoritative board: a move queued offline
-      // carries a stale oldVal that the server would reject.
-      if (pending.length) { requestSync(); setTimeout(flushPending, 400); }
+      // ALWAYS resync on (re)connect, not only when moves are queued. Anything that
+      // happened while the socket was down — the peer's moves, an undo, a hint — was
+      // simply missed, and the client carried on from a stale board until something else
+      // happened to trigger a sync.
+      requestSync();
+      if (pending.length) setTimeout(flushPending, 400);
     };
 
     socket.onmessage = function (ev) {
+      lastRxMs = Date.now(); probeSentMs = 0;
       var env;
-      try { env = JSON.parse(ev.data); } catch (e) { return; }
+      try { env = JSON.parse(ev.data); } catch (e) { log('· ignored unparseable frame'); return; }
+      if (!env || typeof env !== 'object' || typeof env.type !== 'string') return;
       switch (env.type) {
         case 'move': {
+          // The guard here used to be `env.from !== me && env.from !== 'server'`, but
+          // MultiplayerBroadcaster stamps EVERY move envelope with from="server" (there is
+          // no per-player attribution on the wire at all), so the condition was never true
+          // and no remote move was ever applied — the branch was dead code. Compare against
+          // local state instead: an echo of our own optimistic move already matches and is
+          // a no-op, anything that differs is news.
           var m = env.payload;
-          // Apply other players' moves; ignore the server echo of our own.
+          if (!board || !isMoveShape(m)) break;
+          var target = board.cells[m.row][m.col];
+          if (target.value === m.newVal) break;          // our own echo
+          target.value = m.newVal;
+          render();
+          announce(m.newVal
+            ? 'Opponent placed ' + m.newVal + ' at row ' + (m.row + 1) + ' column ' + (m.col + 1)
+            : 'Opponent cleared row ' + (m.row + 1) + ' column ' + (m.col + 1));
           // Do NOT bump the move counter here — the same move is broadcast by
           // two server paths, so per-envelope counting double-counts. The HUD
           // is driven by the authoritative moveCount on 'board' syncs instead.
-          if (env.from !== me && env.from !== 'server' && board) {
-            board.cells[m.row][m.col].value = m.newVal;
-            render();
-            if (isLocallyFull()) requestSync();
-          }
+          if (isLocallyFull()) requestSync();
           break;
         }
         case 'board':
+          // Assigning env.payload unchecked meant one malformed frame replaced `board`
+          // with whatever arrived, and the very next render() threw on board.cells —
+          // taking down every later handler on this socket with it.
+          if (!isBoardShape(env.payload)) { log('· ignored malformed board envelope'); break; }
           board = env.payload; gameId = board.gameId;
           $('hudMoves').textContent = board.moveCount;   // authoritative
           $('boardWrap').classList.toggle('solved', !!board.solved);
@@ -946,33 +1254,32 @@
         }
         case 'join': log('▸ ' + (env.payload && env.payload.player ? env.payload.player : 'someone') + ' joined'); break;
         case 'leave': log('◂ ' + (env.payload && env.payload.player ? env.payload.player : 'someone') + ' left'); break;
-        case 'error':
-          if (lastWasClear) {
-            // The server currently rejects any move with newVal 0, so an erase
-            // never lands. Point the player at Undo, which does work.
-            toast('Erase was rejected by the server — use ↶ Undo instead.', 'bad');
+        case 'error': {
+          // The "erase is always rejected" special case was removed: SudokuBoard.isValidMove
+          // now returns true for value 0 (`if (value == 0) return true;`), so a clear is a
+          // legal move and lands like any other. The old branch swallowed the real reason
+          // for ANY failed erase and told the player to press Undo instead.
+          var d = env.payload && env.payload.detail;
+          // Surface a conflict on the cell rather than as a jargon toast. The server
+          // wipes the optimistic value faster than a frame, so `.cell.conflict` and the
+          // whole conflictSet() scan never actually rendered anything — the player's
+          // only feedback was a red toast reading "Server: Invalid move", which does not
+          // say which cell or why.
+          if (d === 'Invalid move' && lastMoveCell) {
+            flashReject(lastMoveCell[0], lastMoveCell[1], lastMoveValue);
           } else {
-            var d = env.payload && env.payload.detail;
-            // Surface a conflict on the cell rather than as a jargon toast. The server
-            // wipes the optimistic value faster than a frame, so `.cell.conflict` and the
-            // whole conflictSet() scan never actually rendered anything — the player's
-            // only feedback was a red toast reading "Server: Invalid move", which does not
-            // say which cell or why.
-            if (d === 'Invalid move' && lastMoveCell) {
-              flashReject(lastMoveCell[0], lastMoveCell[1], lastMoveValue);
-            } else {
-              // The server's fallback error path sends a raw Java exception message.
-              toast('Server: ' + String(d || 'move rejected').slice(0, 120), 'bad');
-            }
+            // The server's fallback error path sends a raw Java exception message.
+            toast('Server: ' + payloadText(env.payload, 'move rejected').slice(0, 120), 'bad');
           }
           lastWasClear = false;
           requestSync();  // reconcile optimistic state
           break;
+        }
         case 'health': break; // keep-alive ping
         case 'notification': case 'DAILY': case 'DUEL': case 'ACHIEVEMENT':
         case 'TOURNAMENT': case 'FRIEND': case 'SEASON':
-          toast(String(env.payload));
-          log('🔔 ' + String(env.payload));
+          toast(payloadText(env.payload, 'Notification'));
+          log('🔔 ' + payloadText(env.payload, 'Notification'));
           refreshHud();
           break;
         // batch_moves was silently dropped, so the board DESYNCED with no error until
@@ -981,9 +1288,7 @@
         case 'batch_moves':
           if (Array.isArray(env.payload) && board) {
             env.payload.forEach(function (m) {
-              if (board.cells[m.row] && board.cells[m.row][m.col]) {
-                board.cells[m.row][m.col].value = m.newVal;
-              }
+              if (isMoveShape(m)) board.cells[m.row][m.col].value = m.newVal;
             });
             render();
             requestSync();
@@ -991,9 +1296,14 @@
           break;
         case 'event': case 'cosmic_duel': case 'event_join':
         case 'event_score': case 'event_reward':
-          toast(String(env.payload));
-          log('⚡ ' + String(env.payload));
+          // MultiplayerBroadcaster.sendGameEvent puts a whole GameEvent OBJECT in the
+          // payload, so String(env.payload) rendered a toast reading "[object Object]".
+          toast(payloadText(env.payload, 'Event'));
+          log('⚡ ' + payloadText(env.payload, 'Event'));
           refreshHud();
+          break;
+        case 'hint': case 'debug':
+          $('hintline').textContent = '💡 ' + payloadText(env.payload, '');
           break;
         // Never fully silent: an unknown type at least reaches the event log.
         default: log('· unhandled envelope: ' + env.type); break;
@@ -1002,14 +1312,65 @@
     // A dropped socket used to do nothing but write one line into a <details> that is
     // collapsed by default: no reconnect, no retry, no indicator anywhere in the UI. The
     // board silently desynced and the next move failed on a stale oldVal.
-    socket.onclose = function () {
-      log('Game channel closed');
+    socket.onclose = function (ev) {
+      log('Game channel closed' + (ev && ev.code ? ' (' + ev.code + ')' : ''));
+      if (socket === this) socket = null;
+      stopWatchdog(); probeSentMs = 0;
       setConnBadge('down');
       if (!wsWanted || !gameId) return;
+      // 1008 is POLICY_VIOLATION: the server refuses this connection outright —
+      // "Authentication required", "Unknown game", "Competitive games cannot be
+      // spectated". Retrying is guaranteed to fail, and the old code retried forever,
+      // hammering the handshake every 15s and leaving the player staring at a dead board
+      // with no explanation.
+      if (ev && ev.code === 1008) {
+        wsWanted = false;
+        var why = (ev.reason || 'the server refused the connection');
+        toast('Cannot join this game: ' + why, 'bad');
+        announce('Disconnected. ' + why);
+        if (/auth/i.test(why)) handleAuthLoss();
+        return;
+      }
       var delay = Math.min(15000, 500 * Math.pow(2, wsRetry++));
+      log('Reconnecting in ' + Math.round(delay / 100) / 10 + 's');
       wsRetryTimer = setTimeout(connectSocket, delay);
     };
     socket.onerror = function () { log('Game channel error'); setConnBadge('down'); };
+  }
+
+  /** True for a {row, col, newVal} payload that addresses a real cell on this board. */
+  function isMoveShape(m) {
+    return !!m && typeof m === 'object' &&
+      Number.isInteger(m.row) && m.row >= 0 && m.row <= 8 &&
+      Number.isInteger(m.col) && m.col >= 0 && m.col <= 8 &&
+      Number.isInteger(m.newVal) && m.newVal >= 0 && m.newVal <= 9 &&
+      !!board && !!board.cells && !!board.cells[m.row] && !!board.cells[m.row][m.col];
+  }
+
+  /** True for a payload that is actually a 9x9 BoardState. */
+  function isBoardShape(b) {
+    if (!b || typeof b !== 'object' || !Array.isArray(b.cells) || b.cells.length !== 9) return false;
+    for (var i = 0; i < 9; i++) {
+      if (!Array.isArray(b.cells[i]) || b.cells[i].length !== 9) return false;
+    }
+    return true;
+  }
+
+  /**
+   * Envelope payloads are sometimes a String and sometimes an object (GameEvent,
+   * {status: ...}, {detail: ...}). String(obj) gives "[object Object]", which is what the
+   * player used to see in the toast.
+   */
+  function payloadText(p, fallback) {
+    if (p == null) return fallback || '';
+    if (typeof p === 'string') return p;
+    if (typeof p !== 'object') return String(p);
+    var pick = p.detail || p.message || p.status || p.reason || p.type;
+    if (typeof pick === 'string' && pick) return pick;
+    try {
+      var s = JSON.stringify(p);
+      return s && s !== '{}' ? s.slice(0, 160) : (fallback || '');
+    } catch (e) { return fallback || ''; }
   }
 
   /** Replays moves made while the socket was down, against the re-synced board. */
@@ -1027,12 +1388,24 @@
     if (queued.length) toast('Sent ' + queued.length + ' queued move(s)', 'good');
   }
 
-  /** Flashes a cell the server refused, instead of toasting "Server: Invalid move". */
+  /**
+   * Flashes a cell the server refused, instead of toasting "Server: Invalid move".
+   *
+   * <p>The flash has to survive a re-render. The 'error' handler ends with requestSync(),
+   * the server answers with a 'board' envelope within a few milliseconds, and render()
+   * reassigns `d.className` wholesale — which stripped `.reject` long before the 350ms
+   * shake or the ✕ could be seen. Verified in Chromium: 400ms after a rejected keystroke
+   * the cell's class list was back to "cell b-right sel" with no trace of the rejection,
+   * so the only thing a sighted player ever got was a value that silently vanished. Hold
+   * the state in a variable render() consults instead of on the node.
+   */
+  var rejectMark = null, rejectTimer = null;
   function flashReject(r, c, v) {
-    var el = cellEls && cellEls[r * 9 + c];
-    if (!el) return;
-    el.classList.add('reject');
-    announce(v + ' conflicts at row ' + (r + 1) + ' column ' + (c + 1));
-    setTimeout(function () { el.classList.remove('reject'); }, 700);
+    if (!cellEls || !cellEls[r * 9 + c]) return;
+    rejectMark = { r: r, c: c, until: Date.now() + 900 };
+    if (rejectTimer) clearTimeout(rejectTimer);
+    rejectTimer = setTimeout(function () { rejectMark = null; rejectTimer = null; render(); }, 900);
+    render();
+    announce(v + ' conflicts at row ' + (r + 1) + ' column ' + (c + 1) + ', not placed');
   }
 })();
