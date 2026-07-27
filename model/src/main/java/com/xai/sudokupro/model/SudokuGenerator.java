@@ -30,6 +30,21 @@ public class SudokuGenerator {
         logger.info("SudokuGenerator initialized with SecureRandomGenerator");
     }
 
+    /**
+     * Generates a puzzle.
+     *
+     * <p><b>{@code seed} does not make generation reproducible.</b> The RNG is a
+     * {@link java.security.SecureRandom}, and its {@code setSeed} <em>supplements</em> the
+     * existing entropy rather than replacing it, so the same seed yields a different grid
+     * every call. The parameter is retained because callers pass a varying value
+     * (typically {@code System.currentTimeMillis()}) to stir the pool, and because the
+     * retry loop below depends on retries NOT being replays — a deterministic generator
+     * would retry a failing seed identically three times and fail three times.
+     *
+     * <p>Nothing in the application relies on reproducibility: daily, weekly and duel
+     * templates are each generated once and persisted, then read back by id. Do not build
+     * on the assumption that a seed reproduces a board — it does not.
+     */
     public SudokuBoard generate(Constants.Difficulty difficulty, boolean chaosMode, boolean mirrorMode, long seed) {
         return generate(difficulty, chaosMode, mirrorMode, seed, false, false, 0);
     }
@@ -52,7 +67,9 @@ public class SudokuGenerator {
                 createFullSolution(board);
                 markAllGiven(board);
                 removeNumbers(board, difficulty.cellsRemoved, enforceSymmetry, maximizeConflicts);
-                if (chaosMode) applyChaosTwist(board);
+                // No generation-time chaos twist. It was a no-op that could never fire, and
+                // the coherent version of the feature already exists at play time — see
+                // the note on the deleted applyChaosTwist below.
                 if (mirrorMode) applyMirrorSymmetry(board);
                 if (cosmicDripFactor > 0) applyCosmicDrip(board, cosmicDripFactor);
                 long timeLimit = calculateTimeLimit(chaosMode, difficulty);
@@ -227,28 +244,27 @@ public class SudokuGenerator {
         }
     }
 
-    private void applyChaosTwist(SudokuCell[][] board) {
-        int swaps = Constants.CHAOS_MODE_SWAPS;
-        int maxAttempts = swaps * size * 2; // hard cap to prevent infinite loop
-        while (swaps > 0 && maxAttempts-- > 0) {
-            int row1 = rand.nextInt(size);
-            int col1 = rand.nextInt(size);
-            int row2 = rand.nextInt(size);
-            int col2 = rand.nextInt(size);
-            if (board[row1][col1].getValue() != 0 && board[row2][col2].getValue() != 0 &&
-                !board[row1][col1].isGiven() && !board[row2][col2].isGiven()) {
-                int temp = board[row1][col1].getValue();
-                board[row1][col1].setValue(board[row2][col2].getValue(), SudokuCell.MoveSource.INITIAL);
-                board[row2][col2].setValue(temp, SudokuCell.MoveSource.INITIAL);
-                swaps--;
-                logger.debug("Chaos swap: ({},{}) <-> ({},{})", row1, col1, row2, col2);
-                generationLog.add("Chaos swap: (" + row1 + "," + col1 + ") <-> (" + row2 + "," + col2 + ")");
-            }
-        }
-        if (maxAttempts <= 0 && swaps > 0) {
-            logger.warn("applyChaosTwist: could not complete all {} swaps — no eligible cells found", swaps);
-        }
-    }
+    /*
+     * applyChaosTwist was DELETED here. It looked for pairs of cells that were
+     * non-empty AND non-given, and by the time it ran no such cell could exist:
+     * markAllGiven marks every cell, and removeNumbers only ever produces cells that
+     * are (value == 0, given == false) — SudokuCell.setValue refuses to clear a given,
+     * which is why removal calls setGiven(false) first. So after generation every cell
+     * is either a clue with a value or an empty non-given, and the predicate is the
+     * empty set. Measured before removal: 60 chaos boards, 0 swaps logged, and 0 cells
+     * anywhere that satisfied the condition.
+     *
+     * It could not be repaired in place either, because the operation is incoherent at
+     * generation time: the only filled cells are the clues, and swapping two clues
+     * destroys the puzzle's unique solution. Chaos on the PLAYER's own entries is the
+     * version that makes sense, and it already exists at play time —
+     * GameService.triggerChaosSwap, which an earlier pass gave the legality checks this
+     * one never had. chaosMode also still selects the BLITZ time limit
+     * (calculateTimeLimit) and still rides on the board so the runtime swaps fire.
+     *
+     * Constants.CHAOS_MODE_SWAPS is left in place: it is externally configurable and
+     * now describes only the runtime feature.
+     */
 
     private void applyMirrorSymmetry(SudokuCell[][] board) {
         int symmetryType = Constants.MIRROR_MODE_SYMMETRY;
