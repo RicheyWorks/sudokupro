@@ -75,13 +75,32 @@ jobs:
             [ -f "$f" ] || continue
             if grep -qE "FAILURE|ERROR" "$f"; then
               found=1
+              # ::error:: annotations render on the run page for ANYONE, including
+              # people who are not signed in; log groups and the step summary do not.
+              # That distinction is the whole reason this step exists: the previous
+              # attempt wrote everything into a group, and a red build still showed
+              # the outside world nothing but "Process completed with exit code 1".
+              # One annotation per failing test, first line of detail included.
+              # $1 != "Tests" skips the per-file "Tests run: …" summary line, which also
+              # ends in <<< FAILURE! and would otherwise title every annotation "Tests".
+              awk '
+                /<<< (FAILURE|ERROR)!/ && $1 != "Tests" {
+                  name = $1
+                  getline detail
+                  gsub(/\r/, "", detail); gsub(/^[ \t]+/, "", detail)
+                  gsub(/%/, "%25", detail)
+                  printf "::error title=%s::%s\n", name, substr(detail, 1, 400)
+                }' "$f" || true
               echo "::group::$f"
               cat "$f"
               echo "::endgroup::"
               { echo; echo "<details><summary>$(basename "$f")</summary>"; echo; echo '```'; cat "$f"; echo '```'; echo "</details>"; } >> "$GITHUB_STEP_SUMMARY"
             fi
           done
-          [ "$found" = 1 ] || echo "No surefire failure reports — the build failed before or after the tests." | tee -a "$GITHUB_STEP_SUMMARY"
+          if [ "$found" != 1 ]; then
+            echo "::error title=No surefire failure reports::The build failed before or after the tests ran — look at the Maven output, not the test reports."
+            echo "No surefire failure reports — the build failed before or after the tests." >> "$GITHUB_STEP_SUMMARY"
+          fi
 
       # The reports themselves, so a failure can be read without signing in and without
       # re-running anything.
