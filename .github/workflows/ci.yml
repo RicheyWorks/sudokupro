@@ -148,10 +148,20 @@ jobs:
       # The dev profile keeps Spring Security enabled, which the adversarial suite
       # depends on — the "test" profile disables SecurityConfig outright and would
       # turn every authorization assertion green for the wrong reason.
+      #
+      # The registration quota is raised for THIS instance (pass 15). The shipped
+      # default is 5 accounts per 600s per address and it counts rejected attempts
+      # too, but every harness below creates more than that from one address: the
+      # adversarial suite needs ~8 and the live engine needs one per --players. So
+      # at the default this job starved two of its three harnesses — measured on the
+      # shipped jar, registration #6 onward returned 429. The throttle is not left
+      # untested: it gets its own purpose-configured instance in the step below,
+      # which is the only place a small quota proves anything.
       - name: Start the server
         run: |
           nohup java -jar server/target/sudokupro-server-*-exec.jar \
-            --spring.profiles.active=dev > /tmp/server.log 2>&1 &
+            --spring.profiles.active=dev \
+            --sudokupro.security.register.max-attempts=500 > /tmp/server.log 2>&1 &
           echo $! > /tmp/server.pid
           for i in $(seq 1 60); do
             if [ "$(curl -s -o /dev/null -w '%{http_code}' http://localhost:8080/actuator/health)" = "200" ]; then
@@ -186,6 +196,42 @@ jobs:
       - name: Stop the server
         if: always()
         run: kill "$(cat /tmp/server.pid)" 2>/dev/null || true
+
+      # The registration throttle, on its own instance (pass 15). L32 reads the quota
+      # in force rather than assuming one, and skips when it is too high to exercise —
+      # so on the raised-quota instance above it announced a skip and the feature went
+      # untested in CI from the day it shipped. A skip that looks like a pass is the
+      # defect, which is the same reasoning that un-gated the Testcontainers tests in
+      # pass 14. This instance gets a SMALL quota, its own port, and its own Redis
+      # database so the counter starts clean and the earlier harnesses' traffic cannot
+      # pre-saturate it (L32 detects that case and skips too).
+      - name: Start a throttle-configured instance
+        run: |
+          nohup java -jar server/target/sudokupro-server-*-exec.jar \
+            --spring.profiles.active=dev \
+            --server.port=8081 \
+            --spring.data.redis.database=3 \
+            --sudokupro.security.register.max-attempts=6 \
+            --sudokupro.security.register.window-seconds=600 > /tmp/server-throttle.log 2>&1 &
+          echo $! > /tmp/server-throttle.pid
+          for i in $(seq 1 60); do
+            if [ "$(curl -s -o /dev/null -w '%{http_code}' http://localhost:8081/actuator/health)" = "200" ]; then
+              echo "throttle instance healthy after ${i}0s"; exit 0
+            fi
+            sleep 10
+          done
+          echo "::error::throttle instance did not become healthy"; tail -100 /tmp/server-throttle.log; exit 1
+
+      - name: Registration throttle suite — L32 against the small quota
+        run: python3 engine/live_engine.py --base http://localhost:8081 --only L32 --registration-quota 6
+
+      - name: Throttle instance log
+        if: always()
+        run: tail -100 /tmp/server-throttle.log || true
+
+      - name: Stop the throttle instance
+        if: always()
+        run: kill "$(cat /tmp/server-throttle.pid)" 2>/dev/null || true
 
   docker:
     needs: test

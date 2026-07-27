@@ -5,6 +5,7 @@ import com.xai.sudokupro.model.SudokuGenerator;
 import com.xai.sudokupro.model.User;
 import com.xai.sudokupro.repository.UserRepository;
 import com.xai.sudokupro.service.AISolverService;
+import com.xai.sudokupro.service.AnalyticsService;
 import com.xai.sudokupro.service.GameService;
 import com.xai.sudokupro.service.NotificationService;
 import com.xai.sudokupro.util.SecureRandomGenerator;
@@ -32,6 +33,7 @@ class DuelServiceTest {
 
     @Mock private GameService gameService;
     @Mock private NotificationService notificationService;
+    @Mock private AnalyticsService analyticsService;
 
     private final Map<String, User> users = new ConcurrentHashMap<>();
     private UserRepository userRepository;
@@ -65,7 +67,7 @@ class DuelServiceTest {
 
         service = new DuelService(gameService,
             new SudokuGenerator(new SecureRandomGenerator(new SimpleMeterRegistry())),
-            store, userRepository, notificationService);
+            store, userRepository, notificationService, analyticsService);
     }
 
     @Test
@@ -132,6 +134,30 @@ class DuelServiceTest {
         assertEquals(1, users.get("richmond").getDuelLosses());
         verify(notificationService).sendTypedNotification(eq("rival"), eq("DUEL"), contains("WON"));
         verify(notificationService).sendTypedNotification(eq("richmond"), eq("DUEL"), contains("lost"));
+    }
+
+    /**
+     * The duel outcome must reach analytics: recordEvent has had DUEL_WIN/DUEL_LOSS
+     * branches since it was written, but until pass 15 no such enum constants existed
+     * and nothing emitted them — so getPlayerWinRates()/getDuelWins() were permanently
+     * empty and the duel.win.rate.average gauge was pinned at 0.0.
+     */
+    @Test
+    void settlementEmitsOneWinAndOneLossAnalyticsEvent() {
+        String duelId = activeDuel();
+
+        service.onGameEnded(solvedBoard(DuelService.duelGameId(duelId, "rival"), "rival"), "rival");
+
+        ArgumentCaptor<com.xai.sudokupro.model.GameEvent> events =
+            ArgumentCaptor.forClass(com.xai.sudokupro.model.GameEvent.class);
+        verify(analyticsService, times(2)).recordEvent(events.capture());
+
+        var byType = events.getAllValues().stream().collect(
+            java.util.stream.Collectors.toMap(e -> e.getType().name(), e -> e));
+        assertEquals("rival", byType.get("DUEL_WIN").getPlayerId());
+        assertEquals("richmond", byType.get("DUEL_LOSS").getPlayerId());
+        assertEquals("richmond", byType.get("DUEL_WIN").getPayload().get("opponent"));
+        assertEquals("rival", byType.get("DUEL_LOSS").getPayload().get("opponent"));
     }
 
     @Test

@@ -26,7 +26,24 @@ def call(st,method,path,body=None,use_auth=True,use_csrf=True,as_json=True):
         return -1,str(e)
 
 def login(st,pw):
-    call(st,"POST","/api/auth/register",{"username":st["u"],"password":pw},use_auth=False,use_csrf=False)
+    code,_=call(st,"POST","/api/auth/register",{"username":st["u"],"password":pw},use_auth=False,use_csrf=False)
+    # A throttled registration is a BROKEN FIXTURE, not a finding, and it must say so
+    # here rather than 25 checks later as a KeyError on a body that was an error
+    # envelope all along. The pass-14 registration throttle defaults to 5 accounts
+    # per 600s per address and deliberately counts REJECTED attempts too; this suite
+    # needs ~8 (the four malformed-registration checks each burn one). So a server
+    # started at the shipped default starves the suite partway through, and before
+    # this guard the symptom was a stack trace with no mention of registration at all.
+    if code==429:
+        raise SystemExit(
+            "\nFIXTURE FAILURE: registration was throttled (429) while creating the suite's\n"
+            "test accounts, so the remaining checks could not run and NOTHING below this\n"
+            "point was verified.\n\n"
+            "This suite needs about 8 account-creation attempts from one address. Start the\n"
+            "server under test with a quota that allows them:\n"
+            "  --sudokupro.security.register.max-attempts=500\n"
+            "and exercise the throttle itself against a purpose-configured instance\n"
+            "(live_engine.py --registration-quota), which is where it is actually asserted.\n")
     s,sess=call(st,"GET","/api/session")
     if isinstance(sess,dict): st["tok"]=sess.get("csrfToken")
     return s

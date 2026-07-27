@@ -1,10 +1,12 @@
 package com.xai.sudokupro.service.duel;
 
+import com.xai.sudokupro.model.GameEvent;
 import com.xai.sudokupro.model.SudokuBoard;
 import com.xai.sudokupro.model.SudokuGenerator;
 import com.xai.sudokupro.model.User;
 import com.xai.sudokupro.model.api.DuelInfo;
 import com.xai.sudokupro.repository.UserRepository;
+import com.xai.sudokupro.service.AnalyticsService;
 import com.xai.sudokupro.service.GameEndListener;
 import com.xai.sudokupro.service.GameService;
 import com.xai.sudokupro.service.NotificationService;
@@ -40,15 +42,18 @@ public class DuelService implements GameEndListener {
     private final DuelStateStore duels;
     private final UserRepository userRepository;
     private final NotificationService notificationService;
+    private final AnalyticsService analyticsService;
 
     public DuelService(GameService gameService, SudokuGenerator generator,
                        DuelStateStore duels, UserRepository userRepository,
-                       NotificationService notificationService) {
+                       NotificationService notificationService,
+                       AnalyticsService analyticsService) {
         this.gameService = gameService;
         this.generator = generator;
         this.duels = duels;
         this.userRepository = userRepository;
         this.notificationService = notificationService;
+        this.analyticsService = analyticsService;
     }
 
     static String duelGameId(String duelId, String playerId) {
@@ -233,6 +238,16 @@ public class DuelService implements GameEndListener {
             l.setDuelLosses(l.getDuelLosses() + 1);
             userRepository.save(w);
             userRepository.save(l);
+            // Feed the outcome to analytics. recordEvent has had DUEL_WIN / DUEL_LOSS
+            // branches since it was written, but nothing ever emitted them (the enum
+            // constants did not exist), so AnalyticsService.getPlayerWinRates() and
+            // getDuelWins() were permanently empty — the duel.win.rate.average gauge
+            // read 0.0 forever and the anti-cheat win-count cross-check compared
+            // against a map that could never match. This is the only writer.
+            analyticsService.recordEvent(new GameEvent(GameEvent.EventType.DUEL_WIN, winner,
+                java.util.Map.of("opponent", loser)));
+            analyticsService.recordEvent(new GameEvent(GameEvent.EventType.DUEL_LOSS, loser,
+                java.util.Map.of("opponent", winner)));
             logger.info("Duel ratings: {} +{} → {}, {} -{} → {}",
                 winner, delta, w.getDuelRating(), loser, delta, l.getDuelRating());
         } catch (Exception e) {

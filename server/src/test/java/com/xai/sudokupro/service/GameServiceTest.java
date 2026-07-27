@@ -86,6 +86,38 @@ class GameServiceTest {
         assertFalse(hint.isEmpty(), "Hint should provide some guidance");
     }
 
+    /**
+     * "Empty hints are free" — for real this time. AISolverService returns the literal
+     * {@code "No moves"} when no logical move exists, which is non-null and non-blank,
+     * so the charge guard's {@code !hint.isBlank()} waved it through: the player paid
+     * 5 gems to be told nothing, on a request that never even raised hintCount. The
+     * sentinel is now a named constant the charge site recognises.
+     */
+    @Test
+    void aNoMovesHintChargesNothingAndCountsNothing() {
+        AISolverService stuckSolver = mock(AISolverService.class);
+        when(stuckSolver.getNextLogicalMove(any())).thenReturn(AISolverService.NO_MOVES);
+        var economy = mock(com.xai.sudokupro.service.economy.EconomyService.class);
+
+        org.springframework.data.redis.core.StringRedisTemplate stringRedis =
+            mock(org.springframework.data.redis.core.StringRedisTemplate.class,
+                inv -> { throw new org.springframework.data.redis.RedisConnectionFailureException("down (test)"); });
+        SecureRandomGenerator rng = new SecureRandomGenerator(new SimpleMeterRegistry());
+        GameService service = new GameService(
+            stuckSolver, gameRepository, multiplayerBroadcaster,
+            redisTemplate, rng, new PlayerStateStore(stringRedis), new GameLockManager(stringRedis),
+            analyticsService, antiCheatEngine, chaosEngine);
+        service.setEconomyService(economy);
+
+        SudokuBoard board = service.createNewGame(1, "p-stuck", false, false);
+        String hint = service.getHint(board.getGameId(), "p-stuck");
+
+        assertEquals(AISolverService.NO_MOVES, hint, "the truthful answer still reaches the player");
+        verify(economy, never()).chargeForHint(anyString());
+        verify(analyticsService, never()).recordEvent(argThat(e ->
+            e.getType() == com.xai.sudokupro.model.GameEvent.EventType.HINT));
+    }
+
     // ---- move / lock logic (AUDIT P1-1) ----
 
     /** Finds an empty cell and a legal value for it. Returns {row, col, value}. */

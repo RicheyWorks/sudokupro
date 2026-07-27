@@ -394,13 +394,27 @@ public class User implements Serializable {
         powerUps.put("cosmicReveal", 0);
     }
 
+    /** The reward every achievement unlock pays, whichever path unlocks it. */
+    public static final int ACHIEVEMENT_GEMS = 20;
+    public static final int ACHIEVEMENT_XP   = 100;
+    public static final int ACHIEVEMENT_HYPE = 30;
+    public static final int ACHIEVEMENT_DRIP = 10;
+
     public void checkAchievement(String name, boolean condition) {
-        if (condition && achievements.containsKey(name) && !achievements.get(name)) {
+        // Guard on "not already TRUE" rather than containsKey: the containsKey form
+        // silently refused any name initializeAchievements didn't seed, which made
+        // CleanSolver, SpeedDemon and PowerUpCollector permanently un-unlockable through
+        // this path (addPowerUp has called checkAchievement("PowerUpCollector", ...)
+        // forever, against a map that never contains that key). It also disagreed with
+        // AchievementService.check, which uses the TRUE-equals form — the two paths must
+        // share one suppression rule, because each one skipping names the other already
+        // unlocked is what keeps the reward from ever being paid twice.
+        if (condition && !Boolean.TRUE.equals(achievements.get(name))) {
             achievements.put(name, true);
-            addGems(20);
-            addXp(100);
-            addHype(30);
-            addCosmicDrip(10);
+            addGems(ACHIEVEMENT_GEMS);
+            addXp(ACHIEVEMENT_XP);
+            addHype(ACHIEVEMENT_HYPE);
+            addCosmicDrip(ACHIEVEMENT_DRIP);
             logger.info("Achievement unlocked for {}: {}", username, name);
         }
     }

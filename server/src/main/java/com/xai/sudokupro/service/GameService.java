@@ -56,7 +56,27 @@ public class GameService {
     // Redis/DB (getGame reads through, mutations write through). Player streaks,
     // cosmic points, and input locks live in PlayerStateStore; per-game mutual
     // exclusion (across replicas) in GameLockManager. (Phase 5 / AUDIT P1-7)
+    //
+    // Cross-replica coherence (pass 15): a cache hit used to be trusted forever —
+    // getGame short-circuited on the map, so a board another replica had since
+    // written was served, and mutated, from this pod's stale copy. GameLockManager
+    // serialises the MUTATIONS but does nothing about the cached COPIES: pod A
+    // writes under the lock, pod B then acquires the same lock, cache-hits its old
+    // copy, and applies a move to a grid that no longer exists — a lost update the
+    // lock was supposed to make impossible. Every write now bumps a per-game
+    // version counter in Redis (persistBoard → bumpBoardVersion, ordered AFTER the
+    // Redis board write, so a reader that observes the new version always finds the
+    // new board behind it), and every getGame validates a cache hit against that
+    // counter before trusting it — one Redis GET, the same order of cost the
+    // cross-replica lock already pays per acquire. Because both the writer's bump
+    // and the reader's validation happen INSIDE the per-game lock, the check is
+    // race-free, not best-effort. With Redis down validation degrades to trusting
+    // the cache, which is exactly the single-replica deployment GameLockManager
+    // already declares itself for in that state.
     private final Map<String, SudokuBoard> activeGames = new ConcurrentHashMap<>();
+    // The board version each cached entry was loaded at. Maintained alongside
+    // activeGames; compared against Redis "game:ver:<id>" on every cache hit.
+    private final Map<String, Long> cachedVersion = new ConcurrentHashMap<>();
     // Last time each cached board was created or read. ConcurrentHashMap has no ordering,
     // so trimActiveGames() used to evict an arbitrary (hash-order) entry while calling it
     // "oldest" — it could throw out the game someone is actively playing and keep a stale
@@ -76,6 +96,17 @@ public class GameService {
     @Autowired
     public void setGameEndListeners(ObjectProvider<GameEndListener> gameEndListeners) {
         this.gameEndListeners = gameEndListeners;
+    }
+
+    // Per-game version counter store for cross-replica cache validation (see the
+    // activeGames comment). Setter-injected and optional so plain unit tests can
+    // construct GameService without it — absent, validation is disabled and the
+    // cache behaves exactly as before, which is correct for single-replica.
+    private org.springframework.data.redis.core.StringRedisTemplate versionRedis;
+
+    @Autowired(required = false)
+    public void setVersionRedis(org.springframework.data.redis.core.StringRedisTemplate versionRedis) {
+        this.versionRedis = versionRedis;
     }
 
     // Hint-economy charge point (solve rewards flow through the listener hook
@@ -187,6 +218,18 @@ public class GameService {
         validateGameId(gameId);
         try (var lock = gameLocks.lock(gameId)) {
             SudokuBoard board = activeGames.get(gameId);
+            if (board != null && cachedCopyIsStale(gameId)) {
+                // Another replica wrote this game since we cached it. Drop the copy and
+                // fall through to the read-through path; the Redis/DB copy behind the
+                // new version is complete because writers bump AFTER writing. The
+                // locallyMutated flag goes too — flushing this stale copy on shutdown
+                // would roll the game back over the other replica's writes, which is
+                // the precise failure shutdown()'s guard exists to prevent.
+                logger.debug("Cached copy of {} is stale (another replica wrote it) — reloading", gameId);
+                activeGames.remove(gameId);
+                locallyMutated.remove(gameId);
+                board = null;
+            }
             if (board == null) {
                 board = readFromRedis(gameId);
                 if (board == null) {
@@ -196,6 +239,7 @@ public class GameService {
                     }
                 }
                 activeGames.put(gameId, board);
+                recordCachedVersion(gameId);
                 saveToRedis(gameId, board);
                 // The READ path populates the cache too, and used to do so without any
                 // cap: only createNewGame/adoptGame trimmed. Abandoned games are never
@@ -319,6 +363,17 @@ public class GameService {
             SudokuBoard board = getGame(gameId);
             requireHintOwner(board, gameId, requesterId);
             String hint = aiSolverService.getNextLogicalMove(board);
+            if (AISolverService.NO_MOVES.equals(hint)) {
+                // No logical move exists for this grid. Nothing was delivered and the
+                // board was not mutated (incrementHintCount only runs when a hint is
+                // found), so nothing is charged, counted in hint analytics, or
+                // persisted. "No moves" is a non-blank string, so the isBlank() guard
+                // below waved it through: the player paid 5 gems to be told nothing,
+                // while hintCount stayed at 0 — a charge with no purchase behind it.
+                // Still memoised, so a replayed GET on the same grid stays free.
+                lastIssuedHint.put(gameId, new IssuedHint(gridFingerprint(board), hint));
+                return hint;
+            }
             // Hint economy: charge AFTER computing but BEFORE revealing — a
             // throw here (InsufficientGemsException) means the player pays
             // nothing and learns nothing. Empty hints are free.
@@ -425,6 +480,11 @@ public class GameService {
                 // scheduler's threshold — it just makes the signal real.
                 antiCheatEngine.scoreCompletedGame(board, playerId);
                 playerState.incrementStreak(playerId);
+                // Make the STREAK_UPDATE analytics branch real: recordEvent has kept a
+                // best-streak map for this event type since it was written, but the enum
+                // constant only exists as of pass 15 and this is its only emission point.
+                analyticsService.recordEvent(new GameEvent(GameEvent.EventType.STREAK_UPDATE, playerId,
+                    Map.of("streak", String.valueOf(playerState.getStreak(playerId)))));
                 chaosEngine.onGameEvent("STREAK", playerId);
                 endGame(gameId, playerId);
             } else if (board.isInfiniteMode() && board.getLives() <= 0) {
@@ -446,6 +506,7 @@ public class GameService {
             lastAccess.remove(gameId);
             locallyMutated.remove(gameId);
             lastIssuedHint.remove(gameId);
+            cachedVersion.remove(gameId);
             if (board != null) {
                 wasActive = true;
                 redisTemplate.delete(redisKey(gameId));
@@ -718,7 +779,13 @@ public class GameService {
     private void persistBoard(SudokuBoard board) {
         board.syncCellsJson();
         gameRepository.save(board);
-        if (board.getGameId() != null) locallyMutated.add(board.getGameId());
+        if (board.getGameId() != null) {
+            locallyMutated.add(board.getGameId());
+            // Every mutation site calls saveToRedis BEFORE persistBoard, so by the time
+            // the version moves, both authoritative copies already hold the new state —
+            // a replica that sees the new version cannot reload the old board.
+            bumpBoardVersion(board.getGameId());
+        }
     }
 
     /** Fans finished games out to feature listeners (daily puzzle, duels, ...). */
@@ -977,6 +1044,59 @@ public class GameService {
         return "game:" + gameId;
     }
 
+    // ---- cross-replica cache validation (see the activeGames comment) ----
+
+    private String versionKey(String gameId) {
+        return "game:ver:" + gameId;
+    }
+
+    /**
+     * True when the Redis version counter for {@code gameId} no longer matches the
+     * version this pod cached the board at. Caller must hold the game lock, which is
+     * what makes the compare race-free against writers (they bump inside the lock too).
+     * Any Redis failure reads as "not stale": with Redis down the deployment is
+     * single-replica by GameLockManager's own declaration, and the local copy is king.
+     */
+    private boolean cachedCopyIsStale(String gameId) {
+        if (versionRedis == null) return false;
+        try {
+            String raw = versionRedis.opsForValue().get(versionKey(gameId));
+            long current = raw == null ? 0L : Long.parseLong(raw);
+            Long cached = cachedVersion.get(gameId);
+            return cached == null ? current != 0L : current != cached;
+        } catch (Exception e) {
+            logger.debug("Board version check failed for {} (treating cache as fresh): {}",
+                gameId, e.getMessage());
+            return false;
+        }
+    }
+
+    /** Records the version the board now entering the cache was loaded at. */
+    private void recordCachedVersion(String gameId) {
+        if (versionRedis == null) return;
+        try {
+            String raw = versionRedis.opsForValue().get(versionKey(gameId));
+            cachedVersion.put(gameId, raw == null ? 0L : Long.parseLong(raw));
+        } catch (Exception e) {
+            // Can't read the version: leave no entry, so the first validation after
+            // Redis recovers reloads once rather than trusting an unknown baseline.
+            cachedVersion.remove(gameId);
+        }
+    }
+
+    /** Advances the shared version counter after a write; our own cache stays fresh. */
+    private void bumpBoardVersion(String gameId) {
+        if (versionRedis == null) return;
+        try {
+            Long v = versionRedis.opsForValue().increment(versionKey(gameId));
+            // TTL matches the board key so an abandoned game's counter is reaped with it.
+            versionRedis.expire(versionKey(gameId), REDIS_TTL_MINUTES, TimeUnit.MINUTES);
+            if (v != null) cachedVersion.put(gameId, v);
+        } catch (Exception e) {
+            logger.debug("Board version bump failed for {} (non-fatal): {}", gameId, e.getMessage());
+        }
+    }
+
     /** Marks a cached board as just used, for LRU eviction. */
     private void touch(String gameId) {
         lastAccess.put(gameId, System.nanoTime());
@@ -987,6 +1107,7 @@ public class GameService {
         activeGames.remove(gameId);
         lastAccess.remove(gameId);
         lastIssuedHint.remove(gameId);
+        cachedVersion.remove(gameId);
         gameLocks.releaseGame(gameId);
     }
 
@@ -1002,6 +1123,7 @@ public class GameService {
             lastAccess.remove(victim);
             locallyMutated.remove(victim);
             lastIssuedHint.remove(victim);
+            cachedVersion.remove(victim);
             // Only drops the monitor if nobody holds it — evicting a busy game's lock
             // would let two threads into the same critical section.
             gameLocks.releaseGame(victim);

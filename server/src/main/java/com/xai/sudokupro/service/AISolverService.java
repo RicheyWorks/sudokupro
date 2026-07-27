@@ -78,6 +78,19 @@ public class AISolverService {
         return false;
     }
 
+    /**
+     * Sentinel returned by {@link #getNextLogicalMove} when no logical move exists.
+     *
+     * <p>A named constant rather than an inline literal because the value is part of a
+     * contract: {@code GameService.purchaseHint} must recognise it to keep the "empty
+     * hints are free" rule — the literal is non-blank, so a plain
+     * {@code !hint.isBlank()} check charged 5 gems for a hint that said nothing.
+     * The literal itself is pinned by AISolverCorrectnessTest and shown verbatim by
+     * clients, so it stays "No moves"; what changed is that it now has a name the
+     * charge site can compare against.
+     */
+    public static final String NO_MOVES = "No moves";
+
     public String getNextLogicalMove(SudokuBoard board) {
         // Hint collection is read-only; run it without holding the lock.
         SudokuCell[][] snapshot = board.getBoardCopy();
@@ -111,7 +124,7 @@ public class AISolverService {
             }
             hintStreak = 0;  // no move found — reset streak
         }
-        return "No moves";
+        return NO_MOVES;
     }
 
     public EnhancedMove getNextLogicalMoveAsEnhancedMove(SudokuBoard board) {

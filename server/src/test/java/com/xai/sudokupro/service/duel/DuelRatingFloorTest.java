@@ -60,7 +60,8 @@ class DuelRatingFloorTest {
                     new io.micrometer.core.instrument.simple.SimpleMeterRegistry())),
             new DuelStateStore(downRedis),
             repo,
-            mock(com.xai.sudokupro.service.NotificationService.class));
+            mock(com.xai.sudokupro.service.NotificationService.class),
+            mock(com.xai.sudokupro.service.AnalyticsService.class));
     }
 
     /** Invokes the production settlement directly — it is the unit under test. */

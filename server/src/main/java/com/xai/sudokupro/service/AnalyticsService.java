@@ -246,12 +246,14 @@ public class AnalyticsService {
      * leaderboard below every real player — a ranking claim the data does not support.
      *
      * <h4>What is deliberately not in the formula</h4>
-     * {@code duelWins}, {@code duelLosses} and {@code streakRecords} are <em>unreachable</em>:
-     * {@link #recordEvent} only fills them for event types {@code "DUEL_WIN"},
-     * {@code "DUEL_LOSS"} and {@code "STREAK_UPDATE"}, and {@link GameEvent.EventType} has no
-     * such constants (it is MOVE, HINT, SOLVE, JOIN, LEAVE, SCORE), so those branches cannot
-     * execute. Weighting a permanently-empty signal would have re-created the bug being
-     * fixed here. {@code cosmicDripHeatmap} is unreachable for the same practical reason —
+     * {@code duelWins}, {@code duelLosses} and {@code streakRecords} are now live —
+     * {@link GameEvent.EventType} gained {@code DUEL_WIN}/{@code DUEL_LOSS}/{@code STREAK_UPDATE}
+     * in pass 15 and DuelService/GameService emit them — but they stay out of the formula
+     * on the original second ground: duel skill is separately and correctly served by the
+     * duel leaderboard (persisted {@code User.duelWins}/ELO), and blending a competitive
+     * signal into a solo-play score would double-count duellists. The maps' consumers are
+     * the {@code sudokupro.duel.win.rate.average} gauge and the anti-cheat win-count
+     * cross-check. {@code cosmicDripHeatmap} remains unreachable for a practical reason —
      * nothing sets the {@code "cosmic"} payload flag on a MOVE. And {@code mistakeHeatmap}
      * is used strictly as a move counter, which is what {@link #recordEvent} increments it
      * for; reading it as "mistakes" would encode a meaning it does not carry. Duel skill is

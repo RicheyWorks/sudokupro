@@ -90,6 +90,27 @@ public interface UserRepository extends JpaRepository<User, Long>,
                         @Param("amount") int amount,
                         @Param("xp") int xp);
 
+    /**
+     * Atomic achievement-unlock payout: gems, xp, hype and cosmic drip in one statement.
+     *
+     * <p>Same rationale as {@link #creditGemsAndXp}: AchievementService pays rewards from
+     * a {@link com.xai.sudokupro.service.GameEndListener} that runs concurrently with the
+     * solve payout and any in-flight hint charges, so a read-modify-write on the entity
+     * would silently revert whichever credit committed in between. Covers the two flavour
+     * counters as well because {@code User.checkAchievement} — the other unlock path,
+     * whose reward this mirrors — has always paid hype and drip alongside gems and xp.
+     */
+    @Transactional
+    @org.springframework.data.jpa.repository.Modifying(clearAutomatically = true, flushAutomatically = true)
+    @Query("UPDATE User u SET u.gems = u.gems + :gems, u.xp = u.xp + :xp, "
+         + "u.hypeMeter = u.hypeMeter + :hype, u.cosmicDrip = u.cosmicDrip + :drip "
+         + "WHERE u.username = :username")
+    int creditAchievementReward(@Param("username") String username,
+                                @Param("gems") int gems,
+                                @Param("xp") int xp,
+                                @Param("hype") int hype,
+                                @Param("drip") int drip);
+
     /** Targeted level write, so recomputing level never rewrites the gem balance. */
     @Transactional
     @org.springframework.data.jpa.repository.Modifying(clearAutomatically = true, flushAutomatically = true)

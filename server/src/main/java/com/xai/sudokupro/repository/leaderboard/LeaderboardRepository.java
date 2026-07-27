@@ -39,9 +39,13 @@ public interface LeaderboardRepository extends JpaRepository<User, Long> {
     //   * The queries LeaderboardService already caches at the service layer lost their
     //     repository-level @Cacheable. Caching both layers made updateScore's @CacheEvict
     //     cosmetic: it evicts the service cache, and the stale rows come back up from here.
-    // findSocialCosmicIcons and findAchievementHunters still pair @EntityGraph with a
-    // Pageable and so still paginate in memory. They have no production caller anywhere in
-    // the codebase, so they are left alone rather than rewritten speculatively.
+    // findSocialCosmicIcons and findAchievementHunters — the two remaining
+    // @EntityGraph-with-Pageable declarations — were DELETED in pass 15. They had no
+    // caller anywhere (production or test), carried the exact in-memory-pagination trap
+    // documented on findTopUsersByPoints below, lacked the u.id ASC tie-break every live
+    // ordering here carries, and their @Cacheable names registered two caches nothing
+    // could ever hit. Dead code that models a known defect is a template for the next
+    // bug; whoever needs these features writes them fresh against the two-query pattern.
 
     /**
      * Top players by points, one page, with {@code matchHistory} fetched.
@@ -153,12 +157,6 @@ public interface LeaderboardRepository extends JpaRepository<User, Long> {
     // up from here.
     List<User> findHypeLegends(@Param("minHype") int minHype, Pageable pageable);
 
-    @EntityGraph(attributePaths = {"friends"})
-    @Query("SELECT u FROM User u WHERE SIZE(u.friends) >= :minFriends AND u.fanCount >= :minFans " +
-           "ORDER BY (u.hypeMeter + u.cosmicDrip) DESC")
-    @Cacheable(value = "socialCosmicIcons", key = "#minFriends + '-' + #minFans + '-' + #pageable")
-    List<User> findSocialCosmicIcons(@Param("minFriends") int minFriends, @Param("minFans") int minFans, Pageable pageable);
-
     @Query("SELECT u FROM User u WHERE u.streak >= :minStreak AND u.lastLogin > :since " +
            "ORDER BY u.streak DESC, u.cosmicDrip DESC")
     // Not cached here: LeaderboardService.getTopRecentPlayersPaged already caches this result, and only the service-level cache is named by
@@ -183,12 +181,6 @@ public interface LeaderboardRepository extends JpaRepository<User, Long> {
     // eviction cosmetic — it would fire, and the stale rows would come straight back
     // up from here.
     List<UserSummary> getCosmicLeaderboardSummary(Pageable pageable);
-
-    @EntityGraph(attributePaths = {"achievements"})
-    @Query("SELECT u FROM User u WHERE SIZE(u.achievements) >= :minAchievements " +
-           "ORDER BY u.points DESC, u.cosmicDrip DESC")
-    @Cacheable(value = "achievementHunters", key = "#minAchievements + '-' + #pageable")
-    List<User> findAchievementHunters(@Param("minAchievements") int minAchievements, Pageable pageable);
 
     @Query("SELECT u FROM User u WHERE u.xp >= :minXp AND u.level >= :minLevel " +
            "ORDER BY (u.points + u.xp) DESC")

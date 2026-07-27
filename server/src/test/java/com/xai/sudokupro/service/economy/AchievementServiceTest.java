@@ -26,6 +26,7 @@ import java.util.concurrent.ConcurrentHashMap;
 
 import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.Mockito.*;
 
@@ -40,10 +41,11 @@ class AchievementServiceTest {
     private final Map<String, User> users = new ConcurrentHashMap<>();
     private DailyStateStore dailyState;
     private AchievementService service;
+    private UserRepository repo;
 
     @BeforeEach
     void setUp() {
-        UserRepository repo = mock(UserRepository.class);
+        repo = mock(UserRepository.class);
         lenient().when(repo.findByUsername(anyString()))
             .thenAnswer(inv -> Optional.ofNullable(users.get(inv.<String>getArgument(0))));
         lenient().when(repo.save(any(User.class))).thenAnswer(inv -> {
@@ -115,6 +117,47 @@ class AchievementServiceTest {
             assertFalse(users.get("richmond").getAchievements().containsValue(true));
         }
         verify(notificationService, never()).sendTypedNotification(anyString(), anyString(), anyString());
+    }
+
+    /**
+     * The reward half of the double-unlock reconciliation: an unlock through this
+     * service pays the same 20/100/30/10 that User.checkAchievement pays, exactly
+     * once, and atomically (via the SQL credit, never a full-row entity save).
+     */
+    @Test
+    void unlockPaysTheStandardRewardExactlyOnce() {
+        lenient().when(repo.creditAchievementReward(anyString(), anyInt(), anyInt(), anyInt(), anyInt()))
+            .thenReturn(1);
+
+        service.onGameEnded(solved("g1", "richmond"), "richmond");
+        // Same achievement again: already TRUE, so no second unlock and no second payout.
+        service.onGameEnded(solved("g2", "richmond"), "richmond");
+
+        verify(repo, times(1)).creditAchievementReward("richmond",
+            User.ACHIEVEMENT_GEMS, User.ACHIEVEMENT_XP,
+            User.ACHIEVEMENT_HYPE, User.ACHIEVEMENT_DRIP);
+    }
+
+    /**
+     * The suppression half: whichever path unlocks first, the other pays nothing.
+     * Here the ENTITY path (User.checkAchievement) unlocks CleanSolver first — which
+     * also proves the guard fix, since CleanSolver is not one of the seeded keys and
+     * the old containsKey guard refused it — and the service run must then credit
+     * no reward at all.
+     */
+    @Test
+    void entityPathUnlockSuppressesTheServicePayout() {
+        User user = new User(null, "richmond");
+        int before = user.getGems();
+        user.checkAchievement("CleanSolver", true);
+        assertEquals(before + User.ACHIEVEMENT_GEMS, user.getGems(),
+            "the entity path must pay the unlock it made");
+        users.put("richmond", user);
+
+        service.onGameEnded(solved("g1", "richmond"), "richmond");
+
+        assertTrue(users.get("richmond").getAchievements().get("CleanSolver"));
+        verify(repo, never()).creditAchievementReward(anyString(), anyInt(), anyInt(), anyInt(), anyInt());
     }
 
     private SudokuBoard solved(String gameId, String playerId) {

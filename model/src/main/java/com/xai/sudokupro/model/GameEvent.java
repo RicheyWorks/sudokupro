@@ -18,7 +18,14 @@ import java.util.Objects;
 public class GameEvent {
 
     public enum EventType {
-        MOVE, HINT, SOLVE, JOIN, LEAVE, SCORE;
+        MOVE, HINT, SOLVE, JOIN, LEAVE, SCORE,
+        // Duel outcomes and streak advances. AnalyticsService.recordEvent has dispatched
+        // on the strings "DUEL_WIN", "DUEL_LOSS" and "STREAK_UPDATE" since it was written,
+        // but no such constants existed, so those branches — and every consumer downstream
+        // of the maps they fill (the sudokupro.duel.win.rate.average gauge, the anti-cheat
+        // win-count cross-check) — were unreachable. The constants make the events real;
+        // DuelService and GameService now emit them.
+        DUEL_WIN, DUEL_LOSS, STREAK_UPDATE;
 
         // Custom deserializer could be added if needed
     }
