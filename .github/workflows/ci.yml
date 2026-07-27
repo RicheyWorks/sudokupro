@@ -60,6 +60,40 @@ jobs:
           REDIS_PORT: '6379'
         run: mvn -B verify
 
+      # A red build must say WHAT failed. Without this, a failing suite surfaced only as
+      # "Process completed with exit code 1" on the job card, and the surefire output that
+      # names the test was reachable only by signing in and expanding the step — so a
+      # failure that did not reproduce locally could not be diagnosed from the outside at
+      # all. Pass 16 hit exactly that: green on two JDKs, with CI's own environment, run
+      # through `verify`, and the CI log was the only place the answer existed.
+      - name: Report which tests failed
+        if: failure()
+        run: |
+          echo "## Failing tests" >> "$GITHUB_STEP_SUMMARY"
+          found=0
+          for f in */target/surefire-reports/*.txt; do
+            [ -f "$f" ] || continue
+            if grep -qE "FAILURE|ERROR" "$f"; then
+              found=1
+              echo "::group::$f"
+              cat "$f"
+              echo "::endgroup::"
+              { echo; echo "<details><summary>$(basename "$f")</summary>"; echo; echo '```'; cat "$f"; echo '```'; echo "</details>"; } >> "$GITHUB_STEP_SUMMARY"
+            fi
+          done
+          [ "$found" = 1 ] || echo "No surefire failure reports — the build failed before or after the tests." | tee -a "$GITHUB_STEP_SUMMARY"
+
+      # The reports themselves, so a failure can be read without signing in and without
+      # re-running anything.
+      - name: Upload surefire reports
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: surefire-reports
+          path: '*/target/surefire-reports/**'
+          retention-days: 7
+          if-no-files-found: ignore
+
       # Belt and braces for the exact failure this replaced: a test that counts as passing
       # while never executing. If either class is missing from the reports, or reports a
       # skip, or ran zero tests, the build fails and says so.
