@@ -42,6 +42,34 @@ python3 testing/reward_replay_probe.py
 Before the fix this minted +15 gems and +15 XP per replay (15 → 135 gems). Expected output
 now: the balance rises once on the genuine solve and then stays flat.
 
+## web_client_test.py
+
+A real Chromium browser against a real server, driving the shipped web client at
+`/play/`. It logs in, starts a puzzle, and **plays it to completion by clicking cells and
+pressing digit keys** — then asserts what the player actually experiences: the win is
+announced, the solve time is shown, pencil marks survive a dropped-and-restored
+connection, and no uncaught JS error occurred anywhere in the session.
+
+```bash
+pip install playwright && playwright install chromium
+python3 testing/web_client_test.py            # add --headed to watch it play
+```
+
+Until pass 17 `app.js` had **no test of any kind**, so two already-fixed client defects
+were protected by nothing but the source comment describing them.
+
+**Run it against a jar built from your current checkout.** Spring serves `/play/app.js`
+out of the packaged jar, so a server started from an older build serves the OLD client
+and the harness silently tests code you are not editing — the first mutation audit of
+this suite came back falsely green for exactly that reason. For quick iteration on the
+client, start the server with:
+
+```bash
+--spring.web.resources.static-locations=file:server/src/main/resources/static/
+```
+
+which serves the files straight off disk, so an edit takes effect on reload.
+
 ## Note on the shared-IP lockout
 
 Every player here connects from the same address, and `LoginAttemptLimiter` keys on

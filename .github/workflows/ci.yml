@@ -223,6 +223,22 @@ jobs:
           pip install --quiet websockets
           python3 testing/fuzz_edge_cases.py
 
+      # The shipped web client had NO test of any kind until pass 17 — no JS tests, no
+      # browser driver, and nothing in CI that referenced app.js. Two defects fixed in
+      # earlier passes live entirely in that file, and the only way to confirm either was
+      # still fixed was to read the source by hand. This plays a whole puzzle through the
+      # real UI in real Chromium and asserts the player-facing outcome.
+      #
+      # It runs against the jar built above, which is built from this checkout — so the
+      # browser always gets the app.js in the commit under test. Running a server built
+      # earlier would serve the OLD client out of its jar and quietly test nothing, which
+      # is exactly how the harness's first mutation audit came back falsely green.
+      - name: Web client suite — a real browser plays a real game
+        run: |
+          pip install --quiet playwright
+          python3 -m playwright install --with-deps chromium
+          python3 testing/web_client_test.py
+
       - name: Server log
         if: always()
         run: tail -200 /tmp/server.log || true
