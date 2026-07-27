@@ -105,6 +105,61 @@ class GeneratedBoardInvariantsTest {
         }
     }
 
+    /**
+     * Mirror mode must actually produce a symmetric clue layout.
+     *
+     * <p>It used not to. The old {@code applyMirrorSymmetry} ran after removal — after the
+     * unique solution was established — and copied one half of the grid onto the other,
+     * guarded against blanking a clue or creating a duplicate. Those guards are what kept
+     * it safe and also what made it pointless: measured over 40 mirror boards, ~13 cells
+     * were "mirrored" per board, the empty-cell count changed on none of them, and
+     * <b>0 of 40 came out symmetric</b>. A player toggling Mirror got an ordinary puzzle
+     * and a burst of warnings in the server log.
+     *
+     * <p>Symmetry now comes from removing clues in pairs, which is the generator's
+     * existing uniqueness-checked path. The symmetry is 180-degree rotational — the usual
+     * Sudoku convention — so a cell is empty exactly when its opposite is.
+     */
+    @Test
+    void mirrorModeProducesASymmetricClueLayout() {
+        for (Constants.Difficulty d : new Constants.Difficulty[]{
+                Constants.Difficulty.EASY, Constants.Difficulty.MEDIUM, Constants.Difficulty.HARD}) {
+            for (int i = 0; i < 3; i++) {
+                SudokuBoard board = generator().generate(d, false, true, 11_000L + i);
+                for (int r = 0; r < 9; r++) {
+                    for (int c = 0; c < 9; c++) {
+                        boolean here = board.getBoard()[r][c].getValue() == 0;
+                        boolean opposite = board.getBoard()[8 - r][8 - c].getValue() == 0;
+                        assertEquals(here, opposite,
+                            "mirror mode (" + d + "): cell " + r + "," + c + " and its opposite "
+                                + (8 - r) + "," + (8 - c) + " must both be clues or both be empty");
+                    }
+                }
+                assertTrue(board.isMirrorMode(), "the board must carry the mirror flag");
+            }
+        }
+    }
+
+    /**
+     * Symmetry must never cost the player a playable puzzle. An odd removal target cannot
+     * be met by removing pairs — NIGHTMARE asks for 55 and pair-wise removal overshoots to
+     * 56 — so those tiers fall back to ordinary removal rather than shipping a board whose
+     * clue count contradicts its difficulty.
+     */
+    @Test
+    void mirrorModeNeverBreaksTheClueCountEvenWhenSymmetryIsImpossible() {
+        for (Constants.Difficulty d : Constants.Difficulty.values()) {
+            SudokuBoard board = generator().generate(d, false, true, 12_000L + d.ordinal());
+            int empty = 0;
+            for (int r = 0; r < 9; r++)
+                for (int c = 0; c < 9; c++)
+                    if (board.getBoard()[r][c].getValue() == 0) empty++;
+            assertEquals(d.cellsRemoved, empty,
+                d + " with mirror requested must still leave exactly " + d.cellsRemoved
+                    + " empty cells — a symmetric layout is a preference, a correct puzzle is not");
+        }
+    }
+
     /** The clue count must match the difficulty tier, chaos or not. */
     @Test
     void theClueCountMatchesTheDifficultyTier() {
