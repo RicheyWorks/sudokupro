@@ -50,6 +50,18 @@ jobs:
       # is hard-coded; the H2 test profile overrides the datasource for every other test.
       # sudokupro.it.optional is deliberately NOT set: the services above are guaranteed,
       # so an unreachable one must fail the build.
+      # The client module's UI tests construct real JavaFX controls, which needs a display.
+      # JavaFX 21's public artifacts do not ship Monocle, so the usual
+      # -Dglass.platform=Monocle headless route fails with a null PlatformFactory; a virtual
+      # framebuffer is the working option and the one a GitHub runner can provide. On a
+      # developer's desktop there is already a display and xvfb-run is unnecessary.
+      #
+      # Deliberately NOT solved by letting the UI tests skip when no display is present:
+      # this project has twice been bitten by a suite that disabled itself and still
+      # reported success.
+      - name: Install Xvfb (the JavaFX UI tests need a display)
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq xvfb
+
       - name: Build and test
         env:
           DB_HOST: localhost
@@ -58,7 +70,7 @@ jobs:
           DB_PASSWORD: sudoku123
           REDIS_HOST: localhost
           REDIS_PORT: '6379'
-        run: mvn -B verify
+        run: xvfb-run -a mvn -B verify
 
       # A red build must say WHAT failed. Without this, a failing suite surfaced only as
       # "Process completed with exit code 1" on the job card, and the surefire output that
