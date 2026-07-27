@@ -85,6 +85,46 @@ class AntiCheatPipelineTest {
     }
 
     /**
+     * The duel-win detector must fire on a BURST, and must not fire on a veteran.
+     *
+     * <p>It used to require the in-memory analytics count to be exactly equal to the
+     * player's persisted lifetime count, with both above the threshold. Those measure
+     * different things — analytics counts what this process has seen and trims its maps,
+     * while {@code User.duelWins} is the lifetime total across every replica — so they
+     * coincide only inside one pod's uptime for a player who started from zero. After any
+     * restart, and on every pod of a multi-replica deployment, the detector could not fire
+     * at all. Pass 15 made the analytics side reachable; this pins that the comparison
+     * now means something.
+     */
+    @Test
+    void aBurstOfDuelWinsIsScoredButALifetimeVeteranIsNot() {
+        User burster = userWith(101L, "10.0.0.9", "web");
+        when(userRepository.findById(101L)).thenReturn(Optional.of(burster));
+        // 21 wins seen recently, in this process — over the threshold of 20.
+        when(analyticsService.getDuelWins()).thenReturn(Map.of("101", 21));
+
+        engine.scoreCompletedGame(boardSolvedIn(Duration.ofMinutes(5)), "101");
+
+        assertTrue(engine.getCheatSuspicionScores().getOrDefault("101", 0.0) > 0.0,
+            "twenty-one duel wins inside one window is the signal this detector exists for");
+
+        // A veteran: thousands of wins on the account, but almost none recently.
+        User veteran = mock(User.class);
+        when(veteran.getId()).thenReturn(102L);
+        when(veteran.getLastLoginIp()).thenReturn("10.0.0.10");
+        when(veteran.getPlatform()).thenReturn("web");
+        lenient().when(veteran.getDuelWins()).thenReturn(5_000);
+        when(userRepository.findById(102L)).thenReturn(Optional.of(veteran));
+        when(analyticsService.getDuelWins()).thenReturn(Map.of("102", 2));
+
+        engine.scoreCompletedGame(boardSolvedIn(Duration.ofMinutes(5)), "102");
+
+        assertEquals(0.0, engine.getCheatSuspicionScores().getOrDefault("102", 0.0),
+            "a long-standing player with a big lifetime record and no recent burst must "
+                + "not be flagged — the rate is the signal, not the total");
+    }
+
+    /**
      * The threshold AntiCheatScheduler enforces on is 75. If repeated offences could not
      * accumulate past it, wiring the pipeline up would still leave enforcement dead.
      */

@@ -134,8 +134,26 @@ public class AntiCheatEngine {
             signals++;
         }
 
-        if (duelWins > MAX_DUEL_WIN_STREAK &&
-            analyticsService.getDuelWins().getOrDefault(playerId, 0) == duelWins) {
+        // A burst of duel wins, not a lifetime total.
+        //
+        // This used to require the in-memory analytics count to be EXACTLY EQUAL to the
+        // player's persisted lifetime count, and both to exceed the threshold. Those two
+        // numbers measure different things: analytics counts what THIS process has seen
+        // since it started (and trims its maps), while User.duelWins is the lifetime
+        // total across every replica since the account was created. They coincide only
+        // for a player whose entire duel history happened inside one pod's uptime with no
+        // trimming — so after any restart, and on every pod in a multi-replica
+        // deployment, the detector could not fire at all. Pass 15 made the analytics side
+        // reachable; this makes the comparison mean something.
+        //
+        // The rate is the signal worth having. A veteran with thousands of lifetime wins
+        // is not suspicious; twenty wins in one short window is. Known limitation, stated
+        // rather than hidden: analytics is per-pod, so an attacker spread across replicas
+        // is undercounted — the same caveat every other in-memory detector here carries.
+        int recentDuelWins = analyticsService.getDuelWins().getOrDefault(playerId, 0);
+        if (recentDuelWins > MAX_DUEL_WIN_STREAK) {
+            logger.debug("Duel-win burst for {}: {} wins observed recently (lifetime {})",
+                playerId, recentDuelWins, duelWins);
             signals++;
         }
 
