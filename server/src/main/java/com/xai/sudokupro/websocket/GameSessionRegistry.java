@@ -49,7 +49,25 @@ public class GameSessionRegistry {
     private static final Logger logger = LoggerFactory.getLogger(GameSessionRegistry.class);
 
     private final ConcurrentMap<String, Set<WebSocketSession>> gameSessions = new ConcurrentHashMap<>();
-    private final ConcurrentMap<String, WebSocketSession> playerSessions = new ConcurrentHashMap<>();
+    /**
+     * Player id to EVERY open session that player holds — not just their latest.
+     *
+     * <p>This was a single-valued map, so it lost a player the moment they had two
+     * sockets. Open a second tab and the second register overwrites the first; close
+     * that second tab and unregister's value-conditional remove matches and deletes the
+     * entry outright, while tab one is still open and still playing. From then on, for
+     * the whole life of that connection, the player is invisible: FriendService reports
+     * them offline to every friend, and every player-targeted notification — friend
+     * request, duel challenge, "You WON the duel", achievement unlock, daily streak — is
+     * dropped by deliverToPlayerLocal and never reaches them. sendToPlayer's boolean is
+     * swallowed by MultiplayerBroadcaster, so nothing logs a failure and the push
+     * fallback never engages either.
+     *
+     * <p>Two tabs is the ordinary case. gameSessions was already multi-session (that was
+     * the orphan-Set fix); this is the same shape, applied to the routing map that
+     * everything player-addressed goes through.
+     */
+    private final ConcurrentMap<String, Set<WebSocketSession>> playerSessions = new ConcurrentHashMap<>();
     private final ObjectMapper objectMapper;
 
     public GameSessionRegistry(ObjectMapper objectMapper) {
@@ -91,7 +109,14 @@ public class GameSessionRegistry {
             sessions.add(session);
             return sessions;
         });
-        playerSessions.put(playerId, session);
+        // Same per-key-locked add as the game map above, for the same reason: the
+        // emptiness check in unregister must never interleave with an add.
+        playerSessions.compute(playerId, (id, existing) -> {
+            Set<WebSocketSession> sessions =
+                (existing != null) ? existing : ConcurrentHashMap.newKeySet();
+            sessions.add(session);
+            return sessions;
+        });
     }
 
     /**
@@ -118,7 +143,12 @@ public class GameSessionRegistry {
                 return sessions.isEmpty() ? null : sessions;   // null removes the entry
             });
         }
-        if (playerId != null) playerSessions.remove(playerId, session);
+        if (playerId != null) {
+            playerSessions.computeIfPresent(playerId, (id, sessions) -> {
+                sessions.remove(session);
+                return sessions.isEmpty() ? null : sessions;   // only the LAST socket clears presence
+            });
+        }
     }
 
     /** Sends to every open session in the game, excluding {@code excludeSender} (may be null). */
@@ -141,8 +171,12 @@ public class GameSessionRegistry {
      */
     /** Presence: true while the player holds an open gameplay WebSocket on this pod. */
     public boolean isOnline(String playerId) {
-        WebSocketSession s = playerSessions.get(playerId);
-        return s != null && s.isOpen();
+        Set<WebSocketSession> sessions = playerSessions.get(playerId);
+        if (sessions == null) return false;
+        for (WebSocketSession s : sessions) {
+            if (s.isOpen()) return true;
+        }
+        return false;
     }
 
     public boolean sendToPlayer(String playerId, Map<String, Object> envelope) {
@@ -176,10 +210,17 @@ public class GameSessionRegistry {
     }
 
     public boolean deliverToPlayerLocal(String playerId, Map<String, Object> envelope) {
-        WebSocketSession s = playerSessions.get(playerId);
-        if (s == null || !s.isOpen()) return false;
+        Set<WebSocketSession> sessions = playerSessions.get(playerId);
+        if (sessions == null || sessions.isEmpty()) return false;
         String msg = serialize(envelope);
-        return msg != null && sendRaw(s, msg);
+        if (msg == null) return false;
+        // Deliver to every open socket the player holds: a notification that reached only
+        // one of two tabs is the same defect in miniature. Delivered if ANY send lands.
+        boolean delivered = false;
+        for (WebSocketSession s : sessions) {
+            if (s.isOpen() && sendRaw(s, msg)) delivered = true;
+        }
+        return delivered;
     }
 
     /** Number of games currently holding at least one session (test/observability hook). */

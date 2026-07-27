@@ -27,6 +27,8 @@ public class FriendService {
     private static final Logger logger = LoggerFactory.getLogger(FriendService.class);
     private static final String PENDING_KEY = "sudokupro:friends:pending:"; // + playerId → set of requesters
     private static final Duration PENDING_TTL = Duration.ofDays(14);
+    /** Ceiling on one player's pending-request inbox; see {@link #request(String, String)}. */
+    static final int MAX_PENDING_PER_PLAYER = 200;
 
     public record FriendView(String playerId, boolean online) {}
 
@@ -48,6 +50,29 @@ public class FriendService {
         this.redis = redis;
     }
 
+    /**
+     * Records a pending friend request from {@code from} to {@code to}.
+     *
+     * <p>Three guards below are new, and each closes an unbounded path:
+     *
+     * <ul>
+     *   <li><b>Already friends.</b> Nothing checked, so you could keep requesting someone
+     *       who was already your friend — every call re-notified them, and accepting again
+     *       just re-ran the edge writes.</li>
+     *   <li><b>Duplicate request.</b> The Redis set already deduplicated the entry, but the
+     *       notification fired regardless, so one attacker could send the same request in a
+     *       loop and drive an unlimited stream of "X wants to be your friend" at the target.
+     *       {@code add} returns 0 when the member was already present; that is the signal.
+     *       Push is rate-limited, but the WebSocket notification is not, and it is the one
+     *       that lands in the app.</li>
+     *   <li><b>Inbox cap.</b> A pending set had no ceiling, so N attacker accounts (or one
+     *       account against N targets) could grow it without limit — a 14-day Redis key per
+     *       entry. Past the cap the request is refused rather than silently dropped, so the
+     *       sender sees a real answer.</li>
+     * </ul>
+     *
+     * <p>None of this is a substitute for a block list, which the product still lacks.
+     */
     public void request(String from, String to) {
         if (from.equals(to)) throw new IllegalArgumentException("You cannot befriend yourself");
         // The target must actually exist. Without this the endpoint accepted any string —
@@ -55,15 +80,40 @@ public class FriendService {
         // pending-request entry (and a 14-day Redis key) for an account that will never
         // exist. That is unbounded attacker-controlled key growth, and it also let a
         // caller probe/populate arbitrary names.
-        if (userRepository.findByUsername(to).isEmpty()) {
-            throw new IllegalArgumentException("No such player: " + to);
+        User target = userRepository.findByUsername(to)
+            .orElseThrow(() -> new IllegalArgumentException("No such player: " + to));
+
+        User sender = economyService.walletFor(from);
+        if (userRepository.countFriendEdge(sender.getId(), target.getId()) > 0) {
+            throw new IllegalArgumentException(to + " is already your friend");
         }
+
+        boolean isNew;
         try {
-            redis.opsForSet().add(PENDING_KEY + to, from);
+            if (redis.opsForSet().size(PENDING_KEY + to) != null
+                    && redis.opsForSet().size(PENDING_KEY + to) >= MAX_PENDING_PER_PLAYER
+                    && !Boolean.TRUE.equals(redis.opsForSet().isMember(PENDING_KEY + to, from))) {
+                throw new IllegalStateException(to + " has too many pending friend requests");
+            }
+            Long added = redis.opsForSet().add(PENDING_KEY + to, from);
             redis.expire(PENDING_KEY + to, PENDING_TTL);
+            isNew = added != null && added > 0;
+        } catch (IllegalStateException e) {
+            throw e;
         } catch (Exception e) {
             degraded(e);
-            localPending.computeIfAbsent(to, x -> ConcurrentHashMap.newKeySet()).add(from);
+            Set<String> pending = localPending.computeIfAbsent(to, x -> ConcurrentHashMap.newKeySet());
+            if (pending.size() >= MAX_PENDING_PER_PLAYER && !pending.contains(from)) {
+                throw new IllegalStateException(to + " has too many pending friend requests");
+            }
+            isNew = pending.add(from);
+        }
+
+        if (!isNew) {
+            // Already in their inbox. Re-requesting is not an error, but it must not
+            // generate another notification.
+            logger.debug("Duplicate friend request {} -> {} — not re-notifying", from, to);
+            return;
         }
         notify(to, from + " wants to be your friend — accept in the Friends menu.");
         logger.info("Friend request {} -> {}", from, to);
@@ -77,10 +127,11 @@ public class FriendService {
         removePending(me, requester);
         User a = economyService.walletFor(me);
         User b = economyService.walletFor(requester);
-        a.addFriend(b.getId());
-        b.addFriend(a.getId());
-        userRepository.save(a);
-        userRepository.save(b);
+        // One statement per edge rather than rewriting each player's whole friend
+        // collection — see UserRepository.linkFriend for why the read-modify-write lost
+        // edges and left one-way friendships behind.
+        userRepository.linkFriend(a.getId(), b.getId());
+        userRepository.linkFriend(b.getId(), a.getId());
         notify(requester, me + " accepted your friend request!");
         logger.info("Friendship formed: {} <-> {}", me, requester);
     }
@@ -105,10 +156,10 @@ public class FriendService {
         }
         User a = economyService.walletFor(me);
         User b = target.get();
-        Set<Long> af = a.getFriends(); af.remove(b.getId()); a.setFriends(af);
-        Set<Long> bf = b.getFriends(); bf.remove(a.getId()); b.setFriends(bf);
-        userRepository.save(a);
-        userRepository.save(b);
+        // Same reason as accept: deleting the one edge cannot clobber a concurrent change
+        // to the rest of either player's list.
+        userRepository.unlinkFriend(a.getId(), b.getId());
+        userRepository.unlinkFriend(b.getId(), a.getId());
     }
 
     /** The caller's friends with live presence flags. */

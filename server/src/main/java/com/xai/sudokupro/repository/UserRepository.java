@@ -71,6 +71,55 @@ public interface UserRepository extends JpaRepository<User, Long>,
     int deductGemsIfAffordable(@Param("username") String username, @Param("cost") int cost);
 
     /**
+     * Adds one directed edge to the friend graph, atomically and idempotently.
+     * Returns 1 if the edge was created, 0 if it already existed or the user is unknown.
+     *
+     * <p>{@code User.friends} is an {@code @ElementCollection}, and Hibernate's update
+     * strategy for one is <b>delete every row for this user, then reinsert the whole set</b>.
+     * So {@code a.addFriend(b); save(a)} does not append an edge — it replaces the entire
+     * friend list with a snapshot read earlier in the transaction. Two accepts touching the
+     * same person concurrently (which is exactly what a popular player gets) each read the
+     * list, each add their own edge, and the second write erases the first. There is no
+     * {@code @Version} on {@code User}, so nothing detects it.
+     *
+     * <p>Worse than a lost row: accept writes BOTH directions, and the two saves are
+     * independent. Losing one of them leaves a <em>one-way friendship</em> — the friend
+     * appears in one player's list and not the other's, with no request left pending to
+     * retry from, and no UI path back to a consistent state. Confirmed against the mapping
+     * and the generated SQL, not inferred.
+     *
+     * <p>Written as one statement per edge so the outcome does not depend on what else the
+     * transaction has read. The {@code NOT EXISTS} guard makes a repeated accept a no-op
+     * rather than a duplicate row.
+     */
+    @Transactional
+    @org.springframework.data.jpa.repository.Modifying(clearAutomatically = true, flushAutomatically = true)
+    @Query(value = "INSERT INTO user_friends (user_id, friends) "
+        + "SELECT u.id, CAST(:friendId AS BIGINT) FROM users u WHERE u.id = :userId "
+        + "AND NOT EXISTS (SELECT 1 FROM user_friends f "
+        + "WHERE f.user_id = :userId AND f.friends = :friendId)",
+        nativeQuery = true)
+    int linkFriend(@Param("userId") Long userId, @Param("friendId") Long friendId);
+
+    /**
+     * Removes one directed edge from the friend graph. Returns the number of rows deleted.
+     * Companion to {@link #linkFriend}, and needed for the same reason: the read-modify-write
+     * in {@code FriendService.remove} rewrote the whole collection from a stale snapshot,
+     * so un-friending one person could silently restore an edge someone else had just
+     * removed — or drop one they had just added.
+     */
+    @Transactional
+    @org.springframework.data.jpa.repository.Modifying(clearAutomatically = true, flushAutomatically = true)
+    @Query(value = "DELETE FROM user_friends WHERE user_id = :userId AND friends = :friendId",
+        nativeQuery = true)
+    int unlinkFriend(@Param("userId") Long userId, @Param("friendId") Long friendId);
+
+    /** True when {@code userId} already lists {@code friendId}. Reads the join table directly. */
+    @Query(value = "SELECT COUNT(*) FROM user_friends WHERE user_id = :userId AND friends = :friendId",
+        nativeQuery = true)
+    long countFriendEdge(@Param("userId") Long userId, @Param("friendId") Long friendId);
+
+    /**
      * Adds {@code amount} gems and {@code xp} atomically, in the database.
      *
      * <p>Companion to {@link #deductGemsIfAffordable}, and needed for the same reason.

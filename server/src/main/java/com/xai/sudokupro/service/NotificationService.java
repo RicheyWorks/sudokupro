@@ -12,6 +12,7 @@ import com.xai.sudokupro.config.AsyncConfig;
 import org.springframework.scheduling.annotation.Async;
 import org.springframework.stereotype.Service;
 
+import java.time.Clock;
 import java.time.LocalDateTime;
 import java.util.List;
 import java.util.Objects;
@@ -27,6 +28,8 @@ public class NotificationService {
 
     private static final int MAX_QUEUE_SIZE = 1000;
     private static final long PUSH_RATE_LIMIT_MINUTES = 5;
+    /** Only sweep the cooldown map once it is big enough to be worth sweeping. */
+    private static final int RATE_LIMIT_SWEEP_THRESHOLD = 512;
 
     private final MultiplayerBroadcaster multiplayerBroadcaster;
     private final MeterRegistry meterRegistry;
@@ -35,17 +38,35 @@ public class NotificationService {
 
     private final ConcurrentLinkedQueue<Notification> notificationQueue = new ConcurrentLinkedQueue<>();
     private final ConcurrentHashMap<String, LocalDateTime> lastNotificationTimes = new ConcurrentHashMap<>();
+    /**
+     * Injectable so the cooldown window can be tested for what it actually is — a function
+     * of elapsed time. Every existing test here pins behaviour that happens within one
+     * instant, which is precisely why the eviction gap went unnoticed: you cannot observe
+     * an entry failing to expire if nothing in the suite can make time pass.
+     */
+    private final Clock clock;
 
     @Autowired
     public NotificationService(MultiplayerBroadcaster multiplayerBroadcaster,
                                MeterRegistry meterRegistry,
                                PushSender pushSender,
                                DeviceTokenStore deviceTokenStore) {
+        this(multiplayerBroadcaster, meterRegistry, pushSender, deviceTokenStore,
+            Clock.systemDefaultZone());
+    }
+
+    /** Test seam: same wiring, with a movable clock. */
+    NotificationService(MultiplayerBroadcaster multiplayerBroadcaster,
+                        MeterRegistry meterRegistry,
+                        PushSender pushSender,
+                        DeviceTokenStore deviceTokenStore,
+                        Clock clock) {
 
         this.multiplayerBroadcaster = Objects.requireNonNull(multiplayerBroadcaster);
         this.meterRegistry = Objects.requireNonNull(meterRegistry);
         this.pushSender = Objects.requireNonNull(pushSender);
         this.deviceTokenStore = Objects.requireNonNull(deviceTokenStore);
+        this.clock = Objects.requireNonNull(clock);
 
         meterRegistry.gauge("sudokupro.notification.queue.size", notificationQueue, Queue::size);
     }
@@ -69,7 +90,7 @@ public class NotificationService {
 
             if (shouldSendPush(playerId)) {
                 queuePushNotification(notification);
-                lastNotificationTimes.put(playerId, LocalDateTime.now());
+                recordPushSent(playerId);
             }
 
             trimQueue();
@@ -100,7 +121,7 @@ public class NotificationService {
 
             if (shouldSendPush(playerId)) {
                 queuePushNotification(notification);
-                lastNotificationTimes.put(playerId, LocalDateTime.now());
+                recordPushSent(playerId);
             }
 
             trimQueue();
@@ -149,7 +170,7 @@ public class NotificationService {
         // AUDIT P1-5 was replaced, not restored).
         String playerId = notification.playerId();
         if (shouldSendPush(playerId)) {
-            lastNotificationTimes.put(playerId, LocalDateTime.now());
+            recordPushSent(playerId);
             deliverPush(notification);
         }
     }
@@ -173,9 +194,36 @@ public class NotificationService {
         }, () -> logger.debug("Push skipped for {} — no device token registered", playerId));
     }
 
+    /**
+     * Stamps a push against {@code playerId} and opportunistically evicts entries that can
+     * no longer affect a decision.
+     *
+     * <p>The map was write-only: every distinct player who ever received a push added a key
+     * and nothing removed it, so on a long-lived server it grew with the total player
+     * population rather than the active one. It is not a cache — it is a cooldown window,
+     * and an entry older than {@link #PUSH_RATE_LIMIT_MINUTES} is indistinguishable from an
+     * absent one: {@link #shouldSendPush} returns true for both. Dropping stale entries is
+     * therefore behaviour-preserving by construction, not a heuristic.
+     *
+     * <p>The sweep runs only when the map is larger than {@link #RATE_LIMIT_SWEEP_THRESHOLD},
+     * so the ordinary path stays a single put.
+     */
+    private void recordPushSent(String playerId) {
+        lastNotificationTimes.put(playerId, LocalDateTime.now(clock));
+        if (lastNotificationTimes.size() > RATE_LIMIT_SWEEP_THRESHOLD) {
+            LocalDateTime cutoff = LocalDateTime.now(clock).minusMinutes(PUSH_RATE_LIMIT_MINUTES);
+            lastNotificationTimes.values().removeIf(t -> t.isBefore(cutoff));
+        }
+    }
+
+    /** Test/observability hook: how many players currently hold a cooldown stamp. */
+    int rateLimitWindowSize() {
+        return lastNotificationTimes.size();
+    }
+
     private boolean shouldSendPush(String playerId) {
         LocalDateTime last = lastNotificationTimes.get(playerId);
-        return last == null || last.isBefore(LocalDateTime.now().minusMinutes(PUSH_RATE_LIMIT_MINUTES));
+        return last == null || last.isBefore(LocalDateTime.now(clock).minusMinutes(PUSH_RATE_LIMIT_MINUTES));
     }
 
     private void trimQueue() {

@@ -32,10 +32,12 @@ class FriendServiceTest {
     private final Map<Long, User> byId = new ConcurrentHashMap<>();
     private final AtomicLong ids = new AtomicLong(1);
     private FriendService service;
+    private UserRepository repoSpy;
 
     @BeforeEach
     void setUp() {
         UserRepository repo = mock(UserRepository.class);
+        this.repoSpy = repo;
         lenient().when(repo.findByUsername(anyString()))
             .thenAnswer(inv -> Optional.ofNullable(byName.get(inv.<String>getArgument(0))));
         lenient().when(repo.saveAndFlush(any(User.class))).thenAnswer(inv -> {
@@ -51,6 +53,28 @@ class FriendServiceTest {
             byName.put(u.getUsername(), u);
             byId.put(u.getId(), u);
             return u;
+        });
+        // The friend graph is now written edge-at-a-time through the repository rather than
+        // by rewriting User.friends and calling save() — see UserRepository.linkFriend. The
+        // fake below applies the same semantics to the in-memory users so these tests keep
+        // exercising the real service logic.
+        lenient().when(repo.linkFriend(any(), any())).thenAnswer(inv -> {
+            User u = byId.get(inv.<Long>getArgument(0));
+            Long friendId = inv.getArgument(1);
+            if (u == null || u.getFriends().contains(friendId)) return 0;
+            u.addFriend(friendId);
+            return 1;
+        });
+        lenient().when(repo.unlinkFriend(any(), any())).thenAnswer(inv -> {
+            User u = byId.get(inv.<Long>getArgument(0));
+            Long friendId = inv.getArgument(1);
+            if (u == null || !u.getFriends().contains(friendId)) return 0;
+            u.removeFriend(friendId);
+            return 1;
+        });
+        lenient().when(repo.countFriendEdge(any(), any())).thenAnswer(inv -> {
+            User u = byId.get(inv.<Long>getArgument(0));
+            return (u != null && u.getFriends().contains(inv.<Long>getArgument(1))) ? 1L : 0L;
         });
         lenient().when(repo.findAllById(any())).thenAnswer(inv -> {
             List<User> out = new ArrayList<>();
@@ -135,5 +159,88 @@ class FriendServiceTest {
 
         assertTrue(service.friendsOf("richmond").isEmpty());
         assertTrue(service.friendsOf("ada").isEmpty());
+    }
+
+    /**
+     * Requesting someone who is already your friend must be refused.
+     *
+     * <p>Nothing checked, so the friends screen's "Add friend" could be pointed at an
+     * existing friend indefinitely: each call re-notified them and re-armed a pending
+     * request that, once accepted, re-ran the edge writes. A friendship is not a thing you
+     * can be asked for twice.
+     */
+    @Test
+    void requestingAnExistingFriendIsRejected() {
+        givenPlayerExists("ada");
+        service.request("richmond", "ada");
+        service.accept("ada", "richmond");
+
+        IllegalArgumentException e = assertThrows(IllegalArgumentException.class,
+            () -> service.request("richmond", "ada"));
+        assertTrue(e.getMessage().contains("already your friend"), e.getMessage());
+    }
+
+    /**
+     * A repeated request must not generate a second notification.
+     *
+     * <p>The pending set deduplicated the entry — but the notify() call sat outside that
+     * check and fired unconditionally, so a loop over the same endpoint produced an
+     * unlimited stream of "X wants to be your friend" in the target's app. The push channel
+     * has a five-minute cooldown; the WebSocket one, which is the notification the player
+     * actually sees, has none.
+     */
+    @Test
+    void repeatedFriendRequestsDoNotSpamTheTarget() {
+        givenPlayerExists("ada");
+
+        for (int i = 0; i < 25; i++) service.request("richmond", "ada");
+
+        verify(notificationService, times(1))
+            .sendTypedNotification(eq("ada"), eq("FRIEND"), contains("wants to be your friend"));
+        assertEquals(Set.of("richmond"), service.pendingFor("ada"),
+            "the inbox holds one entry per requester, however many times they ask");
+    }
+
+    /**
+     * The pending inbox has a ceiling. Without one, N accounts could each leave an entry
+     * (each carrying a 14-day Redis key) with nothing bounding the set.
+     */
+    @Test
+    void aPendingInboxIsBounded() {
+        givenPlayerExists("ada");
+        for (int i = 0; i < FriendService.MAX_PENDING_PER_PLAYER; i++) {
+            service.request("spammer-" + i, "ada");
+        }
+        assertEquals(FriendService.MAX_PENDING_PER_PLAYER, service.pendingFor("ada").size());
+
+        assertThrows(IllegalStateException.class, () -> service.request("one-too-many", "ada"),
+            "past the cap a new requester must be refused, not silently dropped");
+        assertFalse(service.pendingFor("ada").contains("one-too-many"));
+    }
+
+    /**
+     * Accepting must write both edges through the atomic per-edge repository calls rather
+     * than by rewriting each user's whole friend collection.
+     *
+     * <p>{@code User.friends} is an {@code @ElementCollection}: Hibernate persists a change
+     * to one by deleting every row for that user and reinserting the set it holds in
+     * memory. Two accepts touching the same person concurrently therefore each write a full
+     * snapshot and the later one erases the earlier — and because accept writes two
+     * independent directions, losing one leaves a permanent ONE-WAY friendship with no
+     * pending request left to retry from. This pins the shape of the fix; the race itself
+     * is a database-level property the unit test cannot reproduce.
+     */
+    @Test
+    void acceptWritesEachFriendEdgeAtomicallyRatherThanRewritingTheCollection() {
+        givenPlayerExists("ada");
+        service.request("richmond", "ada");
+        Long adaId = byName.get("ada").getId();
+
+        service.accept("ada", "richmond");
+        Long richmondId = byName.get("richmond").getId();
+
+        verify(repoSpy).linkFriend(adaId, richmondId);
+        verify(repoSpy).linkFriend(richmondId, adaId);
+        verify(repoSpy, never()).save(argThat(u -> "ada".equals(u.getUsername())));
     }
 }

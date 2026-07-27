@@ -533,6 +533,26 @@ public class SudokuBoard implements Serializable {
         }
     }
 
+    /**
+     * Drops the trailing {@code replayHistory} entry that corresponds to a move just popped
+     * off {@code moveHistory}.
+     *
+     * <p>Every writer appends to both lists in the same order and one-for-one — makeMove,
+     * applyExternalMove, applyBatchMoves, applyMirrorMove, autoSolve and redo all do. So the
+     * last replay entry always describes the last move, and undoing a move means retracting
+     * its replay entry too.
+     *
+     * <p>This did not exist, and {@code redo()} appends unconditionally, so an
+     * undo/redo/undo/redo cycle grew {@code replayHistory} by one entry per redo and never
+     * shrank it. That is a live WebSocket path — a player tapping undo/redo while thinking
+     * grows an unbounded in-memory list on the server, and every export, jump and replay
+     * afterwards replays the same move over and over as though the player had entered it
+     * repeatedly. The board state stayed correct, which is why nothing caught it.
+     */
+    private void dropLastReplayEntry() {
+        if (!replayHistory.isEmpty()) replayHistory.remove(replayHistory.size() - 1);
+    }
+
     public synchronized void undo() {
         if (moveHistory.isEmpty()) return;
         Move move = moveHistory.pop();
@@ -540,6 +560,7 @@ public class SudokuBoard implements Serializable {
         // setValue() would reset the source to UNKNOWN.
         board[move.row()][move.col()].setValue(move.oldVal(), move.oldSource());
         redoStack.push(move);
+        dropLastReplayEntry();
         // In mirror mode one player action writes two cells and pushes two entries (the
         // twin last). Undoing only the twin left the primary cell filled, so the move
         // could not be cleanly taken back. Revert the pair as a unit.
@@ -547,13 +568,25 @@ public class SudokuBoard implements Serializable {
             Move primary = moveHistory.pop();
             board[primary.row()][primary.col()].setValue(primary.oldVal(), primary.oldSource());
             redoStack.push(primary);
+            dropLastReplayEntry();
         }
         usedUndo = true;
         cosmicDripLevel = calculateCosmicDripLevel();
         refreshSolvedState();
     }
 
-    /** Returns the re-applied move, or null if nothing to redo. */
+    /**
+     * Re-applies the most recently undone move. Returns the re-applied move — the PRIMARY
+     * one in mirror mode — or null if there is nothing to redo.
+     *
+     * <p>Mirror mode writes two cells per player action, and {@code undo} reverts both and
+     * pushes both (twin first, so the primary ends up on top). Redo used to pop exactly one,
+     * which restored the primary cell and left its twin empty: the board came back in a state
+     * the game cannot otherwise produce, and — because the twin's {@code Move} was still
+     * sitting on the redo stack — the next redo would fill a mirrored cell with no visible
+     * cause. That half-state persists, since the board is serialized to Redis and the database
+     * as-is. Redo now restores the pair as one unit, mirroring what undo takes back.
+     */
     public synchronized EnhancedMove redo() {
         if (redoStack.isEmpty()) return null;
         Move move = redoStack.pop();
@@ -563,6 +596,15 @@ public class SudokuBoard implements Serializable {
         moveHistory.push(move);
         EnhancedMove em = new EnhancedMove(move.row(), move.col(), move.oldVal(), move.newVal(), move.source());
         replayHistory.add(em);
+        // The twin sits immediately beneath its primary on the redo stack (undo pushed it
+        // first). Restore it in the same action so the pair is never half-applied.
+        if (!redoStack.isEmpty() && redoStack.peek().mirrored()) {
+            Move twin = redoStack.pop();
+            board[twin.row()][twin.col()].setValue(twin.newVal(), twin.source());
+            moveHistory.push(twin);
+            replayHistory.add(new EnhancedMove(twin.row(), twin.col(), twin.oldVal(),
+                twin.newVal(), twin.source()));
+        }
         cosmicDripLevel = calculateCosmicDripLevel();
         refreshSolvedState();
         return em;
@@ -757,10 +799,15 @@ public class SudokuBoard implements Serializable {
         // Fix: was 'synchronized' but called Thread.sleep() inside the loop, blocking every
         // other board operation for the full replay duration. Snapshot the history under a
         // brief lock, then apply each move (locked individually) and sleep without the lock.
+        //
+        // Second fix: the snapshot was taken AFTER reset(), and reset() clears
+        // replayHistory. So the snapshot was always empty and the loop below never ran —
+        // "watch this game back" cleared the player's board, printed nothing, and destroyed
+        // the very history it was about to replay. Snapshot first, then reset.
         List<EnhancedMove> snapshot;
         synchronized (this) {
-            reset();
             snapshot = new java.util.ArrayList<>(replayHistory);
+            reset();
         }
         for (EnhancedMove move : snapshot) {
             synchronized (this) {
@@ -782,23 +829,51 @@ public class SudokuBoard implements Serializable {
         }
     }
 
+    /**
+     * Rewinds the board to the state it held immediately after move {@code index}.
+     *
+     * <p>This threw {@link IndexOutOfBoundsException} on every call it did not reject, and
+     * wiped the board on the way out. {@code reset()} clears {@code replayHistory}, and the
+     * {@code subList} view was taken <em>after</em> the reset — so the bounds check passed
+     * against the real history, then the list it indexed into was empty. A scrub-bar drag,
+     * a post-game review, any jump at all: board cleared, exception thrown, history gone.
+     * Only {@code index == 0} on an empty history escaped, by returning early.
+     *
+     * <p>The snapshot is now taken first, and copied rather than viewed — {@code subList}
+     * returns a live window onto {@code replayHistory}, which {@code applyBatchMoves}
+     * appends to as it goes.
+     */
     public synchronized void jumpToMove(int index) {
         if (index < 0 || index >= replayHistory.size()) return;
+        List<EnhancedMove> upTo = new ArrayList<>(replayHistory.subList(0, index + 1));
         reset();
-        applyBatchMoves(replayHistory.subList(0, index + 1));
+        applyBatchMoves(upTo);
     }
 
+    /**
+     * Replaces the board's history with a replay timeline previously produced by
+     * {@link #exportMoveTimelineJson()}.
+     *
+     * <p>Parsing is now complete before anything is destroyed. It used to {@code reset()}
+     * and then map the timeline, so a single malformed entry — a missing {@code row} key
+     * (NPE), a non-numeric value (ClassCastException), a {@code source} that is not a
+     * {@link SudokuCell.MoveSource} (IllegalArgumentException) — cleared the player's board
+     * and every move they had made, and only then threw. The caller sees
+     * "Invalid replay JSON" and reasonably assumes nothing happened; the game is already
+     * gone. Rejecting bad input must leave the board exactly as it was.
+     */
     public synchronized void loadReplayFromJson(String json) {
+        List<EnhancedMove> moves;
         try {
             List<Map<String,Object>> timeline = MAPPER.readValue(json, new TypeReference<>(){});
-            reset();
-            List<EnhancedMove> moves = timeline.stream().map(d -> new EnhancedMove(
+            moves = timeline.stream().map(d -> new EnhancedMove(
                 ((Number)d.get("row")).intValue(), ((Number)d.get("col")).intValue(),
                 ((Number)d.get("from")).intValue(), ((Number)d.get("to")).intValue(),
                 SudokuCell.MoveSource.valueOf((String)d.get("source"))
             )).collect(Collectors.toList());
-            applyBatchMoves(moves);
         } catch (Exception e) { throw new IllegalArgumentException("Invalid replay JSON", e); }
+        reset();
+        applyBatchMoves(moves);
     }
 
     public synchronized String exportMoveTimelineJson() {
@@ -1034,7 +1109,23 @@ public class SudokuBoard implements Serializable {
     }
     public SudokuCell getCell(int r,int c) { return board[r][c].clone(); }
 
-    public boolean isCellEditable(int r,int c) { return !board[r][c].isGiven(); }
+    /**
+     * True when {@code r,c} is a real cell on this board and is not a clue.
+     *
+     * <p>The bounds check is defence in depth, and deliberately so. The {@link EnhancedMove}
+     * constructor rejects coordinates outside 0..8, so every move that arrives as a record
+     * is already in range — but this method also takes raw ints, is public, and is the FIRST
+     * thing each apply path calls. Without the guard an out-of-range argument reaches the
+     * array index and surfaces as {@link ArrayIndexOutOfBoundsException} from deep inside
+     * the board rather than as a rejected move. That exact shape has been shipped here once
+     * before: {@code EnhancedMove} used to allow row -1, and the symptom was a raw
+     * "Index -1 out of bounds for length 9" over the WebSocket. Returning false routes an
+     * off-board coordinate through the ordinary rejected-move path instead.
+     */
+    public boolean isCellEditable(int r,int c) {
+        if (r < 0 || r >= size || c < 0 || c >= size) return false;
+        return !board[r][c].isGiven();
+    }
 
     public int getDifficulty()  { return difficulty; }
     public void setDifficulty(int d) { this.difficulty = d; }
