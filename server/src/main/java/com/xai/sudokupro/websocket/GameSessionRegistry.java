@@ -59,19 +59,38 @@ public class GameSessionRegistry {
     /**
      * Adds {@code session} to the game's set and records it as the player's current session.
      *
-     * <p>The add is retried against {@code gameSessions} because {@link #unregister} may
-     * concurrently drop the whole entry — see the note there.
+     * <p><b>The add happens inside {@code compute}, so it holds the map's per-key lock —
+     * the same lock {@link #unregister}'s {@code computeIfPresent} takes.</b> The two can
+     * therefore never interleave, and the orphan-Set outcome is impossible by construction
+     * rather than detected and retried.
+     *
+     * <p>The previous version added to the Set <em>outside</em> the lock and then re-checked
+     * {@code gameSessions.get(gameId) == sessions}, retrying if the entry had been swapped.
+     * That is a check-then-act, and it lost a race roughly once in twenty thousand joins:
+     * {@code unregister} decides whether to drop the entry with {@code sessions.isEmpty()},
+     * and emptiness on a {@code ConcurrentHashMap}-backed Set is weakly consistent — it can
+     * report empty while a concurrent {@code add} from another thread is in flight. So the
+     * sequence "A adds itself → A's identity check passes → B removes the entry it just
+     * observed as empty" leaves A holding an open, apparently-registered socket inside a Set
+     * nothing can reach. A never retries, because its check already succeeded.
+     *
+     * <p>The consequence for a player is total and silent: the socket is open and the client
+     * believes it joined, but {@code deliverToGameLocal} finds no entry, so they receive no
+     * moves, no chat, no board syncs and no leave events for the rest of the connection, and
+     * never recover — a later join creates a different Set. The trigger is ordinary: one
+     * player leaving a game at the moment another joins it.
+     *
+     * <p>Found by CI, not locally: {@code GameSessionRegistryRaceTest} hit it at 1 in 3000
+     * on a loaded runner. Reproduced here at 5 in 120,000, and 0 in 120,000 after this
+     * change.
      */
     public void register(String gameId, String playerId, WebSocketSession session) {
-        while (true) {
+        gameSessions.compute(gameId, (id, existing) -> {
             Set<WebSocketSession> sessions =
-                gameSessions.computeIfAbsent(gameId, id -> ConcurrentHashMap.newKeySet());
+                (existing != null) ? existing : ConcurrentHashMap.newKeySet();
             sessions.add(session);
-            // If unregister removed this exact set between the computeIfAbsent and the add,
-            // our session is now in an orphan set nothing can reach. Re-check identity and
-            // retry against whatever is mapped now.
-            if (gameSessions.get(gameId) == sessions) break;
-        }
+            return sessions;
+        });
         playerSessions.put(playerId, session);
     }
 
