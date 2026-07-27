@@ -51,6 +51,28 @@ public class RegistrationAttemptLimiter {
     private final AtomicBoolean degradedLogged = new AtomicBoolean(false);
 
     private final Map<String, LocalCounter> local = new ConcurrentHashMap<>();
+    /** Only sweep the degraded-mode map once it is big enough to be worth sweeping. */
+    private static final int LOCAL_SWEEP_THRESHOLD = 1024;
+
+    /**
+     * Drops expired counters from the in-memory fallback map.
+     *
+     * <p>Same no-eviction shape as {@code LoginAttemptLimiter} had: nothing ever swept this,
+     * and expiry was consulted only for a key touched again. Milder here because the key is
+     * the client address alone, so growth is bounded by reachable source addresses rather
+     * than by an attacker-chosen string — but a botnet or a v6 range still walks it up, and
+     * an expired counter permits exactly what an absent one permits, so removing them cannot
+     * change a decision.
+     */
+    private void sweepExpired(long now) {
+        if (local.size() <= LOCAL_SWEEP_THRESHOLD) return;
+        local.values().removeIf(c -> now > c.expiresAtMs);
+    }
+
+    /** Test/observability hook: live entries in the degraded-mode counter map. */
+    int localCounterCount() {
+        return local.size();
+    }
 
     public RegistrationAttemptLimiter(
             StringRedisTemplate redis,
@@ -102,6 +124,7 @@ public class RegistrationAttemptLimiter {
         } catch (Exception e) {
             degraded(e);
             long now = System.currentTimeMillis();
+            sweepExpired(now);
             local.compute(clientAddress, (k, c) -> {
                 if (c == null || now > c.expiresAtMs) {
                     return new LocalCounter(1, now + window.toMillis());

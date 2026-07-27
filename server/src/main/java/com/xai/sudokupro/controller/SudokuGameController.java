@@ -41,13 +41,16 @@ public class SudokuGameController {
     private final GameService gameService;
     private final AuthService authService;
     private final com.xai.sudokupro.service.SmartDifficultyService smartDifficulty;
+    private final com.xai.sudokupro.service.social.FriendService friends;
 
     @Autowired
     public SudokuGameController(GameService gameService, AuthService authService,
-                                com.xai.sudokupro.service.SmartDifficultyService smartDifficulty) {
+                                com.xai.sudokupro.service.SmartDifficultyService smartDifficulty,
+                                com.xai.sudokupro.service.social.FriendService friends) {
         this.gameService  = gameService;
         this.authService  = authService;
         this.smartDifficulty = smartDifficulty;
+        this.friends = friends;
     }
 
     @Operation(summary = "Create a new Sudoku game with specified difficulty")
@@ -203,9 +206,44 @@ public class SudokuGameController {
             smartDifficulty.recommendedDifficulty(authService.getCurrentPlayerId())));
     }
 
-    @Operation(summary = "The player's current active game id (for spectating). Per-pod lookup.")
+    /**
+     * The player's current active game id, for spectating. Per-pod lookup.
+     *
+     * <p><b>Entitlement check added.</b> This was the one handler in the codebase that took
+     * a player identity straight off the request and never consulted
+     * {@code authService.getCurrentPlayerId()} at all — {@code findActiveGameForPlayer}
+     * scans {@code activeGames} by owner and takes no requester argument. Usernames are
+     * public (the leaderboards return them), so any authenticated account could name any
+     * other and learn two things it had no right to.
+     *
+     * <p>First, presence: whether that person is playing right now. That is exactly what
+     * {@code FriendService.friendsOf} gates behind an accepted friendship, so this was a
+     * way around the friends model entirely — a stranger could poll it to track when
+     * someone is online.
+     *
+     * <p>Second, and worse, the game id itself. For a casual board that id is an
+     * unguessable UUID, and being unguessable is the ONLY thing protecting it:
+     * {@code getGameForReader} deliberately lets anyone read a casual board so share links
+     * work. Handing out the id on request removes the protection. For competitive boards it
+     * returned ids of the form {@code duel-<id>:<victim>}, disclosing live duels and who is
+     * in them.
+     *
+     * <p>The audit that fixed the two competitive read paths named this endpoint as "a
+     * discovery aid for both" and then left it open. Access now requires that you are the
+     * player, or that you and the player are friends — the same relationship the rest of
+     * the presence surface already requires.
+     */
+    @Operation(summary = "The player's current active game id (for spectating). Friends only.")
     @GetMapping("/active-of/{playerId}")
     public ResponseEntity<Object> activeGameOf(@PathVariable String playerId) {
+        String requester = authService.getCurrentPlayerId();
+        if (!requester.equals(playerId) && !friends.areFriends(requester, playerId)) {
+            // Deliberately the same response as "not playing": telling a stranger that they
+            // are not entitled to know still tells them the account exists and, over time,
+            // when it is active. The 404 reveals nothing either way.
+            return problemResponse(HttpStatus.NOT_FOUND, "No Active Game",
+                playerId + " is not playing right now");
+        }
         String gameId = gameService.findActiveGameForPlayer(playerId);
         if (gameId == null) {
             return problemResponse(HttpStatus.NOT_FOUND, "No Active Game",

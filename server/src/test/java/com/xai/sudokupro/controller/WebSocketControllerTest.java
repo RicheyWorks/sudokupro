@@ -17,6 +17,7 @@ import java.security.Principal;
 import java.util.HashMap;
 import java.util.Map;
 
+import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.argThat;
 import static org.mockito.ArgumentMatchers.anyBoolean;
@@ -298,6 +299,125 @@ class WebSocketControllerTest {
             ((org.springframework.web.socket.TextMessage) msg).getPayload().contains("\"type\":\"error\"")));
         verify(watcher).sendMessage(argThat(msg ->
             ((org.springframework.web.socket.TextMessage) msg).getPayload().contains("\"type\":\"board\"")));
+    }
+
+    /**
+     * The frame budget belongs to the PLAYER, not to the connection.
+     *
+     * <p>Keyed on the {@code WebSocketSession}, the throttle was self-defeating: the session
+     * is a resource the caller creates at will, and nothing capped how many they could hold,
+     * so every new socket handed out a fresh 20/s budget. One account opening sockets in a
+     * loop got an unbounded aggregate rate against a single board — and every frame takes
+     * the cross-replica game lock, which is exactly the starvation the throttle was written
+     * to prevent. The board's owner then failed every move, hint and undo with "busy on
+     * another server instance" after a 3-second stall.
+     *
+     * <p>Two sockets, same player: the second must inherit the first's exhausted budget.
+     */
+    @Test
+    void asecondSocketDoesNotGrantTheSamePlayerAFreshFrameBudget() throws Exception {
+        WebSocketSession first = connectedSession("richmond");
+        for (int i = 0; i < 400; i++) {
+            controller.handleTextMessage(first,
+                new org.springframework.web.socket.TextMessage("{\"type\":\"unknown-junk\"}"));
+        }
+        int callsAfterFirstSocketDrained =
+            org.mockito.Mockito.mockingDetails(gameService).getInvocations().size();
+
+        WebSocketSession second = connectedSession2("richmond");
+        for (int i = 0; i < 400; i++) {
+            controller.handleTextMessage(second,
+                new org.springframework.web.socket.TextMessage("{\"type\":\"unknown-junk\"}"));
+        }
+
+        int callsAfterSecondSocket =
+            org.mockito.Mockito.mockingDetails(gameService).getInvocations().size();
+        // The second socket may earn a few tokens from refill during the test, but it must
+        // not start over at full capacity — that is what a per-session budget did.
+        assertTrue(callsAfterSecondSocket - callsAfterFirstSocketDrained < 40,
+            "a second socket must inherit the player's drained budget, not receive a new one; "
+                + "extra gameService calls: " + (callsAfterSecondSocket - callsAfterFirstSocketDrained));
+        verify(second, org.mockito.Mockito.atLeastOnce()).sendMessage(argThat(msg ->
+            ((org.springframework.web.socket.TextMessage) msg).getPayload().contains("Too many messages")));
+    }
+
+    /**
+     * A per-player budget is only meaningful if the number of players' sockets is bounded.
+     * Past the cap the connection is refused rather than served.
+     */
+    @Test
+    void aPlayerCannotHoldUnlimitedConcurrentSockets() throws Exception {
+        for (int i = 0; i < WebSocketController.MAX_SOCKETS_PER_PLAYER; i++) {
+            connectedSession2("greedy");
+        }
+
+        WebSocketSession overTheLimit = rawSession("greedy");
+        controller.afterConnectionEstablished(overTheLimit);
+
+        verify(overTheLimit).close(argThat((CloseStatus s) ->
+            s.getReason() != null && s.getReason().contains("Too many connections")));
+    }
+
+    /**
+     * Closing a socket frees its slot — otherwise ordinary reconnection walks a player into
+     * a permanent lockout.
+     */
+    @Test
+    void closingASocketReturnsItsSlot() throws Exception {
+        for (int i = 0; i < WebSocketController.MAX_SOCKETS_PER_PLAYER; i++) {
+            WebSocketSession s = connectedSession2("busy");
+            controller.afterConnectionClosed(s, CloseStatus.NORMAL);
+        }
+
+        WebSocketSession another = rawSession("busy");
+        controller.afterConnectionEstablished(another);
+
+        verify(another, never()).close(argThat((CloseStatus s) ->
+            s.getReason() != null && s.getReason().contains("Too many connections")));
+    }
+
+    /**
+     * The HANDSHAKE is throttled too, not just the frames that follow it.
+     *
+     * <p>A handshake carrying no gameId runs the generator and persists a board row, and the
+     * frame bucket does not exist until a connection is established — so a
+     * connect/disconnect loop was unbounded database growth that the concurrent-socket cap
+     * cannot see, because each socket closes before the next opens.
+     */
+    @Test
+    void aConnectDisconnectLoopIsThrottledRatherThanMintingUnboundedGames() throws Exception {
+        for (int i = 0; i < 60; i++) {
+            WebSocketSession s = rawSession("looper");
+            controller.afterConnectionEstablished(s);
+            controller.afterConnectionClosed(s, CloseStatus.NORMAL);
+        }
+
+        verify(gameService, org.mockito.Mockito.atMost(20))
+            .createNewGame(anyInt(), eq("looper"), anyBoolean(), anyBoolean());
+    }
+
+    /** An unconnected mock session for a given player, with no handshake performed. */
+    private WebSocketSession rawSession(String player) {
+        WebSocketSession s = mock(WebSocketSession.class);
+        Map<String, Object> attrs = new HashMap<>();
+        lenient().when(s.getAttributes()).thenReturn(attrs);
+        lenient().when(s.getId()).thenReturn("sess-" + System.nanoTime());
+        lenient().when(s.isOpen()).thenReturn(true);
+        Principal principal = () -> player;
+        lenient().when(s.getPrincipal()).thenReturn(principal);
+        SudokuBoard board = new SudokuBoard(1, false, false, 0, "real-game-id");
+        board.setPlayerId(player);
+        lenient().when(gameService.createNewGame(anyInt(), eq(player), anyBoolean(), anyBoolean()))
+            .thenReturn(board);
+        lenient().when(gameService.getGame("real-game-id")).thenReturn(board);
+        return s;
+    }
+
+    /** Like {@link #connectedSession}, but a distinct mock each call so several can coexist. */
+    private WebSocketSession connectedSession2(String player) throws Exception {
+        WebSocketSession s = rawSession(player);
+        controller.afterConnectionEstablished(s);
+        return s;
     }
 
     private WebSocketSession connectedSession(String player) throws Exception {

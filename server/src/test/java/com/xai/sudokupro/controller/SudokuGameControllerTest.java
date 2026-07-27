@@ -25,13 +25,14 @@ class SudokuGameControllerTest {
     @Mock private GameService gameService;
     @Mock private AuthService authService;
     @Mock private com.xai.sudokupro.service.SmartDifficultyService smartDifficulty;
+    @Mock private com.xai.sudokupro.service.social.FriendService friends;
 
     private SudokuGameController controller;
     private SudokuBoard board;
 
     @BeforeEach
     void setUp() {
-        controller = new SudokuGameController(gameService, authService, smartDifficulty);
+        controller = new SudokuGameController(gameService, authService, smartDifficulty, friends);
         board = new SudokuBoard(1, false, false, 0, "g-1");
         board.setPlayerId("richmond");
     }
@@ -157,5 +158,52 @@ class SudokuGameControllerTest {
         var list = (java.util.List<?>) response.getBody();
         assertEquals(1, list.size());
         assertInstanceOf(BoardState.class, list.get(0));
+    }
+
+    /**
+     * {@code GET /api/game/active-of/{playerId}} was the one handler that took a player
+     * identity off the request and never consulted the authenticated principal at all.
+     *
+     * <p>Usernames are public — both leaderboards return them — so any authenticated account
+     * could name any other and learn whether they are playing right now (bypassing the
+     * friends-gated presence model entirely) and, worse, their live gameId. For a casual
+     * board that id is an unguessable UUID, and being unguessable is the ONLY thing
+     * protecting it: {@code getGameForReader} deliberately lets anyone read a casual board so
+     * share links work. For competitive boards it returned ids of the form
+     * {@code duel-<id>:<victim>}, disclosing live duels and who is in them.
+     */
+    @Test
+    void aStrangerCannotDiscoverAnotherPlayersLiveGameId() {
+        when(authService.getCurrentPlayerId()).thenReturn("stranger");
+        when(friends.areFriends("stranger", "richmond")).thenReturn(false);
+
+        ResponseEntity<Object> response = controller.activeGameOf("richmond");
+
+        org.junit.jupiter.api.Assertions.assertEquals(404, response.getStatusCode().value());
+        verify(gameService, never()).findActiveGameForPlayer(anyString());
+    }
+
+    /** A friend may still spectate — that is the feature the endpoint exists for. */
+    @Test
+    void aFriendCanStillLookUpTheActiveGame() {
+        when(authService.getCurrentPlayerId()).thenReturn("ada");
+        when(friends.areFriends("ada", "richmond")).thenReturn(true);
+        when(gameService.findActiveGameForPlayer("richmond")).thenReturn("g-1");
+
+        ResponseEntity<Object> response = controller.activeGameOf("richmond");
+
+        org.junit.jupiter.api.Assertions.assertEquals(200, response.getStatusCode().value());
+    }
+
+    /** And a player can always look up their own. */
+    @Test
+    void aPlayerCanLookUpTheirOwnActiveGame() {
+        when(authService.getCurrentPlayerId()).thenReturn("richmond");
+        when(gameService.findActiveGameForPlayer("richmond")).thenReturn("g-1");
+
+        ResponseEntity<Object> response = controller.activeGameOf("richmond");
+
+        org.junit.jupiter.api.Assertions.assertEquals(200, response.getStatusCode().value());
+        verify(friends, never()).areFriends(anyString(), anyString());
     }
 }

@@ -51,8 +51,8 @@ class EventEngineTest {
             .thenReturn(List.of());
         engine = new EventEngine(userRepository, antiCheatEngine, analyticsService,
             sudokuGenerator, gameRepository, broadcaster);
-        // The constructor self-starts three fixed-rate schedules with an initial delay of
-        // zero, so let that opening burst land before measuring anything.
+        // The constructor no longer self-starts anything — see the note below. Settling
+        // here anyway keeps the timing shape of these tests honest.
         settle();
     }
 
@@ -103,5 +103,30 @@ class EventEngineTest {
 
         assertDoesNotThrow(engine::triggerDripShowdown,
             "a failed cycle must be logged and contained, not thrown at the scheduler");
+    }
+
+    /**
+     * The constructor must NOT install recurring schedules.
+     *
+     * <p>It used to, and {@link com.xai.sudokupro.service.EventScheduler} independently
+     * drives the very same cycles on the very same periods — so every cosmic event fired
+     * TWICE per period per pod. {@code EventScheduler}'s gap guard is its own in-memory map
+     * and could not see this engine's executor, so it never suppressed the duplicates.
+     *
+     * <p>The players felt it: {@code runDripShowdown} broadcasts to every connected client,
+     * so a 15-minute showdown announced itself twice per period — 192 toasts a day instead
+     * of 96, tripled across three replicas — and {@code runCosmicDuel} sent duplicate duel
+     * invitations naming different game ids to each eligible streaker.
+     */
+    @Test
+    void constructingTheEngineDoesNotStartRecurringEventCycles() {
+        clearInvocations(broadcaster);
+
+        settle();
+
+        verifyNoInteractions(broadcaster);
+        assertTrue(engine.getActiveEvents().isEmpty(),
+            "a freshly constructed engine must run no cycles of its own — EventScheduler "
+                + "is the single driver, and two drivers means every event fires twice");
     }
 }

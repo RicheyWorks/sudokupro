@@ -65,10 +65,32 @@ public class EventEngine {
         this.sudokuGenerator = Objects.requireNonNull(sudokuGenerator, "SudokuGenerator cannot be null");
         this.gameRepository = Objects.requireNonNull(gameRepository, "GameRepository cannot be null");
         this.multiplayerBroadcaster = Objects.requireNonNull(multiplayerBroadcaster, "MultiplayerBroadcaster cannot be null");
-        startCosmicEvents();
         logger.info("EventEngine initialized with cosmic swagger");
     }
 
+    /**
+     * Installs the three recurring event cycles on this engine's own executor.
+     *
+     * <p><b>Not called from the constructor any more, and nothing calls it.</b> It used to
+     * be, and the result was that every cosmic event fired TWICE per period: once from this
+     * executor and once from {@link EventScheduler}, which drives the very same cycles
+     * ({@code triggerDailyChallenge}/{@code triggerCosmicDuel}/{@code triggerDripShowdown})
+     * on the very same periods. {@code EventScheduler}'s gap guard is its own in-memory map,
+     * so it could not see this executor's firings and never suppressed them.
+     *
+     * <p>The visible symptom was noise aimed at players: {@code runDripShowdown} broadcasts
+     * to every connected client, so a 15-minute showdown announced itself twice per period
+     * per pod — 192 toasts a day instead of 96, and three times that across three replicas.
+     * {@code runCosmicDuel} sends a direct invitation to each eligible streaker, so those
+     * players received duplicate duel invites naming different game ids. Board generation
+     * was duplicated at the same rate against a three-thread pool.
+     *
+     * <p>{@link EventScheduler} is now the single driver. It is the Spring-managed component,
+     * it carries the retry policy, and it is where a cross-replica guard belongs. This method
+     * is kept rather than deleted because it is the natural place for this note, and because
+     * calling it is the exact mistake worth naming — do not wire it back into the
+     * constructor.
+     */
     public void startCosmicEvents() {
         scheduleDailyChallenge();
         scheduleCosmicDuel();

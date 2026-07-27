@@ -39,6 +39,12 @@ public class AntiCheatScheduler {
     private static final int DEVICE_SWITCH_THRESHOLD = 2; // Max device switches in 1 hour
     private static final int SKILL_SCORE_ANOMALY_THRESHOLD = 50; // Max skill score deviation
     private static final int MAX_CACHE_SIZE = 10000; // Cap for in-memory maps
+    /**
+     * Minimum gap between two durable flags against the same player, across ALL detectors.
+     * See {@link #flagPlayer(User, String)} — without it the scan re-punished standing
+     * evidence once a minute, forever.
+     */
+    private static final int FLAG_COOLDOWN_MINUTES = 30;
 
     private final UserRepository userRepository;
     private final AntiCheatEngine antiCheatEngine;
@@ -48,6 +54,7 @@ public class AntiCheatScheduler {
     private final Map<String, Integer> flaggedPlayers = new ConcurrentHashMap<>(); // Player ID -> flag count
     private final Map<String, LocalDateTime> lastCosmicDripSpike = new ConcurrentHashMap<>(); // Player ID -> last drip spike time
     private final Map<String, LocalDateTime> lastBoardCheck = new ConcurrentHashMap<>(); // Player ID -> last board check time
+    private final Map<String, LocalDateTime> lastFlagged = new ConcurrentHashMap<>(); // Player ID -> last durable flag
 
     @Autowired
     public AntiCheatScheduler(UserRepository userRepository, AntiCheatEngine antiCheatEngine, 
@@ -298,11 +305,62 @@ public class AntiCheatScheduler {
         }
     }
 
+    /**
+     * Records a durable anti-cheat flag against {@code user}, at most once per
+     * {@link #FLAG_COOLDOWN_MINUTES} regardless of how many detectors fire or how many
+     * scans observe the same standing evidence.
+     *
+     * <p><b>This cooldown is the fix for a punishment loop that could zero a player's
+     * balance in about twenty minutes.</b> {@link AntiCheatEngine#flagPlayer(String)} is
+     * destructive and persistent — it halves {@code cosmicDrip} and increments
+     * {@code cheatFlagCount} in the database. Six of the eight detectors called it
+     * unconditionally on every 60-second scan, and only two (drip spike, board patterns)
+     * carried any rate limit of their own.
+     *
+     * <p>The inputs those detectors read do not clear on their own, which is what turns a
+     * single offence into a permanent sentence:
+     * <ul>
+     *   <li>{@code suspicionScoreMap} only decays inside {@code detectCheating}, on a clean
+     *       observation. A player who crosses the threshold and then stops playing keeps
+     *       that score until the 10,000-entry trim evicts it.</li>
+     *   <li>{@code moveRates} is only reset when that player submits another move, so a
+     *       stale rate above the threshold persists indefinitely.</li>
+     *   <li>{@code ipSolveCounts} only ever increments — nothing decays it — and the
+     *       threshold is three solves from one address, which any carrier-NAT or office
+     *       address clears permanently.</li>
+     * </ul>
+     *
+     * <p>So a player who tripped one detector once was re-flagged every 60 seconds forever:
+     * starting at a million cosmic drip they reached zero in roughly twenty minutes and
+     * stayed there, while {@code cheatFlagCount} climbed by 1,440 per day per pod. Several
+     * detectors firing in the same pass compounded it — each called this method separately,
+     * so one scan could halve the balance four times. Nothing in the moderation path could
+     * undo it either: {@code clearFlaggedPlayer} clears only the calling pod's maps, so on
+     * a multi-replica deployment the other pods re-flag an exonerated player within a
+     * minute.
+     *
+     * <p>The cooldown is keyed on the player and consulted before any state changes, so it
+     * also collapses a multi-detector scan into a single flag — which is the correct
+     * reading anyway: one scan observing one player is one piece of evidence, however many
+     * ways it is described.
+     */
     private void flagPlayer(User user, String reason) {
         String playerId = user.getId().toString();
+        LocalDateTime previous = lastFlagged.get(playerId);
+        if (previous != null && previous.isAfter(now().minusMinutes(FLAG_COOLDOWN_MINUTES))) {
+            logger.info("Suppressing repeat flag for {} (last flagged {}): {}",
+                user.getUsername(), previous, reason);
+            return;
+        }
+        lastFlagged.put(playerId, now());
         flaggedPlayers.merge(playerId, 1, Integer::sum);
         antiCheatEngine.flagPlayer(playerId);
         logger.error("Cosmic justice served: {} flagged - Reason: {} (Flag Count: {})", user.getUsername(), reason, flaggedPlayers.get(playerId));
+    }
+
+    /** Test/observability hook: when this pod last flagged each player. */
+    Map<String, LocalDateTime> getLastFlagged() {
+        return new HashMap<>(lastFlagged);
     }
 
     public synchronized Map<String, Integer> getFlaggedPlayers() {
@@ -315,6 +373,10 @@ public class AntiCheatScheduler {
         antiCheatEngine.clearPlayerSuspicion(playerId);
         lastCosmicDripSpike.remove(playerId);
         lastBoardCheck.remove(playerId);
+        // Clearing the cooldown too: moderation says the evidence was wrong, so the next
+        // genuine offence must be actionable immediately rather than waiting out a window
+        // that only exists to stop us re-punishing the evidence just thrown out.
+        lastFlagged.remove(playerId);
         logger.info("Cosmic mercy granted: Player {} unflagged—drip slate wiped clean", playerId);
     }
 
@@ -345,5 +407,13 @@ public class AntiCheatScheduler {
             lastCosmicDripSpike.remove(lastCosmicDripSpike.keySet().iterator().next());
         while (lastBoardCheck.size() > MAX_SIZE)
             lastBoardCheck.remove(lastBoardCheck.keySet().iterator().next());
+        // Drop cooldown entries that have expired: past the window they permit exactly what
+        // an absent entry permits, so removing them cannot change a decision. The size cap
+        // below is the backstop; this is what keeps the map proportional to recent
+        // enforcement rather than to every player ever flagged.
+        LocalDateTime flagCutoff = now().minusMinutes(FLAG_COOLDOWN_MINUTES);
+        lastFlagged.values().removeIf(t -> t.isBefore(flagCutoff));
+        while (lastFlagged.size() > MAX_SIZE)
+            lastFlagged.remove(lastFlagged.keySet().iterator().next());
     }
 }

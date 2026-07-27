@@ -170,4 +170,65 @@ class AsyncWiringTest {
         assertThat(executor.getThreadPoolExecutor().getRejectedExecutionHandler())
             .isInstanceOf(ThreadPoolExecutor.CallerRunsPolicy.class);
     }
+
+    @Autowired(required = false)
+    private org.springframework.scheduling.concurrent.ThreadPoolTaskScheduler taskScheduler;
+
+    @Autowired
+    private org.springframework.context.ApplicationContext ctx;
+
+    /**
+     * Scheduled work must have a pool, not a single thread.
+     *
+     * <p>No {@code TaskScheduler} bean existed and no {@code spring.task.scheduling.*}
+     * property was set, so Spring Boot's default pool size of ONE applied and all nine
+     * {@code @Scheduled} jobs ran strictly serially on it. One of them is not like the
+     * others: {@code AntiCheatScheduler.scanForCheaters} pages 500 boards a minute with a
+     * {@code findById} per board, and carries
+     * {@code @Retryable(maxAttempts = 3, backoff = 5000ms)} while rethrowing — so a failing
+     * scan sleeps ten seconds on the scheduling thread and repeats the whole pass three
+     * times.
+     *
+     * <p>Sharing that thread is {@code MultiplayerBroadcaster.broadcastHealthPing}, the
+     * 20-second keep-alive that exists to stop proxies reaping idle gameplay sockets. While
+     * the scan holds the only thread the heartbeat does not fire, load balancers reap the
+     * sockets, and players are disconnected mid-game by a background job that has nothing to
+     * do with them.
+     */
+    @Test
+    void scheduledJobsGetARealPoolRatherThanASingleSharedThread() {
+        assertThat(taskScheduler)
+            .as("a dedicated TaskScheduler bean must exist, or Boot defaults to one thread")
+            .isNotNull();
+        assertThat(taskScheduler.getPoolSize())
+            .as("the anti-cheat scan must not be able to monopolise scheduled execution")
+            .isGreaterThan(1);
+    }
+
+    /**
+     * The leaderboard refresh must actually be scheduled.
+     *
+     * <p>It was a bare {@code Runnable} bean that nothing consumed — no {@code @Scheduled},
+     * no {@code TaskScheduler.schedule}, no {@code ApplicationRunner}. It read as a working
+     * scheduler in review and had never run. {@code refreshLeaderboard} is the only
+     * {@code @CacheEvict} for the leaderboard caches and the only reset of the recent-score
+     * window, so in production neither ever happened: {@code pointsDelta}, documented as a
+     * "recent" figure, silently reported the lifetime total instead.
+     */
+    @Test
+    void theLeaderboardRefreshIsAScheduledJobAndNotAnOrphanedRunnable() {
+        AppConfig.LeaderboardRefreshJob job = ctx.getBean(AppConfig.LeaderboardRefreshJob.class);
+        assertThat(job).isNotNull();
+
+        java.lang.reflect.Method refresh;
+        try {
+            refresh = AppConfig.LeaderboardRefreshJob.class.getMethod("refresh");
+        } catch (NoSuchMethodException e) {
+            throw new AssertionError("refresh() must exist and be public for Spring to schedule it", e);
+        }
+        assertThat(refresh.isAnnotationPresent(
+                org.springframework.scheduling.annotation.Scheduled.class))
+            .as("an unscheduled refresh is the bug: the leaderboard caches would never be evicted")
+            .isTrue();
+    }
 }

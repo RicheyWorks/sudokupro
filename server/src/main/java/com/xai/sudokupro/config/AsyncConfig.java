@@ -9,6 +9,7 @@ import org.springframework.context.annotation.Configuration;
 import org.springframework.scheduling.annotation.AsyncConfigurer;
 import org.springframework.scheduling.annotation.EnableAsync;
 import org.springframework.scheduling.concurrent.ThreadPoolTaskExecutor;
+import org.springframework.scheduling.concurrent.ThreadPoolTaskScheduler;
 
 import java.lang.reflect.Method;
 import java.util.Arrays;
@@ -145,5 +146,49 @@ public class AsyncConfig implements AsyncConfigurer {
             logger.error("Async {}.{} failed with args {}: {}",
                 method.getDeclaringClass().getSimpleName(), method.getName(),
                 Arrays.toString(params), ex.toString(), ex);
+    }
+
+    /** Bean name for the scheduler pool, so a test can assert the wiring rather than trust it. */
+    public static final String SCHEDULER_POOL = "applicationTaskScheduler";
+
+    /**
+     * Dedicated pool for {@code @Scheduled} work.
+     *
+     * <p>There was no {@code TaskScheduler} bean and no {@code spring.task.scheduling.*}
+     * property, so every scheduled method in the application shared Spring Boot's default
+     * pool size of <b>one thread</b>. Nine jobs ran strictly serially on it, and one of them
+     * is not like the others: {@code AntiCheatScheduler.scanForCheaters} pages 500 boards a
+     * minute and issues a {@code findById} per board — and it carries
+     * {@code @Retryable(maxAttempts = 3, backoff = 5000ms)} while rethrowing, so a failing
+     * scan sleeps ten seconds on the scheduling thread and repeats the whole pass three
+     * times.
+     *
+     * <p>What shares that thread matters: {@code MultiplayerBroadcaster.broadcastHealthPing}
+     * is the 20-second keep-alive that exists specifically to stop proxies reaping idle
+     * gameplay sockets. While the anti-cheat scan holds the only thread — trivially longer
+     * than 20 seconds under retry — the heartbeat does not fire, load balancers reap the
+     * sockets, and players are disconnected mid-game by a background job they have nothing
+     * to do with. The 5-minute Redis sync and the 30-second metrics update are delayed by
+     * the same amount, so a Grafana gap during an anti-cheat stall looks like an outage.
+     *
+     * <p>Sizing is deliberately modest: enough that a long job cannot monopolise the pool,
+     * not so much that nine jobs all hammer the database at once. Overridable for tuning
+     * without a rebuild.
+     */
+    @Bean(SCHEDULER_POOL)
+    public ThreadPoolTaskScheduler applicationTaskScheduler(
+            @Value("${sudokupro.scheduling.pool-size:5}") int poolSize) {
+        ThreadPoolTaskScheduler scheduler = new ThreadPoolTaskScheduler();
+        scheduler.setPoolSize(poolSize);
+        scheduler.setThreadNamePrefix("sudokupro-sched-");
+        // Do not let a shutdown hang on a scan mid-flight, but do let short jobs finish so
+        // a rolling deploy does not truncate a metrics write halfway.
+        scheduler.setWaitForTasksToCompleteOnShutdown(true);
+        scheduler.setAwaitTerminationSeconds(20);
+        // Without this, an uncaught error inside a scheduled task is logged by the pool with
+        // no indication of which task produced it.
+        scheduler.setErrorHandler(t ->
+            logger.error("Scheduled task failed: {}", t.toString(), t));
+        return scheduler;
     }
 }

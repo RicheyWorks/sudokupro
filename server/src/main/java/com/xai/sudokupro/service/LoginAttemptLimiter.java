@@ -25,6 +25,8 @@ public class LoginAttemptLimiter {
 
     private static final Logger logger = LoggerFactory.getLogger(LoginAttemptLimiter.class);
     private static final String KEY_PREFIX = "sudokupro:login:fail:";
+    /** Only sweep the degraded-mode map once it is big enough to be worth sweeping. */
+    private static final int LOCAL_SWEEP_THRESHOLD = 1024;
 
     private final StringRedisTemplate redis;
     private final int maxAttempts;
@@ -94,6 +96,7 @@ public class LoginAttemptLimiter {
         } catch (Exception e) {
             degraded(e);
             long now = System.currentTimeMillis();
+            sweepExpired(now);
             local.compute(remoteAddress, (k, c) -> {
                 if (c == null || now > c.expiresAtMs) {
                     return new LocalCounter(1, now + lockoutWindow.toMillis());
@@ -102,6 +105,37 @@ public class LoginAttemptLimiter {
                 return c;
             });
         }
+    }
+
+    /**
+     * Drops expired counters from the in-memory fallback map.
+     *
+     * <p>Nothing swept it. Expiry was only ever consulted for a key that was touched again,
+     * and the sole removal was {@link #recordSuccess}, which needs a <em>successful</em>
+     * authentication for that exact key. The key is {@code (remoteAddress, username)}, and
+     * the username comes straight off the wire — the filter base64-decodes it out of the
+     * {@code Authorization} header and the failure listener records it whether or not the
+     * account exists.
+     *
+     * <p>So while Redis is down — an explicitly supported degraded mode, and exactly when
+     * the pod is least able to shed load — an unauthenticated caller could send
+     * {@code Authorization: Basic base64(<random>:x)} in a loop and permanently allocate a
+     * map entry per distinct username. No success would ever arrive to clear them, and
+     * nothing expired them. Heap grows until the process dies.
+     *
+     * <p>An expired counter permits exactly what an absent one permits ({@code isBlocked}
+     * treats both as zero attempts, and {@code recordFailure} resets a stale counter to 1),
+     * so removing them cannot change a decision. The Redis path never had this problem —
+     * its keys carry the lockout window as a TTL.
+     */
+    private void sweepExpired(long now) {
+        if (local.size() <= LOCAL_SWEEP_THRESHOLD) return;
+        local.values().removeIf(c -> now > c.expiresAtMs);
+    }
+
+    /** Test/observability hook: live entries in the degraded-mode counter map. */
+    int localCounterCount() {
+        return local.size();
     }
 
     public void recordSuccess(String remoteAddress) {

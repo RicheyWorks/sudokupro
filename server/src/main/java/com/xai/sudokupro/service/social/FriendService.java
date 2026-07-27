@@ -174,6 +174,23 @@ public class FriendService {
         return out;
     }
 
+    /**
+     * Whether {@code a} and {@code b} are friends. Reads the join table directly rather than
+     * loading either user's whole collection.
+     *
+     * <p>Deliberately does NOT provision a wallet for an unknown name — it is called from an
+     * authorization check on a caller-supplied identity, and {@code walletFor} creates rows.
+     * That is the row-factory shape {@code request} and {@code remove} were both hardened
+     * against; an authorization predicate is the last place that should mint anything.
+     */
+    public boolean areFriends(String a, String b) {
+        if (a == null || b == null || a.equals(b)) return false;
+        var ua = userRepository.findByUsername(a);
+        var ub = userRepository.findByUsername(b);
+        if (ua.isEmpty() || ub.isEmpty()) return false;
+        return userRepository.countFriendEdge(ua.get().getId(), ub.get().getId()) > 0;
+    }
+
     public Set<String> pendingFor(String me) {
         try {
             Set<String> members = redis.opsForSet().members(PENDING_KEY + me);

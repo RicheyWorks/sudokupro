@@ -61,6 +61,26 @@ public class WebSocketController extends TextWebSocketHandler {
         }
         String playerId = session.getPrincipal().getName();
 
+        // Bound the number of budgets before handing out another one. The frame throttle
+        // below is per-player, but a per-player limit is only as good as the cap on how
+        // many sockets one player can hold: this pairs with it, and neither works alone.
+        if (!claimSocket(playerId)) {
+            logger.warn("Refusing connection for {}: already at {} open sockets",
+                playerId, MAX_SOCKETS_PER_PLAYER);
+            session.close(CloseStatus.POLICY_VIOLATION.withReason("Too many connections"));
+            return;
+        }
+        // Throttle the HANDSHAKE itself, not just the frames that follow it. The branch
+        // below creates and PERSISTS a game when no gameId is supplied, so a
+        // connect/disconnect loop is unbounded database growth that the concurrent-socket
+        // cap cannot see — each socket closes before the next opens.
+        if (!allowConnection(playerId)) {
+            logger.warn("Rate-limiting WebSocket connections for player={}", playerId);
+            releaseSocket(playerId);
+            session.close(CloseStatus.POLICY_VIOLATION.withReason("Connecting too quickly"));
+            return;
+        }
+
         // Raise the per-session frame limits off the container's 8 KB default. A board
         // envelope carries all 81 cells and can exceed 8 KB on a full grid with pencil
         // marks, and an oversized frame is killed by the container with close code 1009
@@ -90,6 +110,7 @@ public class WebSocketController extends TextWebSocketHandler {
                 session.close(CloseStatus.POLICY_VIOLATION.withReason("Unknown game"));
                 playerMap.remove(session);
                 broadcaster.unregisterClient();
+                releaseSocket(playerId);
                 return;
             }
             // Spectating a free-play game is a feature; spectating a COMPETITIVE game is a
@@ -104,6 +125,7 @@ public class WebSocketController extends TextWebSocketHandler {
                 session.close(CloseStatus.POLICY_VIOLATION.withReason("Competitive games cannot be spectated"));
                 playerMap.remove(session);
                 broadcaster.unregisterClient();
+                releaseSocket(playerId);
                 return;
             }
         } else {
@@ -134,7 +156,7 @@ public class WebSocketController extends TextWebSocketHandler {
             // loop and starve the board's real owner, who then fails every move/hint/undo
             // with "busy on another server instance" after a 3s stall. There was no rate
             // limit anywhere on the WebSocket path.
-            if (!allowMessage(session)) {
+            if (!allowMessage(playerId)) {
                 logger.warn("Rate-limiting WebSocket session={} player={}", session.getId(), playerId);
                 send(session, buildEnvelope("error", playerId,
                     Map.of("detail", "Too many messages — slow down")));
@@ -221,12 +243,14 @@ public class WebSocketController extends TextWebSocketHandler {
 
     @Override
     public void afterConnectionClosed(WebSocketSession session, CloseStatus status) {
-        rateBuckets.remove(session);
         String playerId = playerMap.remove(session);
         if (playerId == null) {
-            // Rejected before registration (e.g. unauthenticated) — nothing to clean up.
+            // Rejected before registration (unauthenticated, at the socket cap, or
+            // connecting too fast). Those paths already released whatever they claimed, so
+            // releasing again here would let the player exceed the cap by one per refusal.
             return;
         }
+        releaseSocket(playerId);
         String gameId = (String) session.getAttributes().get("gameId");
         sessionRegistry.unregister(gameId, playerId, session);
         broadcaster.unregisterClient();
@@ -237,10 +261,13 @@ public class WebSocketController extends TextWebSocketHandler {
     @Override
     public void handleTransportError(WebSocketSession session, Throwable ex) {
         logger.error("Transport error {}: {}", session.getId(), ex.getMessage());
-        rateBuckets.remove(session);
         String gameId = (String) session.getAttributes().get("gameId");
         String playerId = playerMap.remove(session);
         if (playerId != null) {
+            // A transport error must free the socket slot exactly as a clean close does, or
+            // a client that keeps dying mid-connection walks itself up to the cap and can
+            // never reconnect.
+            releaseSocket(playerId);
             sessionRegistry.unregister(gameId, playerId, session);
             broadcaster.unregisterClient();
             // Peers must be told, exactly as on a clean close. Previously only
@@ -310,11 +337,44 @@ public class WebSocketController extends TextWebSocketHandler {
         return GameService.isCompetitiveGameId(gameId);
     }
 
-    // ── Per-session flood control ──────────────────────────────────────────
+    // ── Per-PLAYER flood control ───────────────────────────────────────────
     // Simple token bucket: a burst is fine (a fast solver types quickly, and the web
     // client can emit a move per keystroke), a sustained flood is not.
+    //
+    // Keyed on the authenticated player, NOT on the WebSocketSession. Keying it on the
+    // session made the limit self-defeating: the session is a resource the caller creates
+    // at will, and nothing capped how many they could hold, so each new socket handed out
+    // a fresh 20/s budget. One account opening 100 sockets to the same gameId got 2000
+    // frames per second against a board — and every frame takes GameLockManager's
+    // cross-replica Redis SET NX + Lua DEL, which is precisely the lock starvation this
+    // throttle exists to prevent. The board's real owner then failed every move, hint and
+    // undo with "busy on another server instance" after a 3-second stall. A per-connection
+    // limit only limits a caller who declines to open a second connection.
     private static final int    BURST_CAPACITY    = 40;
     private static final double REFILL_PER_SECOND = 20.0;
+
+    /**
+     * Ceiling on concurrent gameplay sockets per player. Generous — several tabs across a
+     * desktop and a phone stay well under it — but finite, which is the point: the frame
+     * budget above is only meaningful if the number of budgets is bounded.
+     */
+    static final int MAX_SOCKETS_PER_PLAYER = 8;
+
+    /**
+     * Separate, much tighter bucket for CONNECTIONS.
+     *
+     * <p>A handshake carrying no {@code gameId} runs the backtracking generator and
+     * persists a {@code sudoku_boards} row ({@code createNewGame} → {@code saveToRedis} +
+     * {@code persistBoard}). Nothing throttled the handshake at all — the frame bucket only
+     * exists once a connection is established — so a connect/disconnect loop from a single
+     * account minted unbounded database rows and generator CPU, and the concurrent-socket
+     * cap alone would not stop it, because each socket is closed before the next opens.
+     * {@code trimActiveGames} bounds the in-memory map, not the table.
+     */
+    private static final int    CONNECT_BURST_CAPACITY    = 10;
+    private static final double CONNECT_REFILL_PER_SECOND = 0.5;
+    /** Only sweep the connect-bucket map once it is big enough to be worth sweeping. */
+    private static final int    CONNECT_BUCKET_SWEEP_THRESHOLD = 1024;
     /** Longest chat text relayed to peers; longer messages are truncated, not rejected. */
     static final int MAX_CHAT_LENGTH = 500;
 
@@ -322,19 +382,81 @@ public class WebSocketController extends TextWebSocketHandler {
     static final int MAX_TEXT_FRAME_BYTES   = 64 * 1024;
     static final int MAX_BINARY_FRAME_BYTES = 16 * 1024;
 
-    private final ConcurrentMap<WebSocketSession, double[]> rateBuckets = new ConcurrentHashMap<>();
+    private final ConcurrentMap<String, double[]> rateBuckets = new ConcurrentHashMap<>();
+    private final ConcurrentMap<String, double[]> connectBuckets = new ConcurrentHashMap<>();
+    /** Open gameplay sockets per player, so {@link #MAX_SOCKETS_PER_PLAYER} can be enforced. */
+    private final ConcurrentMap<String, Integer> openSocketsPerPlayer = new ConcurrentHashMap<>();
 
-    private boolean allowMessage(WebSocketSession session) {
+    private boolean allowMessage(String playerId) {
+        return consumeToken(rateBuckets, playerId, BURST_CAPACITY, REFILL_PER_SECOND);
+    }
+
+    private boolean allowConnection(String playerId) {
+        sweepFullConnectBuckets();
+        return consumeToken(connectBuckets, playerId, CONNECT_BURST_CAPACITY, CONNECT_REFILL_PER_SECOND);
+    }
+
+    /**
+     * Drops connect buckets that have refilled to capacity.
+     *
+     * <p>This map must outlive disconnection to do its job, so it cannot be cleaned up in
+     * {@code afterConnectionClosed} — which would otherwise make it grow with every player
+     * who has ever connected. A bucket at full capacity permits exactly what an absent one
+     * permits (both start a caller at {@code CONNECT_BURST_CAPACITY} tokens), so removing
+     * it cannot change a decision. Runs only once the map is large enough to be worth
+     * sweeping.
+     */
+    private void sweepFullConnectBuckets() {
+        if (connectBuckets.size() <= CONNECT_BUCKET_SWEEP_THRESHOLD) return;
         long now = System.nanoTime();
-        double[] bucket = rateBuckets.computeIfAbsent(session,
-            s -> new double[]{BURST_CAPACITY, now});
+        connectBuckets.values().removeIf(bucket -> {
+            synchronized (bucket) {
+                double elapsedSeconds = (now - (long) bucket[1]) / 1_000_000_000.0;
+                return bucket[0] + elapsedSeconds * CONNECT_REFILL_PER_SECOND >= CONNECT_BURST_CAPACITY;
+            }
+        });
+    }
+
+    private static boolean consumeToken(ConcurrentMap<String, double[]> buckets, String key,
+                                        double capacity, double refillPerSecond) {
+        long now = System.nanoTime();
+        double[] bucket = buckets.computeIfAbsent(key, k -> new double[]{capacity, now});
         synchronized (bucket) {
             double elapsedSeconds = (now - (long) bucket[1]) / 1_000_000_000.0;
             bucket[1] = now;
-            bucket[0] = Math.min(BURST_CAPACITY, bucket[0] + elapsedSeconds * REFILL_PER_SECOND);
+            bucket[0] = Math.min(capacity, bucket[0] + elapsedSeconds * refillPerSecond);
             if (bucket[0] < 1.0) return false;
             bucket[0] -= 1.0;
             return true;
+        }
+    }
+
+    /**
+     * Claims one of the player's socket slots, atomically. Returns false when they are
+     * already at {@link #MAX_SOCKETS_PER_PLAYER}, in which case nothing is claimed and the
+     * caller must not call {@link #releaseSocket}.
+     */
+    private boolean claimSocket(String playerId) {
+        boolean[] claimed = {false};
+        openSocketsPerPlayer.compute(playerId, (k, current) -> {
+            int open = (current == null) ? 0 : current;
+            if (open >= MAX_SOCKETS_PER_PLAYER) return open;   // refused; count unchanged
+            claimed[0] = true;
+            return open + 1;
+        });
+        return claimed[0];
+    }
+
+    /** Releases a socket slot, dropping the player's buckets once their last socket closes. */
+    private void releaseSocket(String playerId) {
+        Integer remaining = openSocketsPerPlayer.computeIfPresent(playerId,
+            (k, v) -> v <= 1 ? null : v - 1);
+        if (remaining == null) {
+            // Last socket gone: the frame budget has nothing left to meter, and keeping it
+            // would make the map grow with every player ever connected. The connect bucket
+            // is deliberately KEPT — its whole purpose is to survive disconnection, since
+            // the abuse it guards against is a connect/disconnect loop.
+            rateBuckets.remove(playerId);
         }
     }
 

@@ -10,6 +10,7 @@ import com.xai.sudokupro.util.SecureRandomGenerator;
 import org.springframework.boot.actuate.health.HealthIndicator;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnMissingBean;
 import org.springframework.context.annotation.Bean;
+import org.springframework.stereotype.Component;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.data.redis.connection.RedisConnectionFactory;
 import org.springframework.data.redis.core.RedisTemplate;
@@ -111,15 +112,44 @@ public class AppConfig {
         return ex;
     }
 
-    @Bean
-    public Runnable leaderboardRefreshScheduler(LeaderboardService leaderboardService) {
-        return () -> {
+    /**
+     * Periodically evicts the leaderboard caches and rolls the recent-score window.
+     *
+     * <p>This used to be a bare {@code Runnable} bean. Nothing consumed it — no
+     * {@code @Scheduled}, no {@code TaskScheduler.schedule}, no {@code ApplicationRunner};
+     * grepping the name found the declaration and nothing else. It read in review as a
+     * working scheduler and had never run in production.
+     *
+     * <p>What that cost: {@code refreshLeaderboard} is the ONLY {@code @CacheEvict} for
+     * {@code topPlayers}, {@code leaderboardSummary} and {@code publicLeaderboard}, and the
+     * only reset of the {@code scoreDeltas} window. So the leaderboard caches were evicted
+     * by nothing but their TTL, and {@code pointsDelta} — documented as a "recent" figure —
+     * silently reported the monotonically growing lifetime total instead, out of a map that
+     * never rolled over. Deleting the bean entirely would not have failed a single test.
+     *
+     * <p>Now a real scheduled method on a real bean, so Spring's post-processor can see it.
+     */
+    @Component
+    static class LeaderboardRefreshJob {
+        private static final org.slf4j.Logger log =
+            org.slf4j.LoggerFactory.getLogger(LeaderboardRefreshJob.class);
+        private final LeaderboardService leaderboardService;
+
+        LeaderboardRefreshJob(LeaderboardService leaderboardService) {
+            this.leaderboardService = leaderboardService;
+        }
+
+        @org.springframework.scheduling.annotation.Scheduled(
+            fixedRateString = "${sudokupro.leaderboard.refresh-ms:300000}")
+        public void refresh() {
             try {
                 leaderboardService.refreshLeaderboard();
             } catch (Exception e) {
-                System.err.println("Leaderboard refresh failed: " + e.getMessage());
+                // Logged, not rethrown: a failed refresh must not retire the schedule, and
+                // a stale leaderboard is not worth failing a health check over.
+                log.warn("Leaderboard refresh failed (non-fatal): {}", e.getMessage(), e);
             }
-        };
+        }
     }
 
     // ---- Private helper ----
