@@ -67,7 +67,8 @@ class DuelServiceTest {
 
         service = new DuelService(gameService,
             new SudokuGenerator(new SecureRandomGenerator(new SimpleMeterRegistry())),
-            store, userRepository, notificationService, analyticsService);
+            store, userRepository, notificationService, analyticsService,
+            new com.xai.sudokupro.service.economy.EconomyService(userRepository, 5, 15, 5));
     }
 
     @Test
@@ -158,6 +159,29 @@ class DuelServiceTest {
         assertEquals("richmond", byType.get("DUEL_LOSS").getPlayerId());
         assertEquals("richmond", byType.get("DUEL_WIN").getPayload().get("opponent"));
         assertEquals("rival", byType.get("DUEL_LOSS").getPayload().get("opponent"));
+    }
+
+    /**
+     * A duel must not strand anyone at zero gems. {@code walletFor} built
+     * {@code new User(null, playerId)} directly — gems 0 — instead of going through
+     * EconomyService, and the shortfall was permanent: {@code AccountService.register}
+     * deliberately claims a pre-existing wallet row rather than granting the bonus, so
+     * a row created here could never be topped up. Both duellists are provisioned on
+     * settlement, including the LOSER, whose board was never solved and who therefore
+     * gets nothing from {@code EconomyService.onGameEnded} either — leaving them unable
+     * to afford a single 5-gem hint, forever.
+     */
+    @Test
+    void settlementProvisionsWalletsWithTheSigningBonus() {
+        String duelId = activeDuel();
+        users.remove("richmond"); // the loser has no wallet row yet
+        users.remove("rival");
+
+        service.onGameEnded(solvedBoard(DuelService.duelGameId(duelId, "rival"), "rival"), "rival");
+
+        assertEquals(15, users.get("richmond").getGems(),
+            "the loser's freshly provisioned wallet must carry the signing bonus");
+        assertEquals(15, users.get("rival").getGems());
     }
 
     @Test

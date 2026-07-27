@@ -83,6 +83,20 @@ class AchievementServiceTest {
         assertTrue(users.get("richmond").getAchievements().get("DailyPlayer"));
     }
 
+    /**
+     * An archive replay is not keeping up with the daily. The check was
+     * {@code startsWith("daily-")}, which the archive id
+     * {@code daily-<date>:archive:<player>} satisfies — so the badge for playing the
+     * daily was handed out for replaying an old one instead, along with its 20 gems.
+     */
+    @Test
+    void archiveReplaysDoNotUnlockDailyPlayer() {
+        service.onGameEnded(solved("daily-2026-07-15:archive:richmond", "richmond"), "richmond");
+
+        assertNotEquals(Boolean.TRUE, users.get("richmond").getAchievements().get("DailyPlayer"),
+            "replaying the archive must not earn the daily badge");
+    }
+
     @Test
     void tenDayStreakUnlocksStreakMaster() {
         LocalDate day = LocalDate.of(2026, 7, 7);

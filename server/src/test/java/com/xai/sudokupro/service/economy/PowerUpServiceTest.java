@@ -64,8 +64,7 @@ class PowerUpServiceTest {
             }
         });
         // 100 starting gems so purchases fit
-        service = new PowerUpService(new EconomyService(repo, 5, 100, 5), repo, gameService,
-            new AISolverService(new SecureRandomGenerator(new SimpleMeterRegistry())), duels);
+        service = new PowerUpService(new EconomyService(repo, 5, 100, 5), repo, gameService, duels);
     }
 
     @Test
@@ -82,41 +81,62 @@ class PowerUpServiceTest {
         assertThrows(InsufficientGemsException.class, () -> service.buy("poor", "FREEZE"));
     }
 
+    /**
+     * Board effects are delegated to GameService, which is the only place that holds the
+     * game lock and writes through to Redis and the database. What this class still owns
+     * is the inventory: spend on success, and — critically — do NOT spend when the board
+     * operation refuses. The board-mutation and persistence assertions live in
+     * {@code GameServicePowerUpEffectTest}, next to the code that performs them.
+     */
     @Test
-    void extraLifeAddsALifeToYourOwnGameOnly() {
-        SudokuBoard mine = new SudokuBoard(1, false, false, 0, "g-mine");
-        mine.setPlayerId("richmond");
-        when(gameService.getGame("g-mine")).thenReturn(mine);
+    void extraLifeGoesThroughGameServiceAndOnlyForYourOwnGame() {
         service.buy("richmond", "EXTRA_LIFE");
-        int before = mine.getLives();
 
         service.use("richmond", "EXTRA_LIFE", "g-mine", null);
-        assertEquals(before + 1, mine.getLives());
+        verify(gameService).grantExtraLife("g-mine", "richmond");
         assertEquals(0, service.inventory("richmond").getOrDefault("EXTRA_LIFE", 0));
 
         // Someone else's board is off limits — and the unit is NOT consumed.
-        SudokuBoard theirs = new SudokuBoard(1, false, false, 0, "g-theirs");
-        theirs.setPlayerId("ada");
-        when(gameService.getGame("g-theirs")).thenReturn(theirs);
+        doThrow(new SecurityException("Game g-theirs does not belong to player richmond"))
+            .when(gameService).grantExtraLife("g-theirs", "richmond");
         service.buy("richmond", "EXTRA_LIFE");
         assertThrows(SecurityException.class,
             () -> service.use("richmond", "EXTRA_LIFE", "g-theirs", null));
-        assertEquals(1, service.inventory("richmond").get("EXTRA_LIFE"));
+        assertEquals(1, service.inventory("richmond").get("EXTRA_LIFE"),
+            "a refused power-up must not be consumed");
     }
 
     @Test
-    void revealCellFillsACorrectCell() {
-        SudokuBoard mine = new SudokuBoard(1, false, false, 0, "g-solve");
-        mine.setPlayerId("richmond");
-        when(gameService.getGame("g-solve")).thenReturn(mine);
+    void revealCellGoesThroughGameService() {
         service.buy("richmond", "REVEAL_CELL");
-        long emptyBefore = countEmpty(mine);
 
         service.use("richmond", "REVEAL_CELL", "g-solve", null);
 
-        assertEquals(emptyBefore - 1, countEmpty(mine), "exactly one cell must be filled");
-        assertEquals(1, mine.getHintCount(),
-            "a reveal is assistance — it must forfeit the clean-solve bonus like a hint");
+        verify(gameService).revealCell("g-solve", "richmond");
+        assertEquals(0, service.inventory("richmond").getOrDefault("REVEAL_CELL", 0));
+    }
+
+    /** A reveal with no derivable cell costs nothing — the throw precedes the decrement. */
+    @Test
+    void anImpossibleRevealDoesNotConsumeTheUnit() {
+        doThrow(new IllegalStateException("No empty cell to reveal"))
+            .when(gameService).revealCell("g-full", "richmond");
+        service.buy("richmond", "REVEAL_CELL");
+
+        assertThrows(IllegalStateException.class,
+            () -> service.use("richmond", "REVEAL_CELL", "g-full", null));
+
+        assertEquals(1, service.inventory("richmond").get("REVEAL_CELL"));
+    }
+
+    /** Board-effect power-ups still require a gameId before anything else happens. */
+    @Test
+    void boardEffectsNeedAGameId() {
+        service.buy("richmond", "REVEAL_CELL");
+        assertThrows(IllegalArgumentException.class,
+            () -> service.use("richmond", "REVEAL_CELL", "  ", null));
+        assertEquals(1, service.inventory("richmond").get("REVEAL_CELL"));
+        verify(gameService, never()).revealCell(anyString(), anyString());
     }
 
     @Test

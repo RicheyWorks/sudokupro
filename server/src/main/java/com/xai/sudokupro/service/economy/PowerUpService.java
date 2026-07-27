@@ -1,9 +1,7 @@
 package com.xai.sudokupro.service.economy;
 
-import com.xai.sudokupro.model.SudokuBoard;
 import com.xai.sudokupro.model.User;
 import com.xai.sudokupro.repository.UserRepository;
-import com.xai.sudokupro.service.AISolverService;
 import com.xai.sudokupro.service.GameService;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -42,16 +40,17 @@ public class PowerUpService {
     private final EconomyService economyService;
     private final UserRepository userRepository;
     private final GameService gameService;
-    private final AISolverService solver;
     private final com.xai.sudokupro.service.duel.DuelStateStore duels;
 
+    // The solver dependency is gone: the reveal now runs inside GameService, which
+    // already holds one. Keeping an injected collaborator this class no longer calls
+    // would imply a relationship that isn't there.
     public PowerUpService(EconomyService economyService, UserRepository userRepository,
-                          GameService gameService, AISolverService solver,
+                          GameService gameService,
                           com.xai.sudokupro.service.duel.DuelStateStore duels) {
         this.economyService = economyService;
         this.userRepository = userRepository;
         this.gameService = gameService;
-        this.solver = solver;
         this.duels = duels;
     }
 
@@ -92,19 +91,19 @@ public class PowerUpService {
         int held = inventory.getOrDefault(type, 0);
         if (held <= 0) throw new IllegalStateException("You do not hold a " + type);
 
+        // Board effects run through GameService, which is the single place that holds
+        // the game lock, broadcasts, and writes through to Redis and the database. Doing
+        // them here meant a paid change lived in one pod's cache and nowhere else — see
+        // GameService.revealCell for the full shape. Both throw before the inventory
+        // decrement below, so a reveal with no derivable cell still costs nothing.
         switch (type) {
             case "EXTRA_LIFE" -> {
-                SudokuBoard board = requireOwnGame(gameId, playerId);
-                board.setLives(board.getLives() + 1);
+                requireGameId(gameId);
+                gameService.grantExtraLife(gameId, playerId);
             }
             case "REVEAL_CELL" -> {
-                SudokuBoard board = requireOwnGame(gameId, playerId);
-                var move = solver.getNextLogicalMoveAsEnhancedMove(board);
-                if (move == null) throw new IllegalStateException("No empty cell to reveal");
-                board.applyExternalMove(move);
-                // A reveal is assistance stronger than a hint: it must forfeit
-                // the clean-solve bonus the same way hints do.
-                board.incrementHintCount();
+                requireGameId(gameId);
+                gameService.revealCell(gameId, playerId);
             }
             case "FREEZE" -> {
                 if (target == null || target.isBlank() || target.equals(playerId)) {
@@ -137,14 +136,14 @@ public class PowerUpService {
         return economyService.walletFor(playerId).getPowerUps();
     }
 
-    private SudokuBoard requireOwnGame(String gameId, String playerId) {
+    /**
+     * The gameId precondition for board-effect power-ups. Ownership itself is enforced
+     * by the GameService operation (it throws SecurityException before mutating), so it
+     * is checked in one place rather than two that could drift apart.
+     */
+    private void requireGameId(String gameId) {
         if (gameId == null || gameId.isBlank()) {
             throw new IllegalArgumentException("This power-up needs a gameId");
         }
-        SudokuBoard board = gameService.getGame(gameId);
-        if (!playerId.equals(board.getPlayerId())) {
-            throw new SecurityException("Game " + gameId + " is not yours");
-        }
-        return board;
     }
 }

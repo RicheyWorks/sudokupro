@@ -88,7 +88,8 @@ class DuelChallengeLimitsTest {
             gameService,
             new SudokuGenerator(new SecureRandomGenerator(new SimpleMeterRegistry())),
             duels, repo, mock(NotificationService.class),
-            mock(com.xai.sudokupro.service.AnalyticsService.class));
+            mock(com.xai.sudokupro.service.AnalyticsService.class),
+            new com.xai.sudokupro.service.economy.EconomyService(repo, 5, 15, 5));
     }
 
     /** Registers a real player row so the challenge existence guard is satisfied. */

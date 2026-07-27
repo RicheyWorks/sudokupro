@@ -495,6 +495,79 @@ public class GameService {
     }
 
     // =====================================================================
+    // Power-up board effects
+    // =====================================================================
+
+    /**
+     * Reveals one logically-derivable cell for the board's owner (REVEAL_CELL).
+     *
+     * <p>Lives here rather than in {@code PowerUpService} because a paid board change
+     * has to go through the same lock / broadcast / write-through path every other
+     * mutation does. It did not: {@code PowerUpService} called {@code applyExternalMove}
+     * — deliberately the NON-broadcasting variant — and then neither
+     * {@code saveToRedis} nor {@code persistBoard}, so the revealed digit existed only
+     * in one pod's {@code activeGames} entry. Nothing marked the game
+     * {@code locallyMutated} either, which is what {@link #shutdown()} keys on, so even
+     * the shutdown safety net skipped it. Any cache trim, pod restart, reconnect or read
+     * from another replica silently reverted the cell — and after pass 15's version
+     * check, the very next write from another replica drops the copy holding it. The
+     * player paid 20 gems, watched nothing change (the desktop client re-renders its
+     * stale local board), and lost the reveal.
+     *
+     * @return the move that was revealed
+     * @throws SecurityException     if the caller does not own the board
+     * @throws IllegalStateException if there is no cell a hint can derive
+     */
+    public EnhancedMove revealCell(String gameId, String playerId) {
+        validateGameId(gameId);
+        validatePlayerId(playerId);
+        try (var lock = gameLocks.lock(gameId)) {
+            SudokuBoard board = getGame(gameId);
+            requireOwner(board, playerId);
+            EnhancedMove move = aiSolverService.getNextLogicalMoveAsEnhancedMove(board);
+            if (move == null) throw new IllegalStateException("No empty cell to reveal");
+            // Broadcasting variant: a reveal is a real board change and peers/spectators
+            // must see it, exactly as they see an ordinary move.
+            if (!board.applyMove(move, multiplayerBroadcaster)) {
+                throw new IllegalStateException("The revealed cell could not be applied");
+            }
+            // A reveal is assistance stronger than a hint: it forfeits the clean-solve
+            // bonus the same way hints do.
+            board.incrementHintCount();
+            saveToRedis(gameId, board);
+            persistBoard(board);
+            logger.info("Revealed {},{} = {} for {} on {}",
+                move.row(), move.col(), move.newVal(), playerId, gameId);
+            return move;
+        }
+    }
+
+    /**
+     * Grants one extra life to the board's owner (EXTRA_LIFE).
+     *
+     * <p>Same defect as {@link #revealCell}: the increment happened on the cached board
+     * and was never written anywhere, so in infinite mode the life a player had just
+     * bought disappeared on the next reload — and {@code applyMove} ends the game at
+     * {@code lives <= 0}.
+     *
+     * @return the new life count
+     */
+    public int grantExtraLife(String gameId, String playerId) {
+        validateGameId(gameId);
+        validatePlayerId(playerId);
+        try (var lock = gameLocks.lock(gameId)) {
+            SudokuBoard board = getGame(gameId);
+            requireOwner(board, playerId);
+            int lives = board.getLives() + 1;
+            board.setLives(lives);
+            saveToRedis(gameId, board);
+            persistBoard(board);
+            logger.info("Granted an extra life to {} on {} ({} held)", playerId, gameId, lives);
+            return lives;
+        }
+    }
+
+    // =====================================================================
     // endGame / solveSudoku / undo / redo / rewind / reset / lock
     // =====================================================================
 

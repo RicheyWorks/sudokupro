@@ -176,27 +176,86 @@ public class DailyPuzzleService implements GameEndListener {
     }
 
     /**
+     * How stale a daily board may be and still earn credit. One day: a puzzle joined
+     * on day N and finished at 00:01 on day N+1 is the case this exists for, and it is
+     * also exactly the window {@code DailyStateStore.getStreak} calls a streak "alive"
+     * (last completion today or yesterday), so credit can never land on a day the
+     * streak model has already written off. It sits inside the store's 3-day key TTL
+     * too, so a completion cannot resurrect an expired leaderboard.
+     */
+    private static final int CREDIT_GRACE_DAYS = 1;
+
+    /**
      * Hook called by GameService.endGame for every finished game. Records the
      * completion (once) and advances the streak when the finished game is the
-     * player's copy of today's puzzle and it is actually solved.
+     * player's copy of a daily puzzle and it is actually solved.
+     *
+     * <p><b>The date comes from the board, not the clock.</b> This used to recompute
+     * {@code today()} at solve time and require it to match the id the board was
+     * stamped with at join time, so a puzzle joined at 23:58 and solved at 00:01 was
+     * compared against the NEXT day's id, matched nothing, and returned here silently —
+     * discarding the completion, the streak advance, the leaderboard entry and the
+     * notification, for the player's most impressive category of solve. Every daily
+     * test runs on a {@code Clock.fixed}, so the boundary was structurally invisible
+     * to the suite. The board's own id is the authoritative statement of which puzzle
+     * it is; the clock only decides whether that puzzle is still current enough to
+     * score, and a board too old to score now says so in the log instead of vanishing.
+     *
+     * <p>Back-dating within the grace window is safe for the leaderboard because the
+     * score is {@code solveTime} — the board's own elapsed timer — so a straggler ranks
+     * by how long they actually took, not by when they happened to finish.
      */
     @Override
     public void onGameEnded(SudokuBoard board, String playerId) {
-        LocalDate date = today();
         if (board == null || playerId == null) return;
-        if (!playerGameId(date, playerId).equals(board.getGameId())) return;
         if (!board.isSolved()) return;
 
+        LocalDate puzzleDate = puzzleDateOf(board.getGameId(), playerId);
+        if (puzzleDate == null) return; // not this player's daily copy (archive, weekly, ordinary game)
+
+        LocalDate today = today();
+        if (puzzleDate.isAfter(today)) {
+            logger.warn("Daily board {} claims a future date — no credit", board.getGameId());
+            return;
+        }
+        if (puzzleDate.isBefore(today.minusDays(CREDIT_GRACE_DAYS))) {
+            logger.info("Player {} finished daily {} on {} — past the {}-day credit window, "
+                + "gems only (no streak or leaderboard)", playerId, puzzleDate, today, CREDIT_GRACE_DAYS);
+            return;
+        }
+
         long seconds = Math.max(0, board.getSolveTime().toSeconds());
-        if (dailyState.recordCompletion(date, playerId, seconds)) {
-            int streak = dailyState.getStreak(playerId, date);
-            logger.info("Player {} completed daily {} in {}s — streak {}", playerId, date, seconds, streak);
+        if (dailyState.recordCompletion(puzzleDate, playerId, seconds)) {
+            int streak = dailyState.getStreak(playerId, today);
+            logger.info("Player {} completed daily {} in {}s — streak {}", playerId, puzzleDate, seconds, streak);
             try {
                 notificationService.sendTypedNotification(playerId, "DAILY",
                     "Daily puzzle solved in " + seconds + "s — " + streak + "-day streak!");
             } catch (Exception e) {
                 logger.debug("Daily completion notification failed: {}", e.getMessage());
             }
+        }
+    }
+
+    /**
+     * The date of the daily puzzle this board <em>is</em>, or null when the board is
+     * not {@code playerId}'s own copy of a daily.
+     *
+     * <p>Deliberately exact rather than a {@code startsWith} test. The archive copy
+     * ({@code daily-<date>:archive:<player>}) and another player's copy both begin with
+     * the daily prefix and must not earn streak or leaderboard credit; requiring the
+     * segment after the date to equal the player id excludes both by construction.
+     */
+    public static LocalDate puzzleDateOf(String gameId, String playerId) {
+        if (gameId == null || playerId == null || !gameId.startsWith(DAILY_PREFIX)) return null;
+        String rest = gameId.substring(DAILY_PREFIX.length());
+        int sep = rest.indexOf(':');
+        if (sep < 0) return null;                                   // the shared template itself
+        if (!rest.substring(sep + 1).equals(playerId)) return null; // archive copy, or not theirs
+        try {
+            return LocalDate.parse(rest.substring(0, sep));
+        } catch (java.time.format.DateTimeParseException e) {
+            return null;
         }
     }
 

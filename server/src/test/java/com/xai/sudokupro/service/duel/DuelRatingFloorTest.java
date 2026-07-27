@@ -61,7 +61,8 @@ class DuelRatingFloorTest {
             new DuelStateStore(downRedis),
             repo,
             mock(com.xai.sudokupro.service.NotificationService.class),
-            mock(com.xai.sudokupro.service.AnalyticsService.class));
+            mock(com.xai.sudokupro.service.AnalyticsService.class),
+            new com.xai.sudokupro.service.economy.EconomyService(repo, 5, 15, 5));
     }
 
     /** Invokes the production settlement directly — it is the unit under test. */

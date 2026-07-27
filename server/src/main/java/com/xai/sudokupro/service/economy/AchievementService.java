@@ -5,6 +5,7 @@ import com.xai.sudokupro.model.User;
 import com.xai.sudokupro.repository.UserRepository;
 import com.xai.sudokupro.service.GameEndListener;
 import com.xai.sudokupro.service.NotificationService;
+import com.xai.sudokupro.service.daily.DailyPuzzleService;
 import com.xai.sudokupro.service.daily.DailyStateStore;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -62,7 +63,14 @@ public class AchievementService implements GameEndListener {
             check(user, unlocked, "CleanSolver", board.getHintCount() == 0);
             check(user, unlocked, "SpeedDemon",
                 board.getSolveTime().toSeconds() > 0 && board.getSolveTime().toSeconds() < SPEED_DEMON_SECONDS);
-            check(user, unlocked, "DailyPlayer", board.getGameId().startsWith("daily-"));
+            // Exact match, not a prefix test. `startsWith("daily-")` also matched the
+            // archive copy (`daily-<date>:archive:<player>`) and any stale-day board, so
+            // replaying an old puzzle from the archive unlocked "DailyPlayer" — an award
+            // for keeping up with the daily, handed out for doing the opposite.
+            // DailyPuzzleService already draws this line correctly for streaks; this is
+            // the same rule, from the same helper, so the two cannot drift apart.
+            check(user, unlocked, "DailyPlayer",
+                DailyPuzzleService.puzzleDateOf(board.getGameId(), playerId) != null);
             check(user, unlocked, "StreakMaster",
                 dailyState.getStreak(playerId, LocalDate.now(clock)) >= 10);
             check(user, unlocked, "DuelChampion", user.getDuelWins() >= 5);

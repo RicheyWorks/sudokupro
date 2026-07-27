@@ -67,14 +67,24 @@ class AsyncWiringTest {
      */
     @Test
     void asyncNotificationLeavesTheCallerThread() throws Exception {
+        // The probe must be able to recognise ITS OWN invocation. EventEngine's scheduled
+        // jobs (cosmic duel, drip showdown, daily challenge) call broadcastEvent on this
+        // same @MockBean from the scheduler's thread, so recording every invocation meant
+        // the queue could hand back "scheduling-1" — a job this test never triggered —
+        // and the assertion then reported a wiring failure that did not exist. It passed
+        // alone and failed in a full-suite run purely on timing, which is the signature of
+        // a test racing the application rather than testing it.
+        String probe = "async wiring probe " + java.util.UUID.randomUUID();
         BlockingQueue<String> executedOn = new LinkedBlockingQueue<>();
         doAnswer(invocation -> {
-            executedOn.add(Thread.currentThread().getName());
+            if (probe.equals(invocation.getArgument(1))) {
+                executedOn.add(Thread.currentThread().getName());
+            }
             return null;
         }).when(broadcaster).broadcastEvent(anyString(), anyString(), any());
 
         String callerThread = Thread.currentThread().getName();
-        notificationService.broadcastNotification("system", "async wiring probe");
+        notificationService.broadcastNotification("system", probe);
 
         String workerThread = executedOn.poll(10, TimeUnit.SECONDS);
         assertThat(workerThread)

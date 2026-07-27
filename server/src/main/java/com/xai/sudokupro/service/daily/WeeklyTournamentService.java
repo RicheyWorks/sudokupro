@@ -61,9 +61,22 @@ public class WeeklyTournamentService implements GameEndListener {
 
     /** ISO week id, e.g. {@code 2026-W29}. */
     public String weekId() {
-        LocalDate now = LocalDate.now(clock);
+        return weekIdOf(LocalDate.now(clock));
+    }
+
+    /** ISO week id for an arbitrary date — used to name the immediately preceding week. */
+    static String weekIdOf(LocalDate date) {
         return String.format("%d-W%02d",
-            now.get(IsoFields.WEEK_BASED_YEAR), now.get(IsoFields.WEEK_OF_WEEK_BASED_YEAR));
+            date.get(IsoFields.WEEK_BASED_YEAR), date.get(IsoFields.WEEK_OF_WEEK_BASED_YEAR));
+    }
+
+    /**
+     * The week before the current one. Computed by subtracting seven days rather than
+     * decrementing the week number, so it stays correct across a week-based-year
+     * boundary (2027-W01 → 2026-W53, which arithmetic on the number would get wrong).
+     */
+    private String previousWeekId() {
+        return weekIdOf(LocalDate.now(clock).minusWeeks(1));
     }
 
     static String templateId(String weekId, int puzzle) {
@@ -126,24 +139,75 @@ public class WeeklyTournamentService implements GameEndListener {
         return out;
     }
 
+    /** Which tournament puzzle a board is: its week and its 1-5 index. */
+    record PuzzleRef(String weekId, int puzzle) {}
+
+    /**
+     * Records a finished tournament puzzle.
+     *
+     * <p><b>The week comes from the board, not the clock.</b> This used to recompute
+     * {@code weekId()} at solve time and compare it against the id the board was
+     * stamped with at join time, so a puzzle joined on Sunday at 23:5x and solved on
+     * Monday at 00:0x matched none of the five candidates and fell out of the loop
+     * with no record and no log. That is worse here than for the daily: standings
+     * require all five puzzles ({@code times.size() == PUZZLES_PER_WEEK}), so one lost
+     * puzzle silently disqualifies the player for the entire week, and the tournament
+     * has exactly one Sunday-to-Monday boundary in it by construction. Every weekly
+     * test pins a {@code Clock.fixed}, so nothing could see it.
+     *
+     * <p>The previous week still counts — its times key lives 14 days, so recording
+     * into it is well inside the data's own lifetime — and anything older is logged
+     * rather than dropped in silence.
+     */
     @Override
     public void onGameEnded(SudokuBoard board, String playerId) {
         if (board == null || playerId == null || !board.isSolved()) return;
-        String week = weekId();
-        String gameId = board.getGameId();
-        for (int i = 1; i <= PUZZLES_PER_WEEK; i++) {
-            if (playerGameId(week, i, playerId).equals(gameId)) {
-                recordTime(week, playerId, i, Math.max(1, board.getSolveTime().toSeconds()));
-                Map<String, Long> times = timesFor(week, playerId);
-                if (times.size() == PUZZLES_PER_WEEK) {
-                    long total = times.values().stream().mapToLong(Long::longValue).sum();
-                    notify(playerId, "Tournament complete! Total " + total + "s — check the standings.");
-                } else {
-                    notify(playerId, "Tournament puzzle " + i + " done — "
-                        + (PUZZLES_PER_WEEK - times.size()) + " to go.");
-                }
-                return;
-            }
+        PuzzleRef ref = puzzleRefOf(board.getGameId(), playerId);
+        if (ref == null) return; // not this player's tournament copy
+
+        if (!ref.weekId().equals(weekId()) && !ref.weekId().equals(previousWeekId())) {
+            logger.info("Player {} finished tournament puzzle {} of {} — older than the previous "
+                + "week, gems only (no standings credit)", playerId, ref.puzzle(), ref.weekId());
+            return;
+        }
+
+        String week = ref.weekId();
+        int i = ref.puzzle();
+        recordTime(week, playerId, i, Math.max(1, board.getSolveTime().toSeconds()));
+        Map<String, Long> times = timesFor(week, playerId);
+        if (times.size() == PUZZLES_PER_WEEK) {
+            long total = times.values().stream().mapToLong(Long::longValue).sum();
+            notify(playerId, "Tournament complete! Total " + total + "s — check the standings.");
+        } else {
+            notify(playerId, "Tournament puzzle " + i + " done — "
+                + (PUZZLES_PER_WEEK - times.size()) + " to go.");
+        }
+    }
+
+    /**
+     * The week and index of the tournament puzzle this board <em>is</em>, or null when
+     * the board is not {@code playerId}'s own tournament copy.
+     *
+     * <p>Parses {@code week-<weekId>-p<n>:<playerId>}. Requiring the segment after the
+     * colon to equal the player id keeps another player's copy out, and the index is
+     * range-checked so a hand-crafted id cannot write a sixth puzzle into the hash and
+     * inflate {@code times.size()} past the all-five standings gate.
+     */
+    static PuzzleRef puzzleRefOf(String gameId, String playerId) {
+        if (gameId == null || playerId == null || !gameId.startsWith(WEEK_PREFIX)) return null;
+        String rest = gameId.substring(WEEK_PREFIX.length());
+        int colon = rest.indexOf(':');
+        if (colon < 0) return null;                                    // the shared template itself
+        if (!rest.substring(colon + 1).equals(playerId)) return null;  // not this player's copy
+        String left = rest.substring(0, colon);                        // "<weekId>-p<n>"
+        int p = left.lastIndexOf("-p");
+        if (p < 0) return null;
+        try {
+            int puzzle = Integer.parseInt(left.substring(p + 2));
+            if (puzzle < 1 || puzzle > PUZZLES_PER_WEEK) return null;
+            return new PuzzleRef(left.substring(0, p), puzzle);
+        } catch (NumberFormatException e) {
+            return null;
         }
     }
 

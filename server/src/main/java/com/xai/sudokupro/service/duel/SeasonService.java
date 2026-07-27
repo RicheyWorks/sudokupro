@@ -84,9 +84,23 @@ public class SeasonService {
 
     /**
      * Exactly-once (per season, across replicas) rollover: crowns last season's
-     * podium and soft-resets ratings. Runs lazily on the first query of a new
-     * season; before any season has ever been marked, it simply marks the
-     * current one so a fresh install doesn't "roll over" nothing.
+     * podium and soft-resets ratings. Runs lazily on the first query of a new season.
+     *
+     * <p><b>A rollover requires an actual boundary crossing.</b> Claiming the marker for
+     * the season now starting is what "this install was running during {@code <season>}"
+     * means, so the previous season's marker is the evidence that a season really ended
+     * while we were watching. Without that check the first {@code /api/season} call on a
+     * fresh install claimed the current marker and — on any non-empty ladder — went
+     * straight on to crown a podium and {@code softResetDuelRatings()} over EVERY rated
+     * player, in the middle of a quarter that had not ended. The javadoc claimed
+     * "before any season has ever been marked, it simply marks the current one", but no
+     * code implemented it: the only escape was an empty ladder, which stops being true
+     * the moment anyone duels. Any install that restored a database, or simply had the
+     * endpoint hit for the first time after some duels, silently destroyed its ladder.
+     *
+     * <p>Known trade-off, stated rather than hidden: an install dormant for a whole
+     * season skips one reset instead of crowning a podium for a season nobody played.
+     * Missing a reset is recoverable; a spurious reset is not.
      */
     void rolloverIfDue() {
         String startingSeason = seasonId();
@@ -96,8 +110,12 @@ public class SeasonService {
         // season's id — not the one just starting.
         String endedSeason = previousSeasonId();
 
-        // If this is the very first season this install has seen, there is no
-        // previous season to score — claiming the marker is all that's needed.
+        if (!wasObserved(endedSeason)) {
+            logger.info("Season {} is the first this install has observed — marker claimed, "
+                + "no rollover (nothing crowned, no ratings reset)", startingSeason);
+            return;
+        }
+
         List<User> podiumPlaces = userRepository.findDuelLadder(PageRequest.of(0, 3));
         if (podiumPlaces.isEmpty()) return;
 
@@ -119,6 +137,24 @@ public class SeasonService {
 
         logger.info("Season {} rollover complete: {} rated players reset, podium of {} crowned for {}",
             startingSeason, reset, podiumPlaces.size(), endedSeason);
+    }
+
+    /**
+     * Whether this install ever ran during {@code season} — i.e. whether its marker was
+     * claimed. Same degrade-to-local path as {@link #claimRollover}: with Redis down a
+     * single replica still reads its own markers, and a missing marker is read as "not
+     * observed", so an outage can only cause a rollover to be SKIPPED, never invented.
+     */
+    private boolean wasObserved(String season) {
+        try {
+            return Boolean.TRUE.equals(redis.hasKey(ROLLED_KEY + season));
+        } catch (Exception e) {
+            if (degradedLogged.compareAndSet(false, true)) {
+                logger.warn("SeasonService: Redis unavailable — season markers in-memory only. Cause: {}",
+                    e.getMessage());
+            }
+            return localRolled.containsKey(season);
+        }
     }
 
     private boolean claimRollover(String season) {

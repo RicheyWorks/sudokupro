@@ -136,6 +136,16 @@ public class DailyStateStore {
             next = 1;
         } else if (current.lastDate().equals(date)) {
             return; // double-guard; recordCompletion already filters repeats
+        } else if (current.lastDate().isAfter(date)) {
+            // An OLDER day completed after a newer one — a puzzle carried across
+            // midnight and finished while today's is already done. Without this the
+            // final `else` treated it as a broken chain: a live 5-day streak became 1,
+            // and lastDate moved BACKWARDS, so the next genuine completion could not
+            // extend it either. The newer completion already counted this player as
+            // current; filling in an earlier day must never cost them the streak.
+            logger.debug("Ignoring out-of-order daily completion for {} on {} (streak already at {})",
+                playerId, date, current.lastDate());
+            return;
         } else if (current.lastDate().equals(date.minusDays(1))) {
             next = current.count() + 1;
         } else {

@@ -8,6 +8,7 @@ import com.xai.sudokupro.model.api.DuelInfo;
 import com.xai.sudokupro.repository.UserRepository;
 import com.xai.sudokupro.service.AnalyticsService;
 import com.xai.sudokupro.service.GameEndListener;
+import com.xai.sudokupro.service.economy.EconomyService;
 import com.xai.sudokupro.service.GameService;
 import com.xai.sudokupro.service.NotificationService;
 import com.xai.sudokupro.service.duel.DuelStateStore.DuelRecord;
@@ -43,17 +44,20 @@ public class DuelService implements GameEndListener {
     private final UserRepository userRepository;
     private final NotificationService notificationService;
     private final AnalyticsService analyticsService;
+    private final EconomyService economyService;
 
     public DuelService(GameService gameService, SudokuGenerator generator,
                        DuelStateStore duels, UserRepository userRepository,
                        NotificationService notificationService,
-                       AnalyticsService analyticsService) {
+                       AnalyticsService analyticsService,
+                       EconomyService economyService) {
         this.gameService = gameService;
         this.generator = generator;
         this.duels = duels;
         this.userRepository = userRepository;
         this.notificationService = notificationService;
         this.analyticsService = analyticsService;
+        this.economyService = economyService;
     }
 
     static String duelGameId(String duelId, String playerId) {
@@ -255,9 +259,22 @@ public class DuelService implements GameEndListener {
         }
     }
 
+    /**
+     * The player's wallet, provisioned with the signing bonus if it does not exist yet.
+     *
+     * <p>This used to build {@code new User(null, playerId)} directly, whose constructor
+     * hard-sets {@code gems = 0} — so it skipped the starting-gem grant that
+     * {@link EconomyService#walletFor} makes, and the shortfall was permanent rather
+     * than a one-off: {@code AccountService.register} deliberately CLAIMS a pre-existing
+     * wallet row instead of granting the bonus, so a row created here could never be
+     * topped up later. Both duellists are provisioned from {@code recordResult},
+     * including the loser, for whom {@code EconomyService.onGameEnded} returns early
+     * because their board was never solved. A guest who lost a duel before registering
+     * was therefore stranded at 0 gems and could not afford a single 5-gem hint, ever.
+     * Delegating removes the second, divergent provisioning path entirely.
+     */
     private User walletFor(String playerId) {
-        return userRepository.findByUsername(playerId)
-            .orElseGet(() -> userRepository.save(new User(null, playerId)));
+        return economyService.walletFor(playerId);
     }
 
     private DuelRecord requireDuel(String duelId) {
