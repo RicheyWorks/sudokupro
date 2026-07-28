@@ -414,13 +414,16 @@ class LeaderboardServiceTest {
     /** Ranking order comes from the skill scores, not from the order the DB returns rows in. */
     @Test
     void combinedBoardOrdersBySkillScoreDescendingRegardlessOfDbOrder() {
+        // Keys are USERNAMES — the shape production actually produces. These tests used to
+        // seed numeric-string ids, which is precisely the unrealistic input that let the
+        // combined board return empty-forever in production while its tests passed.
         Map<String, Double> skills = new LinkedHashMap<>();
-        skills.put("1", 10.0);
-        skills.put("2", 30.0);
-        skills.put("3", 20.0);
+        skills.put("one", 10.0);
+        skills.put("two", 30.0);
+        skills.put("three", 20.0);
         when(analyticsService.getPlayerSkillScores()).thenReturn(skills);
         when(antiCheatEngine.getCheatSuspicionScores()).thenReturn(Map.of());
-        when(userRepository.findAllById(any()))
+        when(userRepository.findByUsernameIn(any()))
                 .thenReturn(List.of(user(1, "one", 1), user(2, "two", 2), user(3, "three", 3)));
 
         List<String> names = service.getTopPlayersCombinedPaged(0, 10).stream()
@@ -432,12 +435,15 @@ class LeaderboardServiceTest {
     /** Suspicion above the 75.0 threshold excludes a player; exactly 75.0 does not. */
     @Test
     void combinedBoardExcludesFlaggedCheatersAtTheThreshold() {
-        when(analyticsService.getPlayerSkillScores()).thenReturn(Map.of("1", 10.0, "2", 20.0, "3", 30.0));
-        when(antiCheatEngine.getCheatSuspicionScores()).thenReturn(Map.of("3", 75.5, "2", 75.0));
-        when(userRepository.findAllById(any())).thenAnswer(inv -> {
-            List<Long> ids = new ArrayList<>();
-            ((Iterable<Long>) inv.getArgument(0)).forEach(ids::add);
-            return ids.stream().map(id -> user(id, "u" + id, 1)).toList();
+        when(analyticsService.getPlayerSkillScores()).thenReturn(Map.of("u1", 10.0, "u2", 20.0, "u3", 30.0));
+        when(antiCheatEngine.getCheatSuspicionScores()).thenReturn(Map.of("u3", 75.5, "u2", 75.0));
+        when(userRepository.findByUsernameIn(any())).thenAnswer(inv -> {
+            List<User> out = new ArrayList<>();
+            long id = 1;
+            for (String name : inv.<java.util.Collection<String>>getArgument(0)) {
+                out.add(user(id++, name, 1));
+            }
+            return out;
         });
 
         List<String> names = service.getTopPlayersCombinedPaged(0, 10).stream()
@@ -446,12 +452,15 @@ class LeaderboardServiceTest {
         assertEquals(List.of("u2", "u1"), names, "75.5 is over the threshold, 75.0 is not");
     }
 
-    /** A non-numeric player id (e.g. "anonymous") must be skipped, not abort the whole board. */
+    /**
+     * A key with no users row behind it ("anonymous" never registers) resolves to nothing
+     * and is dropped, not rendered as a null row and not an abort of the whole board.
+     */
     @Test
-    void combinedBoardSkipsNonNumericPlayerIds() {
-        when(analyticsService.getPlayerSkillScores()).thenReturn(Map.of("anonymous", 99.0, "5", 1.0));
+    void combinedBoardSkipsKeysWithNoAccountBehindThem() {
+        when(analyticsService.getPlayerSkillScores()).thenReturn(Map.of("anonymous", 99.0, "five", 1.0));
         when(antiCheatEngine.getCheatSuspicionScores()).thenReturn(Map.of());
-        when(userRepository.findAllById(any())).thenReturn(List.of(user(5, "five", 1)));
+        when(userRepository.findByUsernameIn(any())).thenReturn(List.of(user(5, "five", 1)));
 
         List<String> names = service.getTopPlayersCombinedPaged(0, 10).stream()
                 .map(LeaderboardService.LeaderboardSnapshot::username).toList();
@@ -466,37 +475,39 @@ class LeaderboardServiceTest {
         when(antiCheatEngine.getCheatSuspicionScores()).thenReturn(Map.of());
 
         assertEquals(List.of(), service.getTopPlayersCombinedPaged(5, 10));
-        verify(userRepository, never()).findAllById(any());
+        verify(userRepository, never()).findByUsernameIn(any());
     }
 
-    /** Only the ids on the requested page are loaded — no N+1 / full-table load. */
+    /** Only the names on the requested page are loaded — no N+1 / full-table load. */
     @Test
-    void combinedBoardLoadsOnlyThePagesIdsInOneQuery() {
+    void combinedBoardLoadsOnlyThePagesNamesInOneQuery() {
         Map<String, Double> skills = new LinkedHashMap<>();
         for (long id = 1; id <= 40; id++) {
-            skills.put(String.valueOf(id), (double) id);
+            skills.put("player-" + id, (double) id);
         }
         when(analyticsService.getPlayerSkillScores()).thenReturn(skills);
         when(antiCheatEngine.getCheatSuspicionScores()).thenReturn(Map.of());
-        when(userRepository.findAllById(any())).thenAnswer(inv -> {
-            List<Long> ids = new ArrayList<>();
-            ((Iterable<Long>) inv.getArgument(0)).forEach(ids::add);
-            assertEquals(5, ids.size(), "exactly one page of ids should be loaded");
-            return ids.stream().map(id -> user(id, "u" + id, 1)).toList();
+        when(userRepository.findByUsernameIn(any())).thenAnswer(inv -> {
+            java.util.Collection<String> names = inv.getArgument(0);
+            assertEquals(5, names.size(), "exactly one page of names should be loaded");
+            List<User> out = new ArrayList<>();
+            long id = 1;
+            for (String name : names) out.add(user(id++, name, 1));
+            return out;
         });
 
         service.getTopPlayersCombinedPaged(1, 5);
 
-        verify(userRepository, times(1)).findAllById(any());
+        verify(userRepository, times(1)).findByUsernameIn(any());
         verify(userRepository, never()).findAll();
     }
 
-    /** Ids on the page that no longer exist in the DB are dropped, not rendered as nulls. */
+    /** Names on the page that no longer exist in the DB are dropped, not rendered as nulls. */
     @Test
     void combinedBoardToleratesDeletedUsers() {
-        when(analyticsService.getPlayerSkillScores()).thenReturn(Map.of("1", 10.0, "2", 20.0));
+        when(analyticsService.getPlayerSkillScores()).thenReturn(Map.of("one", 10.0, "two", 20.0));
         when(antiCheatEngine.getCheatSuspicionScores()).thenReturn(Map.of());
-        when(userRepository.findAllById(any())).thenReturn(List.of(user(1, "one", 1)));
+        when(userRepository.findByUsernameIn(any())).thenReturn(List.of(user(1, "one", 1)));
 
         List<LeaderboardService.LeaderboardSnapshot> page = service.getTopPlayersCombinedPaged(0, 10);
 
@@ -522,16 +533,17 @@ class LeaderboardServiceTest {
     @Test
     void eventBoardRanksByEventScoreForTheRequestedEventOnly() {
         Map<String, Integer> scores = new LinkedHashMap<>();
-        scores.put("1-e1", 5);
-        scores.put("2-e1", 9);
-        scores.put("3-e2", 1000);          // different event — must be ignored
-        scores.put("anonymous-e1", 7);     // non-numeric — must be skipped
+        scores.put("u1-e1", 5);
+        scores.put("u2-e1", 9);
+        scores.put("u3-e2", 1000);         // different event — must be ignored
         when(eventEngine.getPlayerEventScores()).thenReturn(scores);
-        when(userRepository.findAllById(any())).thenAnswer(inv -> {
-            List<Long> ids = new ArrayList<>();
-            ((Iterable<Long>) inv.getArgument(0)).forEach(ids::add);
-            assertFalse(ids.contains(3L), "a player from another event must not be loaded");
-            return ids.stream().map(id -> user(id, "u" + id, 42)).toList();
+        when(userRepository.findByUsernameIn(any())).thenAnswer(inv -> {
+            java.util.Collection<String> names = inv.getArgument(0);
+            assertFalse(names.contains("u3"), "a player from another event must not be loaded");
+            List<User> out = new ArrayList<>();
+            long id = 1;
+            for (String name : names) out.add(user(id++, name, 42));
+            return out;
         });
 
         List<LeaderboardService.LeaderboardSnapshot> page = service.getTopEventPlayersPaged("e1", 0, 10);
@@ -545,7 +557,7 @@ class LeaderboardServiceTest {
     @Test
     void eventBoardWithNoScoresIsEmpty() {
         when(eventEngine.getPlayerEventScores()).thenReturn(Map.of());
-        when(userRepository.findAllById(any())).thenReturn(List.of());
+        when(userRepository.findByUsernameIn(any())).thenReturn(List.of());
         assertEquals(List.of(), service.getTopEventPlayersPaged("e1", 0, 10));
     }
 

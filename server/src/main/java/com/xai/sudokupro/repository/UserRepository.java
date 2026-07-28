@@ -52,6 +52,9 @@ public interface UserRepository extends JpaRepository<User, Long>,
      */
     Optional<User> findByUsername(String username);
 
+    /** Batch lookup by username — the identity key the in-memory score maps carry. */
+    List<User> findByUsernameIn(java.util.Collection<String> usernames);
+
     /**
      * Atomically deducts {@code cost} gems, but only if the player can afford it.
      * Returns the number of rows updated: 1 on success, 0 if the balance was too low.
@@ -159,6 +162,21 @@ public interface UserRepository extends JpaRepository<User, Long>,
         + "AND user_id = (SELECT id FROM users WHERE username = :username)",
         nativeQuery = true)
     int incrementPowerUp(@Param("username") String username, @Param("type") String type);
+
+    /**
+     * Adds leaderboard points atomically, in the database.
+     *
+     * <p>The FIRST production writer {@code User.points} has ever had. The column existed
+     * from the baseline schema, five configurable points-per-solve values existed in
+     * {@code Constants}, the leaderboard ordered by it, and the anti-cheat scheduler
+     * queried for players above a points threshold — but no code path ever added a point.
+     * Same atomic single-statement shape as {@link #creditGemsAndXp} and for the same
+     * reason: this is the concurrent-wallet path.
+     */
+    @Transactional
+    @org.springframework.data.jpa.repository.Modifying(clearAutomatically = true, flushAutomatically = true)
+    @Query("UPDATE User u SET u.points = u.points + :points WHERE u.username = :username")
+    int creditPoints(@Param("username") String username, @Param("points") int points);
 
     /**
      * Adds {@code amount} gems and {@code xp} atomically, in the database.

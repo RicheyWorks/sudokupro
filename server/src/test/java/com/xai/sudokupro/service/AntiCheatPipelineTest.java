@@ -15,6 +15,7 @@ import java.util.Optional;
 import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyLong;
+import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.Mockito.*;
 
 /**
@@ -45,9 +46,14 @@ class AntiCheatPipelineTest {
         engine = new AntiCheatEngine(analyticsService, userRepository, gameRepository);
     }
 
-    private static User userWith(long id, String ip, String platform) {
+    /**
+     * A mock user carrying the identity production actually uses: the USERNAME. The engine
+     * used to key everything by the numeric id, and this helper used to hand out ids —
+     * which is exactly how the tests kept passing while every real player was skipped.
+     */
+    private static User userWith(String username, String ip, String platform) {
         User u = mock(User.class);
-        when(u.getId()).thenReturn(id);
+        lenient().when(u.getUsername()).thenReturn(username);
         when(u.getLastLoginIp()).thenReturn(ip);
         when(u.getPlatform()).thenReturn(platform);
         when(u.getDuelWins()).thenReturn(0);
@@ -68,19 +74,19 @@ class AntiCheatPipelineTest {
      */
     @Test
     void scoringACompletedGameFeedsTheSuspicionScoreTheSchedulerReads() {
-        User cheater = userWith(42L, "10.0.0.1", "ios");
-        when(userRepository.findById(42L)).thenReturn(Optional.of(cheater));
+        User cheater = userWith("speedster", "10.0.0.1", "ios");
+        when(userRepository.findByUsername("speedster")).thenReturn(Optional.of(cheater));
 
         assertTrue(engine.getCheatSuspicionScores().isEmpty(),
             "precondition: no suspicion recorded yet");
 
         // 900ms for a difficulty-1 board is far under the 10s-per-difficulty floor.
-        engine.scoreCompletedGame(boardSolvedIn(Duration.ofMillis(900)), "42");
+        engine.scoreCompletedGame(boardSolvedIn(Duration.ofMillis(900)), "speedster");
 
         Map<String, Double> scores = engine.getCheatSuspicionScores();
-        assertTrue(scores.containsKey("42"),
+        assertTrue(scores.containsKey("speedster"),
             "a suspiciously fast solve must register against the player");
-        assertTrue(scores.get("42") > 0.0,
+        assertTrue(scores.get("speedster") > 0.0,
             "the score the scheduler compares against its threshold must be non-zero");
     }
 
@@ -98,28 +104,30 @@ class AntiCheatPipelineTest {
      */
     @Test
     void aBurstOfDuelWinsIsScoredButALifetimeVeteranIsNot() {
-        User burster = userWith(101L, "10.0.0.9", "web");
-        when(userRepository.findById(101L)).thenReturn(Optional.of(burster));
-        // 21 wins seen recently, in this process — over the threshold of 20.
-        when(analyticsService.getDuelWins()).thenReturn(Map.of("101", 21));
+        User burster = userWith("burster", "10.0.0.9", "web");
+        when(userRepository.findByUsername("burster")).thenReturn(Optional.of(burster));
+        // 21 wins seen recently, in this process — over the threshold of 20. The analytics
+        // map is keyed by username, which is why the engine's numeric-id lookup could
+        // never see this number before the identity fix.
+        when(analyticsService.getDuelWins()).thenReturn(Map.of("burster", 21));
 
-        engine.scoreCompletedGame(boardSolvedIn(Duration.ofMinutes(5)), "101");
+        engine.scoreCompletedGame(boardSolvedIn(Duration.ofMinutes(5)), "burster");
 
-        assertTrue(engine.getCheatSuspicionScores().getOrDefault("101", 0.0) > 0.0,
+        assertTrue(engine.getCheatSuspicionScores().getOrDefault("burster", 0.0) > 0.0,
             "twenty-one duel wins inside one window is the signal this detector exists for");
 
         // A veteran: thousands of wins on the account, but almost none recently.
         User veteran = mock(User.class);
-        when(veteran.getId()).thenReturn(102L);
+        lenient().when(veteran.getUsername()).thenReturn("veteran");
         when(veteran.getLastLoginIp()).thenReturn("10.0.0.10");
         when(veteran.getPlatform()).thenReturn("web");
         lenient().when(veteran.getDuelWins()).thenReturn(5_000);
-        when(userRepository.findById(102L)).thenReturn(Optional.of(veteran));
-        when(analyticsService.getDuelWins()).thenReturn(Map.of("102", 2));
+        when(userRepository.findByUsername("veteran")).thenReturn(Optional.of(veteran));
+        when(analyticsService.getDuelWins()).thenReturn(Map.of("veteran", 2));
 
-        engine.scoreCompletedGame(boardSolvedIn(Duration.ofMinutes(5)), "102");
+        engine.scoreCompletedGame(boardSolvedIn(Duration.ofMinutes(5)), "veteran");
 
-        assertEquals(0.0, engine.getCheatSuspicionScores().getOrDefault("102", 0.0),
+        assertEquals(0.0, engine.getCheatSuspicionScores().getOrDefault("veteran", 0.0),
             "a long-standing player with a big lifetime record and no recent burst must "
                 + "not be flagged — the rate is the signal, not the total");
     }
@@ -130,14 +138,14 @@ class AntiCheatPipelineTest {
      */
     @Test
     void repeatedOffencesAccumulatePastTheSchedulerEnforcementThreshold() {
-        User cheater = userWith(7L, "10.0.0.2", "web");
-        when(userRepository.findById(7L)).thenReturn(Optional.of(cheater));
+        User cheater = userWith("persistent-cheat", "10.0.0.2", "web");
+        when(userRepository.findByUsername("persistent-cheat")).thenReturn(Optional.of(cheater));
 
         for (int i = 0; i < 20; i++) {
-            engine.scoreCompletedGame(boardSolvedIn(Duration.ofMillis(500)), "7");
+            engine.scoreCompletedGame(boardSolvedIn(Duration.ofMillis(500)), "persistent-cheat");
         }
 
-        double score = engine.getCheatSuspicionScores().getOrDefault("7", 0.0);
+        double score = engine.getCheatSuspicionScores().getOrDefault("persistent-cheat", 0.0);
         assertTrue(score >= 75.0,
             "sustained impossible solve times must reach the enforcement threshold, got " + score);
     }
@@ -152,12 +160,12 @@ class AntiCheatPipelineTest {
      */
     @Test
     void aBoardReportingNoElapsedTimeIsNotTreatedAsAnInstantSolve() {
-        User innocent = userWith(1L, "10.0.0.3", "android");
-        when(userRepository.findById(1L)).thenReturn(Optional.of(innocent));
+        User innocent = userWith("innocent", "10.0.0.3", "android");
+        when(userRepository.findByUsername("innocent")).thenReturn(Optional.of(innocent));
 
-        engine.scoreCompletedGame(boardSolvedIn(Duration.ZERO), "1");
+        engine.scoreCompletedGame(boardSolvedIn(Duration.ZERO), "innocent");
 
-        assertEquals(0.0, engine.getCheatSuspicionScores().getOrDefault("1", 0.0),
+        assertEquals(0.0, engine.getCheatSuspicionScores().getOrDefault("innocent", 0.0),
             "an unsolved or rehydrated board must not generate suspicion signals");
     }
 
@@ -169,50 +177,49 @@ class AntiCheatPipelineTest {
      */
     @Test
     void observingAGameRecordsTheIpAndDeviceTheSchedulerDetectorsRead() {
-        User player = userWith(9L, "203.0.113.7", "ios");
-        when(userRepository.findById(9L)).thenReturn(Optional.of(player));
+        User player = userWith("mobile-ada", "203.0.113.7", "ios");
+        when(userRepository.findByUsername("mobile-ada")).thenReturn(Optional.of(player));
 
-        engine.scoreCompletedGame(boardSolvedIn(Duration.ofMinutes(4)), "9");
+        engine.scoreCompletedGame(boardSolvedIn(Duration.ofMinutes(4)), "mobile-ada");
 
         assertEquals(Integer.valueOf(1),
-            engine.getIPSolveCounts().getOrDefault("203.0.113.7", Map.of()).get("9"),
+            engine.getIPSolveCounts().getOrDefault("203.0.113.7", Map.of()).get("mobile-ada"),
             "the IP-clustering detector needs a solve recorded against the IP");
-        assertTrue(engine.getDeviceSwitches().getOrDefault("9", Map.of()).containsKey("ios"),
+        assertTrue(engine.getDeviceSwitches().getOrDefault("mobile-ada", Map.of()).containsKey("ios"),
             "the device-switch detector needs the platform recorded against the player");
     }
 
-    /** Anonymous and non-numeric ids have no User row; scoring them must be a no-op. */
+    /** Anonymous and blank ids have no User row; scoring them must be a no-op. */
     @Test
     void unresolvablePlayerIdsAreSkippedRatherThanThrowing() {
         assertFalse(engine.scoreCompletedGame(boardSolvedIn(Duration.ofSeconds(1)), "anonymous"));
-        assertFalse(engine.scoreCompletedGame(boardSolvedIn(Duration.ofSeconds(1)), "not-a-number"));
         assertFalse(engine.scoreCompletedGame(boardSolvedIn(Duration.ofSeconds(1)), null));
-        assertFalse(engine.scoreCompletedGame(null, "1"));
+        assertFalse(engine.scoreCompletedGame(null, "somebody"));
         assertTrue(engine.getCheatSuspicionScores().isEmpty());
-        verify(userRepository, never()).findById(anyLong());
+        verify(userRepository, never()).findByUsername(anyString());
     }
 
     /** A player the repository does not know about must not be scored either. */
     @Test
-    void anUnknownUserIdIsSkipped() {
-        when(userRepository.findById(anyLong())).thenReturn(Optional.empty());
-        assertFalse(engine.scoreCompletedGame(boardSolvedIn(Duration.ofMillis(1)), "1234"));
+    void anUnknownUsernameIsSkipped() {
+        when(userRepository.findByUsername(anyString())).thenReturn(Optional.empty());
+        assertFalse(engine.scoreCompletedGame(boardSolvedIn(Duration.ofMillis(1)), "ghost"));
         assertTrue(engine.getCheatSuspicionScores().isEmpty());
     }
 
     /** Clean play must decay the score back down rather than latching it on. */
     @Test
     void cleanPlayDecaysAnExistingSuspicionScore() {
-        User player = userWith(5L, "10.0.0.9", "web");
-        when(userRepository.findById(5L)).thenReturn(Optional.of(player));
+        User player = userWith("redeemed", "10.0.0.9", "web");
+        when(userRepository.findByUsername("redeemed")).thenReturn(Optional.of(player));
 
-        engine.scoreCompletedGame(boardSolvedIn(Duration.ofMillis(100)), "5");
-        double afterOffence = engine.getCheatSuspicionScores().getOrDefault("5", 0.0);
+        engine.scoreCompletedGame(boardSolvedIn(Duration.ofMillis(100)), "redeemed");
+        double afterOffence = engine.getCheatSuspicionScores().getOrDefault("redeemed", 0.0);
         assertTrue(afterOffence > 0.0);
 
         // A twelve-minute solve trips nothing.
-        engine.scoreCompletedGame(boardSolvedIn(Duration.ofMinutes(12)), "5");
-        double afterCleanGame = engine.getCheatSuspicionScores().getOrDefault("5", 0.0);
+        engine.scoreCompletedGame(boardSolvedIn(Duration.ofMinutes(12)), "redeemed");
+        double afterCleanGame = engine.getCheatSuspicionScores().getOrDefault("redeemed", 0.0);
 
         assertTrue(afterCleanGame < afterOffence,
             "a clean game must decay suspicion, got " + afterCleanGame + " vs " + afterOffence);

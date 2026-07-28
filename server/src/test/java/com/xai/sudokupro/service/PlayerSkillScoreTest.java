@@ -93,14 +93,18 @@ class PlayerSkillScoreTest {
                 userRepository, mock(LeaderboardRepository.class), analytics,
                 mock(AntiCheatEngine.class), mock(MultiplayerBroadcaster.class), mock(EventEngine.class));
 
-        // Player 1 is the stronger solver: same puzzle count, half the time, no hints.
-        recordSolve("1", 120);
-        recordMoves("1", 40);
-        recordSolve("2", 600);
-        recordMoves("2", 40);
-        recordHints("2", 6);
+        // Ada is the stronger solver: same puzzle count, half the time, no hints. The
+        // keys are USERNAMES — production's shape. This test used to seed "1"/"2", the
+        // numeric-string ids the old Long.parseLong path happened to accept, which is how
+        // the headline regression test for this board passed while the board itself
+        // returned empty for every real player.
+        recordSolve("ada", 120);
+        recordMoves("ada", 40);
+        recordSolve("bob", 600);
+        recordMoves("bob", 40);
+        recordHints("bob", 6);
 
-        when(userRepository.findAllById(anyIterable()))
+        when(userRepository.findByUsernameIn(org.mockito.ArgumentMatchers.any()))
                 .thenReturn(List.of(new User(1L, "ada"), new User(2L, "bob")));
 
         List<LeaderboardService.LeaderboardSnapshot> board = leaderboard.getTopPlayersCombinedPaged(0, 10);

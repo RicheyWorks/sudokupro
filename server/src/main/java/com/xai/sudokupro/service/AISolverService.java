@@ -150,12 +150,30 @@ public class AISolverService {
     }
 
     /**
-     * Returns a hint string for a fixed test board — used by SudokuHealthMonitor
-     * to verify the solver is alive without touching a real game.
+     * Returns a hint string for a fixed test board — used by the health indicator to
+     * verify the solver is alive without touching a real game.
+     *
+     * <p><b>Read-only by construction.</b> This used to delegate to
+     * {@link #getNextLogicalMove(SudokuBoard)}, which records its answer into the two
+     * process-global maps every real hint shares: the 10-entry {@code recentHints}
+     * de-duplication window and the {@code cosmicHotspots} tie-break weights. Kubernetes
+     * probes both readiness and liveness through this path — roughly nine calls a minute
+     * per pod — so health traffic turned the entire {@code recentHints} window over about
+     * every seventy seconds and steadily biased the hotspot tie-break toward whatever
+     * coordinates the probe's throwaway board happened to produce. Paying players' hints
+     * were being filtered and re-ranked by the load balancer's heartbeat. The probe now
+     * scores candidates without recording anything.
      */
     public String getNextLogicalMoveForTestBoard() {
         SudokuBoard test = new SudokuBoard(3, false, false, 0L, "health-check");
-        return getNextLogicalMove(test);
+        SudokuCell[][] snapshot = test.getBoardCopy();
+        List<Hint> hints = collectAllHints(test, snapshot);
+        synchronized (recentHints) {
+            return hints.stream()
+                .max(Comparator.comparingInt(this::scoreHint))
+                .map(this::formatHint)
+                .orElse(NO_MOVES);
+        }
     }
 
     /**

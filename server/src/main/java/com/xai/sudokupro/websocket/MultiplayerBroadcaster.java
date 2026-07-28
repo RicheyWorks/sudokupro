@@ -3,7 +3,6 @@ package com.xai.sudokupro.websocket;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.xai.sudokupro.model.EnhancedMove;
 import com.xai.sudokupro.model.GameEvent;
-import com.xai.sudokupro.service.AnalyticsService;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -29,7 +28,6 @@ public class MultiplayerBroadcaster implements com.xai.sudokupro.model.MoveBroad
     // /topic and /queue destinations no client ever subscribed to.
     private final GameSessionRegistry sessionRegistry;
     private final ObjectMapper objectMapper;
-    private final AnalyticsService analyticsService;
 
     // Event subscriptions (topic → list of handlers)
     private final ConcurrentHashMap<String, CopyOnWriteArrayList<Consumer<String>>> eventSubscribers
@@ -45,40 +43,33 @@ public class MultiplayerBroadcaster implements com.xai.sudokupro.model.MoveBroad
 
     @Autowired
     public MultiplayerBroadcaster(GameSessionRegistry sessionRegistry,
-                                 ObjectMapper objectMapper,
-                                 AnalyticsService analyticsService) {
+                                 ObjectMapper objectMapper) {
         this.sessionRegistry = sessionRegistry;
         this.objectMapper = objectMapper;
-        this.analyticsService = analyticsService;
     }
 
     // ---- Core topic broadcasts ------------------------------------------
 
     @Override
     public void sendMove(String gameId, EnhancedMove move) {
-        broadcast(gameId, "move", move, "move_broadcast",
-                Map.of("gameId", gameId, "move", move.toString()));
+        broadcast(gameId, "move", move);
         notifyGameSubscribers(gameId);
     }
 
     public void sendGameEvent(String gameId, GameEvent event) {
-        broadcast(gameId, "event", event, "event_broadcast",
-                Map.of("gameId", gameId, "eventType", event.getType().toString()));
+        broadcast(gameId, "event", event);
     }
 
     public void sendBatchMoves(String gameId, List<EnhancedMove> moves) {
         if (moves == null || moves.isEmpty()) return;
 
-        broadcast(gameId, "batch_moves", moves, "batch_move_broadcast",
-                Map.of("gameId", gameId, "moveCount", moves.size()));
+        broadcast(gameId, "batch_moves", moves);
 
         notifyGameSubscribers(gameId);
     }
 
     public void sendGameStatus(String gameId, String status) {
-        broadcast(gameId, "status",
-                Map.of("status", status), "status_update",
-                Map.of("gameId", gameId, "status", status));
+        broadcast(gameId, "status", Map.of("status", status));
     }
 
     public void sendHint(String playerId, String hint) {
@@ -191,13 +182,17 @@ public class MultiplayerBroadcaster implements com.xai.sudokupro.model.MoveBroad
 
     // ---- Private --------------------------------------------------------
 
-    private void broadcast(String gameId, String type, Object payload,
-                           String analyticsEvent, Map<String, Object> analyticsData) {
+    private void broadcast(String gameId, String type, Object payload) {
         // Per-session delivery failures are handled (and logged) inside the registry;
         // the broker-level retry executor the STOMP path needed is gone with it.
+        //
+        // The analyticsEvent/analyticsData parameters are gone: they fed
+        // AnalyticsService.logEvent, an EMPTY method, so every broadcast allocated a
+        // payload map that was immediately discarded. Real analytics ingestion is
+        // recordEvent(GameEvent), which GameService already calls on the events that
+        // matter; nothing consumed a broadcast-level stream.
         sessionRegistry.broadcastToGame(gameId, null, Map.of("type", type, "from", SERVER, "payload", payload));
         messageRateCounter.incrementAndGet();
-        analyticsService.logEvent(analyticsEvent, analyticsData);
     }
 
     private void notifyGameSubscribers(String gameId) {

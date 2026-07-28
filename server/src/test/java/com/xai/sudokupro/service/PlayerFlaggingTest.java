@@ -67,7 +67,8 @@ class PlayerFlaggingTest {
     @Test
     void aFlagOutlivesTheProcessThatIssuedIt() {
         User player = newPlayer(80);
-        String playerId = String.valueOf(player.getId());
+        // The playerId handed to the engine in production is the USERNAME.
+        String playerId = player.getUsername();
 
         antiCheatEngine.flagPlayer(playerId);
 
@@ -92,7 +93,8 @@ class PlayerFlaggingTest {
     @Test
     void repeatFlagsAccumulateWithoutLosingTheFirstSighting() {
         User player = newPlayer(80);
-        String playerId = String.valueOf(player.getId());
+        // The playerId handed to the engine in production is the USERNAME.
+        String playerId = player.getUsername();
 
         antiCheatEngine.flagPlayer(playerId);
         var firstSeen = userRepository.findById(player.getId()).orElseThrow().getFirstFlaggedAt();
@@ -115,7 +117,7 @@ class PlayerFlaggingTest {
         User flagged = newPlayer(40);
         User clean = newPlayer(40);
 
-        antiCheatEngine.flagPlayer(String.valueOf(flagged.getId()));
+        antiCheatEngine.flagPlayer(flagged.getUsername());
 
         assertThat(userRepository.findFlaggedPlayers())
             .extracting(User::getId)
@@ -132,7 +134,8 @@ class PlayerFlaggingTest {
     @Test
     void clearingSuspicionAlsoClearsTheDurableFlag() {
         User player = newPlayer(60);
-        String playerId = String.valueOf(player.getId());
+        // The playerId handed to the engine in production is the USERNAME.
+        String playerId = player.getUsername();
 
         antiCheatEngine.flagPlayer(playerId);
         assertThat(antiCheatEngine.isFlagged(playerId)).isTrue();
@@ -154,7 +157,7 @@ class PlayerFlaggingTest {
     void theCosmicDripPenaltyIsUnchanged() {
         User player = newPlayer(80);
 
-        antiCheatEngine.flagPlayer(String.valueOf(player.getId()));
+        antiCheatEngine.flagPlayer(player.getUsername());
 
         assertThat(userRepository.findById(player.getId()).orElseThrow().getCosmicDrip())
             .isEqualTo(40);
@@ -165,12 +168,12 @@ class PlayerFlaggingTest {
     void nonPersistentPlayerIdsAreIgnored() {
         assertThatCode(() -> {
             antiCheatEngine.flagPlayer("anonymous");
-            antiCheatEngine.flagPlayer("not-a-number");
+            antiCheatEngine.flagPlayer("no-such-username-exists");
             antiCheatEngine.flagPlayer("");
             antiCheatEngine.flagPlayer(null);
         }).doesNotThrowAnyException();
 
         assertThat(antiCheatEngine.isFlagged("anonymous")).isFalse();
-        assertThat(antiCheatEngine.isFlagged("not-a-number")).isFalse();
+        assertThat(antiCheatEngine.isFlagged("no-such-username-exists")).isFalse();
     }
 }

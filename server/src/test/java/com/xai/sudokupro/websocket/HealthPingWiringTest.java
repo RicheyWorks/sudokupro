@@ -1,7 +1,6 @@
 package com.xai.sudokupro.websocket;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
-import com.xai.sudokupro.service.AnalyticsService;
 import org.junit.jupiter.api.Test;
 import org.springframework.scheduling.annotation.Scheduled;
 
@@ -39,7 +38,7 @@ class HealthPingWiringTest {
 
     private final GameSessionRegistry registry = mock(GameSessionRegistry.class);
     private final MultiplayerBroadcaster broadcaster = new MultiplayerBroadcaster(
-        registry, new ObjectMapper(), mock(AnalyticsService.class));
+        registry, new ObjectMapper());
 
     /**
      * The actual finding: the method must be invoked by something. An annotation assertion

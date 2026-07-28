@@ -159,32 +159,32 @@ public void updateScore(Long userId, int points) {
             Map<String, Double> skillScores = analyticsService.getPlayerSkillScores();
             Map<String, Double> suspicionScores = antiCheatEngine.getCheatSuspicionScores();
 
-            // Sort the in-memory skill-score map, filter suspicious IDs, then page.
-            // Only the page's IDs are loaded from the DB via findAllById.
-            // Fix 3: guard Long.parseLong — non-numeric player IDs (e.g. "anonymous") would
-            // throw NumberFormatException and abort the entire leaderboard fetch.
-            List<Long> pageIds = skillScores.entrySet().stream()
+            // Sort the in-memory skill-score map, filter suspicious players, then page.
+            // Only the page's names are loaded from the DB, in one batch.
+            //
+            // The keys here are USERNAMES — the skill map is fed by GameEvents recorded
+            // under the authenticated principal's name. This method used to Long.parseLong
+            // each key and warn-skip the "non-numeric" ones, which was every real player:
+            // the elaborate skill model upstream computed real scores, and this board
+            // returned an empty list forever, one warn line per player per fetch as the
+            // only trace. The regression test seeded numeric-string ids ("1", "2") that
+            // production never produces, so it passed throughout.
+            List<String> pageNames = skillScores.entrySet().stream()
                 .filter(e -> suspicionScores.getOrDefault(e.getKey(), 0.0) <= SUSPICION_THRESHOLD)
                 .sorted(Map.Entry.<String, Double>comparingByValue().reversed())
                 .skip((long) page * size)
                 .limit(size)
-                .flatMap(e -> {
-                    try { return java.util.stream.Stream.of(Long.parseLong(e.getKey())); }
-                    catch (NumberFormatException ex) {
-                        logger.warn("Skipping non-numeric player ID in combined leaderboard: {}", e.getKey());
-                        return java.util.stream.Stream.empty();
-                    }
-                })
+                .map(Map.Entry::getKey)
                 .collect(Collectors.toList());
 
-            if (pageIds.isEmpty()) {
+            if (pageNames.isEmpty()) {
                 return Collections.emptyList();
             }
 
-            // findAllById returns rows in arbitrary order; re-sort to match skill-score ranking.
-            Map<Long, User> userMap = userRepository.findAllById(pageIds).stream()
-                .collect(Collectors.toMap(User::getId, u -> u));
-            List<User> topPlayers = pageIds.stream()
+            // findByUsernameIn returns rows in arbitrary order; re-sort to skill ranking.
+            Map<String, User> userMap = userRepository.findByUsernameIn(pageNames).stream()
+                .collect(Collectors.toMap(User::getUsername, u -> u));
+            List<User> topPlayers = pageNames.stream()
                 .map(userMap::get)
                 .filter(java.util.Objects::nonNull)
                 .collect(Collectors.toList());
@@ -226,20 +226,13 @@ public void updateScore(Long userId, int points) {
                     Map.Entry::getValue,
                     (a, b) -> a
                 ));
-            // Fix 3 (cont.): same guard for event leaderboard player IDs.
-            List<Long> eventPlayerIds = eventScores.keySet().stream()
-                .flatMap(id -> {
-                    try { return java.util.stream.Stream.of(Long.parseLong(id)); }
-                    catch (NumberFormatException ex) {
-                        logger.warn("Skipping non-numeric player ID in event leaderboard: {}", id);
-                        return java.util.stream.Stream.empty();
-                    }
-                })
-                .collect(Collectors.toList());
-            List<User> topPlayers = withoutFlaggedPlayers(userRepository.findAllById(eventPlayerIds)).stream()
+            // Same identity fix as the combined board: event scores are keyed by
+            // username, and the old Long.parseLong guard skipped every real player.
+            List<User> topPlayers = withoutFlaggedPlayers(
+                    userRepository.findByUsernameIn(eventScores.keySet())).stream()
                 .sorted((u1, u2) -> Integer.compare(
-                    eventScores.getOrDefault(u2.getId().toString(), 0), 
-                    eventScores.getOrDefault(u1.getId().toString(), 0)))
+                    eventScores.getOrDefault(u2.getUsername(), 0),
+                    eventScores.getOrDefault(u1.getUsername(), 0)))
                 // (long) cast: page and size are both caller-supplied ints. page * size in int
                 // arithmetic overflows to a negative offset for large pages, and
                 // Stream.skip(negative) throws IllegalArgumentException — a 500 where an empty
@@ -386,9 +379,14 @@ public void updateScore(Long userId, int points) {
         Map<String, Double> suspicionScores = antiCheatEngine.getCheatSuspicionScores();
         // A player with no suspicion entry defaults to 0.0, i.e. unflagged. Defaulting the
         // other way would empty every board the moment the engine restarted.
+        // Compare by USERNAME: that is the key the engine's suspicion map carries (it is
+        // the authenticated principal's name, which is what every event and score in this
+        // application is recorded under). This compared u.getId().toString() — the numeric
+        // database id — so even a maximally-suspicious player passed the filter, because
+        // the numeric key could never match a username-keyed entry.
         List<User> clean = users.stream()
-            .filter(u -> u.getId() == null
-                      || suspicionScores.getOrDefault(u.getId().toString(), 0.0) <= SUSPICION_THRESHOLD)
+            .filter(u -> u.getUsername() == null
+                      || suspicionScores.getOrDefault(u.getUsername(), 0.0) <= SUSPICION_THRESHOLD)
             .collect(Collectors.toList());
         if (clean.size() != users.size()) {
             logger.info("Excluded {} flagged player(s) from a leaderboard page", users.size() - clean.size());
@@ -415,7 +413,9 @@ public void updateScore(Long userId, int points) {
         List<LeaderboardSnapshot> snapshots = new ArrayList<>(users.size());
         for (int i = 0; i < users.size(); i++) {
             User u = users.get(i);
-            String playerId = u.getId().toString();
+            // Username: the key every in-memory score map carries (event scores, deltas).
+            // The numeric id looked up entries that could not exist.
+            String playerId = u.getUsername();
             int rank = (int) Math.min(Integer.MAX_VALUE, offset + i + 1);
             int sortValue;
             switch (sortBy) {

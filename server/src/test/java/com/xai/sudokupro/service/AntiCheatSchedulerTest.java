@@ -34,7 +34,10 @@ class AntiCheatSchedulerTest {
     private GameRepository gameRepository;
     private AntiCheatScheduler scheduler;
 
-    private static final String PLAYER_ID = "42";
+    // A USERNAME, because that is what every engine map is keyed by in production. The
+    // previous "42" was the numeric-id shape the old code parsed — the same unrealistic
+    // seed that let the identity mismatch pass every test while skipping every real player.
+    private static final String PLAYER_ID = "suspect";
 
     @BeforeEach
     void setUp() {
@@ -44,9 +47,8 @@ class AntiCheatSchedulerTest {
         gameRepository = mock(GameRepository.class);
 
         User suspect = mock(User.class);
-        when(suspect.getId()).thenReturn(42L);
         lenient().when(suspect.getUsername()).thenReturn("suspect");
-        lenient().when(userRepository.findById(42L)).thenReturn(Optional.of(suspect));
+        lenient().when(userRepository.findByUsername("suspect")).thenReturn(Optional.of(suspect));
 
         // A player sitting above the enforcement threshold with a stale move rate — the
         // exact standing state the scan re-read every minute. Nothing here decays: the

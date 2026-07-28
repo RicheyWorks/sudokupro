@@ -121,7 +121,10 @@ public class AntiCheatScheduler {
 
     private void checkHighPointSolvers(List<User> potentialCheaters, Map<String, Double> suspicionScores) {
         potentialCheaters.forEach(u -> {
-            String playerId = u.getId().toString();
+            // Username, not numeric id: every map the engine keeps is keyed by the
+            // authenticated principal's name. The numeric key looked up a score that
+            // could not exist and read 0.0 for everyone.
+            String playerId = u.getUsername();
             int points = u.getPoints();
             double suspicionScore = suspicionScores.getOrDefault(playerId, 0.0);
             if (suspicionScore >= SUSPICION_SCORE_THRESHOLD) {
@@ -294,15 +297,17 @@ public class AntiCheatScheduler {
      * instead of throwing NumberFormatException.
      */
     private User findUserByPlayerId(String playerId) {
-        if (playerId == null || playerId.isBlank() || "anonymous".equals(playerId)) {
+        if (playerId == null || playerId.isBlank() || "anonymous".equals(playerId)
+                || playerId.startsWith("__")) {
             return null;
         }
-        try {
-            return userRepository.findById(Long.parseLong(playerId)).orElse(null);
-        } catch (NumberFormatException e) {
-            logger.debug("Skipping non-numeric playerId '{}' in anti-cheat scan", playerId);
-            return null;
-        }
+        // The keys in every detector input are USERNAMES — that is what the engine and
+        // analytics record under. This used to Long.parseLong the key and findById, so a
+        // real player's entry hit the NumberFormatException branch and the detector
+        // treated the player as nonexistent: with the engine's own keying fixed to
+        // usernames, leaving this numeric would have re-broken all six map-driven
+        // detectors one step later.
+        return userRepository.findByUsername(playerId).orElse(null);
     }
 
     /**
@@ -345,7 +350,7 @@ public class AntiCheatScheduler {
      * ways it is described.
      */
     private void flagPlayer(User user, String reason) {
-        String playerId = user.getId().toString();
+        String playerId = user.getUsername();
         LocalDateTime previous = lastFlagged.get(playerId);
         if (previous != null && previous.isAfter(now().minusMinutes(FLAG_COOLDOWN_MINUTES))) {
             logger.info("Suppressing repeat flag for {} (last flagged {}): {}",

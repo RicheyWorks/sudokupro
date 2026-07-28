@@ -59,6 +59,12 @@ class EconomyServiceTest {
             return 1;
         });
         lenient().when(repo.updateLevel(anyString(), anyInt())).thenReturn(1);
+        lenient().when(repo.creditPoints(anyString(), anyInt())).thenAnswer(inv -> {
+            User u = users.get(inv.<String>getArgument(0));
+            if (u == null) return 0;
+            u.setPoints(u.getPoints() + inv.<Integer>getArgument(1));
+            return 1;
+        });
         // Emulate the atomic conditional UPDATE: decrement only if affordable, and do it
         // under a lock so the mock behaves like the single SQL statement it stands in for.
         lenient().when(repo.deductGemsIfAffordable(anyString(), org.mockito.ArgumentMatchers.anyInt()))
@@ -103,6 +109,44 @@ class EconomyServiceTest {
 
         assertEquals(STARTING_GEMS + 3 * 10 + CLEAN_BONUS, users.get("richmond").getGems());
         assertTrue(users.get("richmond").getXp() > 0, "solves must grant XP too");
+    }
+
+    /**
+     * Solving must credit leaderboard POINTS, from the per-tier table Constants has always
+     * carried.
+     *
+     * <p>{@code User.points} had no production writer at all: the column existed from the
+     * baseline schema, five configurable points-per-solve values sat unread in Constants,
+     * the public leaderboard ordered by the column, and the anti-cheat scheduler queried
+     * for players above a points threshold — but no code path ever added a point. Everyone
+     * held 0, so ORDER BY points fell through to the id tie-break: the "top players" board
+     * was literally the oldest accounts, every one of them tier "Unranked".
+     */
+    @Test
+    void solvingCreditsLeaderboardPointsPerDifficultyTier() {
+        economy.onGameEnded(solvedBoard("g-hard", "richmond", 3), "richmond");
+        assertEquals(com.xai.sudokupro.util.Constants.POINTS_PER_SOLVE_HARD,
+            users.get("richmond").getPoints(),
+            "a tier-3 solve pays the HARD points value");
+
+        economy.onGameEnded(solvedBoard("g-night", "richmond", 5), "richmond");
+        assertEquals(com.xai.sudokupro.util.Constants.POINTS_PER_SOLVE_HARD
+                + com.xai.sudokupro.util.Constants.POINTS_PER_SOLVE_NIGHTMARE,
+            users.get("richmond").getPoints(),
+            "points accumulate across solves — they are the leaderboard's ranking currency");
+    }
+
+    /**
+     * An out-of-range difficulty clamps into the 1..5 tier table rather than scaling past
+     * it. Difficulty is a plain int column, and at least one dormant producer (the puzzle
+     * editor's 0-10 estimate) writes values outside the tier range; a clamp keeps a
+     * mis-scaled row from paying a premium over NIGHTMARE.
+     */
+    @Test
+    void outOfRangeDifficultyClampsIntoTheTierTable() {
+        economy.onGameEnded(solvedBoard("g-weird", "richmond", 9), "richmond");
+        assertEquals(com.xai.sudokupro.util.Constants.POINTS_PER_SOLVE_NIGHTMARE,
+            users.get("richmond").getPoints());
     }
 
     @Test

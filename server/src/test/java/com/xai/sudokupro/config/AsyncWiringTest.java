@@ -71,7 +71,7 @@ class AsyncWiringTest {
             new java.util.concurrent.ConcurrentLinkedQueue<>();
 
         RecordingBroadcaster() {
-            super(null, null, null);
+            super(null, null);
         }
 
         @Override

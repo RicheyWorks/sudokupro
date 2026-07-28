@@ -63,21 +63,22 @@ class AntiCheatEngineTest {
 
     @Test
     void flagPlayerHalvesCosmicDripForRealUsers() {
+        // Resolved by USERNAME — the identity every caller actually passes.
         com.xai.sudokupro.model.User user = new com.xai.sudokupro.model.User(42L, "richmond");
         user.setCosmicDrip(80);
-        org.mockito.Mockito.when(userRepository.findById(42L))
+        org.mockito.Mockito.when(userRepository.findByUsername("richmond"))
             .thenReturn(java.util.Optional.of(user));
 
-        engine.flagPlayer("42");
+        engine.flagPlayer("richmond");
 
         assertEquals(40, user.getCosmicDrip(), "Flagging must halve the player's cosmic drip");
         org.mockito.Mockito.verify(userRepository).save(user);
     }
 
     @Test
-    void flagPlayerIgnoresAnonymousAndNonNumericIds() {
+    void flagPlayerIgnoresPseudoPlayers() {
         engine.flagPlayer("anonymous");
-        engine.flagPlayer("player_abc123");
+        engine.flagPlayer("__daily__");
         engine.flagPlayer(null);
 
         org.mockito.Mockito.verifyNoInteractions(userRepository);

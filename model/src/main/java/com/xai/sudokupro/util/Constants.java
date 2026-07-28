@@ -165,7 +165,38 @@ public class Constants {
 
     // Static accessor fields
     public static int POINTS_PER_SOLVE_EASY = 10;
+    public static int POINTS_PER_SOLVE_MEDIUM = 20;
+    public static int POINTS_PER_SOLVE_HARD = 30;
+    public static int POINTS_PER_SOLVE_EXTREME = 50;
+    public static int POINTS_PER_SOLVE_NIGHTMARE = 100;
     public static int GEMS_PER_DUEL_WIN = 10;
+
+    /**
+     * Points paid for solving a board of the given difficulty tier (1..5).
+     *
+     * <p>This is the READ side of a table that had no reader: the five
+     * {@code pointsPerSolve*} fields above have been configurable since this class was
+     * written, and {@code User.points} — the number the public leaderboard ranks on —
+     * had no production writer at all. Solving paid gems and XP only, so every player
+     * held 0 points, {@code ORDER BY u.points DESC, u.id ASC} fell through to the
+     * tie-break, and the "top players" board was literally the N oldest accounts, all
+     * tier "Unranked". The anti-cheat high-point-solver detector queried for players
+     * above a points threshold nobody could reach.
+     *
+     * <p>Out-of-range tiers clamp rather than throw: difficulty is stored as a plain int
+     * column and at least one dormant producer (the puzzle editor's 0-10 estimate) writes
+     * values outside 1..5. A clamp keeps a mis-scaled row from paying 10x.
+     */
+    public static int pointsForTier(int tier) {
+        int clamped = Math.max(MIN_DIFFICULTY_TIER, Math.min(MAX_DIFFICULTY_TIER, tier));
+        return switch (clamped) {
+            case 1 -> POINTS_PER_SOLVE_EASY;
+            case 2 -> POINTS_PER_SOLVE_MEDIUM;
+            case 3 -> POINTS_PER_SOLVE_HARD;
+            case 4 -> POINTS_PER_SOLVE_EXTREME;
+            default -> POINTS_PER_SOLVE_NIGHTMARE;
+        };
+    }
 
     /** Points-per-hour threshold above which a player is considered a potential solver-bot. */
     public static int SOLVER_DETECTION_THRESHOLD = 100;
@@ -187,6 +218,10 @@ public class Constants {
 
         // Sync statics
         POINTS_PER_SOLVE_EASY = pointsPerSolveEasy;
+        POINTS_PER_SOLVE_MEDIUM = pointsPerSolveMedium;
+        POINTS_PER_SOLVE_HARD = pointsPerSolveHard;
+        POINTS_PER_SOLVE_EXTREME = pointsPerSolveExtreme;
+        POINTS_PER_SOLVE_NIGHTMARE = pointsPerSolveNightmare;
         GEMS_PER_DUEL_WIN = gemsPerDuelWin;
 
         TIME_ATTACK_SECONDS    = timeAttackSeconds;

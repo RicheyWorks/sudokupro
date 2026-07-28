@@ -86,8 +86,14 @@ class LeaderboardFairnessTest {
         private EventEngine eventEngine;
         private LeaderboardService service;
 
-        /** id 2 is the cheater the pipeline already caught. */
-        private static final String FLAGGED = "2";
+        /**
+         * The suspicion map is keyed by USERNAME — the authenticated principal's name,
+         * which is what every event in the application is recorded under. This test used
+         * to key the flag by numeric id ("2"), which conveniently matched the service's
+         * own numeric-id lookup — both sides of a key mismatch that meant NO real player
+         * could ever be filtered, since real suspicion entries carry usernames.
+         */
+        private static final String FLAGGED = "cheater";
 
         @BeforeEach
         void setUp() {
@@ -111,8 +117,9 @@ class LeaderboardFairnessTest {
             when(leaderboardRepository.findActiveStreakCosmonauts(anyInt(), any(LocalDateTime.class), any(Pageable.class)))
                     .thenReturn(threePlayers);
             when(userRepository.findAllById(anyIterable())).thenReturn(threePlayers);
-            when(analyticsService.getPlayerSkillScores()).thenReturn(Map.of("1", 30.0, "2", 20.0, "3", 10.0));
-            when(eventEngine.getPlayerEventScores()).thenReturn(Map.of("1-e", 30, "2-e", 20, "3-e", 10));
+            when(userRepository.findByUsernameIn(any())).thenReturn(threePlayers);
+            when(analyticsService.getPlayerSkillScores()).thenReturn(Map.of("clean-top", 30.0, "cheater", 20.0, "clean-bottom", 10.0));
+            when(eventEngine.getPlayerEventScores()).thenReturn(Map.of("clean-top-e", 30, "cheater-e", 20, "clean-bottom-e", 10));
         }
 
         private void flagWithSuspicion(double score) {

@@ -81,7 +81,19 @@ public class AntiCheatEngine {
 
     public synchronized boolean detectCheating(SudokuBoard board, User user) {
 
-        String playerId = String.valueOf(user.getId());
+        // The USERNAME is the identity key, here and in every map this class keeps.
+        //
+        // This was String.valueOf(user.getId()) — the numeric database id — and that one
+        // line disabled two detectors and mis-keyed every map. The analytics maps this
+        // method reads (skill scores, duel wins) are keyed by username, because that is
+        // what GameService emits events under; looking them up by numeric id returned the
+        // default 0.0/0 for every player alive, so the peer-skill-ratio signal and the
+        // duel-win-burst signal could never fire — both of them the subject of earlier
+        // "made real" fixes that this key mismatch quietly undid. And the maps this method
+        // WRITES (the suspicion score above all) came out keyed by numeric id, which is
+        // not what the leaderboard's cheater filter or the scheduler's username-keyed
+        // detector inputs compare against.
+        String playerId = user.getUsername();
         validatePlayerId(playerId);
 
         String ip = user.getLastLoginIp() == null ? "unknown" : user.getLastLoginIp();
@@ -218,16 +230,20 @@ public class AntiCheatEngine {
         if (board == null || playerId == null || playerId.isBlank() || "anonymous".equals(playerId)) {
             return false;
         }
-        long userId;
-        try {
-            userId = Long.parseLong(playerId);
-        } catch (NumberFormatException e) {
-            logger.debug("Skipping cheat scoring for non-numeric playerId '{}'", playerId);
-            return false;
-        }
-        return userRepository.findById(userId)
+        // Resolve by USERNAME. The playerId GameService passes here is the authenticated
+        // principal's name — a username, everywhere in this application. This method used
+        // to Long.parseLong it and look up findById, so every real game took the debug-level
+        // early return and the pipeline pass 15 built stayed empty in production: the
+        // suspicion map had no writer again, every scheduler detector compared 0.0 >= 75,
+        // and the sudokupro.suspicious.players gauge read a flat zero. The unit tests all
+        // passed, because they seeded numeric-string ids ("42") that production never
+        // produces — the exact blind spot the tests now cover with realistic names.
+        return userRepository.findByUsername(playerId)
             .map(user -> detectCheating(board, user))
-            .orElse(false);
+            .orElseGet(() -> {
+                logger.debug("Skipping cheat scoring for unknown player '{}'", playerId);
+                return false;
+            });
     }
 
     public synchronized Map<String, Double> getCheatSuspicionScores() {
@@ -255,9 +271,7 @@ public class AntiCheatEngine {
      * elsewhere and are deliberately left exactly as they were.
      */
     public synchronized void flagPlayer(String playerId) {
-        Long userId = persistentUserId(playerId);
-        if (userId == null) return;
-        userRepository.findById(userId).ifPresent(user -> {
+        resolveUser(playerId).ifPresent(user -> {
             user.setCosmicDrip(Math.max(0, user.getCosmicDrip() / 2));
             user.recordCheatFlag(LocalDateTime.now());
             userRepository.save(user);
@@ -273,26 +287,26 @@ public class AntiCheatEngine {
      * persisted flag is that it answers correctly on a pod that did not make the decision.
      */
     public boolean isFlagged(String playerId) {
-        Long userId = persistentUserId(playerId);
-        if (userId == null) return false;
-        return userRepository.findById(userId).map(User::isCheatFlagged).orElse(false);
+        return resolveUser(playerId).map(User::isCheatFlagged).orElse(false);
     }
 
     /**
-     * Resolves a playerId to a persistent user id, or null when there is no row behind it
-     * (anonymous play, daily/duel template pseudo-players, blank ids).
+     * Filters out ids that cannot have a users row (anonymous play, daily/duel template
+     * pseudo-players, blanks), resolving the rest to their users row by USERNAME.
+     *
+     * <p>Replaces {@code persistentUserId}, which tried {@code Long.parseLong} on the id —
+     * but the id is a USERNAME, so the parse failed for every real player and the flag,
+     * is-flagged and clear paths were all silent no-ops in production. Only the numeric
+     * "42"-style ids the unit tests seeded ever got through, which is why every test
+     * passed while nothing worked.
      */
-    private Long persistentUserId(String playerId) {
-        if (playerId == null || playerId.isBlank() || "anonymous".equals(playerId)) {
+    private java.util.Optional<User> resolveUser(String playerId) {
+        if (playerId == null || playerId.isBlank() || "anonymous".equals(playerId)
+                || playerId.startsWith("__")) {
             logger.debug("Skipping flag operation for non-persistent playerId: {}", playerId);
-            return null;
+            return java.util.Optional.empty();
         }
-        try {
-            return Long.parseLong(playerId);
-        } catch (NumberFormatException e) {
-            logger.debug("Non-numeric playerId '{}' has no DB record to flag", playerId);
-            return null;
-        }
+        return userRepository.findByUsername(playerId);
     }
 
     /** Returns a snapshot of per-player move rates (moves counted in current window). */
@@ -347,15 +361,12 @@ public class AntiCheatEngine {
         // only caller. Clearing only the in-memory signal would leave the durable flag set
         // forever, so an exonerated player would still read as flagged to every other pod
         // and to whoever looks at the record next.
-        Long userId = persistentUserId(playerId);
-        if (userId != null) {
-            userRepository.findById(userId).ifPresent(user -> {
-                if (user.isCheatFlagged()) {
-                    user.clearCheatFlags();
-                    userRepository.save(user);
-                }
-            });
-        }
+        resolveUser(playerId).ifPresent(user -> {
+            if (user.isCheatFlagged()) {
+                user.clearCheatFlags();
+                userRepository.save(user);
+            }
+        });
         logger.info("Cleared suspicion data and anti-cheat flags for player {}", playerId);
     }
 

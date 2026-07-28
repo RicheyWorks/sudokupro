@@ -132,6 +132,13 @@ public class EconomyService implements GameEndListener {
                 logger.warn("Solve credit for {} matched no wallet row", playerId);
                 return;
             }
+            // Leaderboard points, from the per-tier table Constants has carried all along.
+            // Until this line, User.points had NO production writer: everyone held 0, the
+            // public board's ORDER BY points fell through to the id tie-break (the "top
+            // players" were the oldest accounts), every tier read "Unranked", and the
+            // high-point-solver anti-cheat query could never match a row.
+            int points = com.xai.sudokupro.util.Constants.pointsForTier(board.getDifficulty());
+            userRepository.creditPoints(playerId, points);
             // level is a pure function of xp (1 + xp/100), so recomputing it from a fresh
             // read is safe and self-healing: a concurrent credit can only make it briefly
             // stale, and the next credit corrects it.
@@ -139,8 +146,8 @@ public class EconomyService implements GameEndListener {
                 int derived = 1 + (fresh.getXp() / 100);
                 if (derived > fresh.getLevel()) userRepository.updateLevel(playerId, derived);
             });
-            logger.info("Player {} earned {} gems for solving {}",
-                playerId, earned, board.getGameId());
+            logger.info("Player {} earned {} gems and {} points for solving {}",
+                playerId, earned, points, board.getGameId());
         } catch (Exception e) {
             logger.warn("Failed to award solve gems to {}: {}", playerId, e.getMessage());
         }

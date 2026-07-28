@@ -204,7 +204,14 @@ public class AnalyticsService {
 
     // ---- COMPATIBILITY METHODS ----
 
-    public void logEvent(String type, Map<String, Object> data) {}
+    // logEvent(String, Map) is GONE. It was an empty method — {} — called by
+    // MultiplayerBroadcaster's private broadcast funnel on every game update, chat, join
+    // and event fan-out, with a freshly allocated payload map per message. The
+    // "COMPATIBILITY METHODS" banner made it read as intentional; what it actually did
+    // was discard the entire broadcast-level analytics stream while charging per-message
+    // allocation for the privilege. The broadcaster no longer builds or passes the
+    // payload. If broadcast analytics are ever wanted, recordEvent(GameEvent) is the real
+    // ingestion path — it feeds the maps every consumer actually reads.
 
     /**
      * Per-player skill score on a 0-100 scale, derived from the play data this service
