@@ -86,49 +86,65 @@ public class PowerUpService {
     @Transactional
     public void use(String playerId, String type, String gameId, String target) {
         if (!CATALOG.containsKey(type)) throw new IllegalArgumentException("Unknown power-up: " + type);
-        User wallet = economyService.walletFor(playerId);
-        Map<String, Integer> inventory = wallet.getPowerUps();
-        int held = inventory.getOrDefault(type, 0);
-        if (held <= 0) throw new IllegalStateException("You do not hold a " + type);
+        // Ensure the wallet row exists before touching the join table (the native decrement
+        // resolves the user by username).
+        economyService.walletFor(playerId);
 
-        // Board effects run through GameService, which is the single place that holds
-        // the game lock, broadcasts, and writes through to Redis and the database. Doing
-        // them here meant a paid change lived in one pod's cache and nowhere else — see
-        // GameService.revealCell for the full shape. Both throw before the inventory
-        // decrement below, so a reveal with no derivable cell still costs nothing.
-        switch (type) {
-            case "EXTRA_LIFE" -> {
-                requireGameId(gameId);
-                gameService.grantExtraLife(gameId, playerId);
-            }
-            case "REVEAL_CELL" -> {
-                requireGameId(gameId);
-                gameService.revealCell(gameId, playerId);
-            }
-            case "FREEZE" -> {
-                if (target == null || target.isBlank() || target.equals(playerId)) {
-                    throw new IllegalArgumentException("FREEZE needs an opposing player");
-                }
-                // This checked only "not blank, not me", so it froze ANY player on the
-                // platform — pick a name off the public leaderboard and lock their input
-                // for ten seconds. The class javadoc says FREEZE "locks a duel opponent's
-                // input"; its two siblings both go through requireOwnGame, and this had
-                // nothing. It is also silent to the victim: GameService.applyMove drops a
-                // locked player's move with a log line and no error, while the WebSocket
-                // layer has already broadcast the move envelope, so their client shows a
-                // move the authoritative board never recorded. Verified live before the
-                // fix against an unrelated account.
-                if (!duels.hasActiveDuelBetween(playerId, target)) {
-                    throw new SecurityException("FREEZE can only target an opponent in an active duel");
-                }
-                gameService.lockPlayerInput(target, FREEZE_MS);
-            }
-            default -> throw new IllegalArgumentException("Unknown power-up: " + type);
+        // RESERVE the unit atomically, before running the effect. This was a
+        // read-modify-write on the whole wallet row — read the powerUps map, subtract in
+        // Java, save the entire row — the exact pattern buy() was already fixed away from.
+        // Two concurrent uses both saw held=1 and both succeeded (two frozen opponents, two
+        // revealed cells, off one purchase), and the full-row save reverted any gem charge
+        // that committed in between. The conditional decrement is now the single source of
+        // truth for "do you hold one": its power_ups > 0 guard is what a concurrent second
+        // call loses against.
+        if (userRepository.decrementPowerUpIfHeld(playerId, type) == 0) {
+            throw new IllegalStateException("You do not hold a " + type);
         }
 
-        inventory.put(type, held - 1);
-        wallet.setPowerUps(inventory);
-        userRepository.save(wallet);
+        try {
+            // Board effects run through GameService, which is the single place that holds
+            // the game lock, broadcasts, and writes through to Redis and the database. Doing
+            // them here meant a paid change lived in one pod's cache and nowhere else — see
+            // GameService.revealCell for the full shape.
+            switch (type) {
+                case "EXTRA_LIFE" -> {
+                    requireGameId(gameId);
+                    gameService.grantExtraLife(gameId, playerId);
+                }
+                case "REVEAL_CELL" -> {
+                    requireGameId(gameId);
+                    gameService.revealCell(gameId, playerId);
+                }
+                case "FREEZE" -> {
+                    if (target == null || target.isBlank() || target.equals(playerId)) {
+                        throw new IllegalArgumentException("FREEZE needs an opposing player");
+                    }
+                    // This checked only "not blank, not me", so it froze ANY player on the
+                    // platform — pick a name off the public leaderboard and lock their input
+                    // for ten seconds. The class javadoc says FREEZE "locks a duel opponent's
+                    // input"; its two siblings both go through requireOwnGame, and this had
+                    // nothing. It is also silent to the victim: GameService.applyMove drops a
+                    // locked player's move with a log line and no error, while the WebSocket
+                    // layer has already broadcast the move envelope, so their client shows a
+                    // move the authoritative board never recorded. Verified live before the
+                    // fix against an unrelated account.
+                    if (!duels.hasActiveDuelBetween(playerId, target)) {
+                        throw new SecurityException("FREEZE can only target an opponent in an active duel");
+                    }
+                    gameService.lockPlayerInput(target, FREEZE_MS);
+                }
+                default -> throw new IllegalArgumentException("Unknown power-up: " + type);
+            }
+        } catch (RuntimeException e) {
+            // The effect refused (not your game, no active duel, no derivable cell, bad
+            // target). Hand the reserved unit back so a rejected use costs nothing — the
+            // contract GameServicePowerUpEffectTest and this class's tests both pin. This
+            // is correct whether or not the surrounding transaction rolls back: on rollback
+            // the decrement is undone too, so the net is still "not consumed".
+            userRepository.incrementPowerUp(playerId, type);
+            throw e;
+        }
         logger.info("{} used {} (game={}, target={})", playerId, type, gameId, target);
     }
 

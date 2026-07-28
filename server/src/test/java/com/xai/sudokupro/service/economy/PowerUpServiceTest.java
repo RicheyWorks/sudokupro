@@ -63,6 +63,37 @@ class PowerUpServiceTest {
                 return 1;
             }
         });
+        // use() now reserves a unit through the same kind of atomic conditional UPDATE a
+        // hint charge uses, instead of a read-modify-write on the whole wallet row. The two
+        // fakes below apply the real semantics — a conditional decrement guarded on
+        // power_ups > 0, and a compensating increment — to the in-memory users, keeping the
+        // service logic under test rather than replacing it. Synchronised on `users` to
+        // model the row lock the real UPDATE takes.
+        lenient().when(repo.decrementPowerUpIfHeld(anyString(), anyString())).thenAnswer(inv -> {
+            synchronized (users) {
+                User u = users.get(inv.<String>getArgument(0));
+                String type = inv.getArgument(1);
+                if (u == null) return 0;
+                Map<String, Integer> inv2 = u.getPowerUps();
+                int held = inv2.getOrDefault(type, 0);
+                if (held <= 0) return 0;
+                inv2.put(type, held - 1);
+                u.setPowerUps(inv2);
+                return 1;
+            }
+        });
+        lenient().when(repo.incrementPowerUp(anyString(), anyString())).thenAnswer(inv -> {
+            synchronized (users) {
+                User u = users.get(inv.<String>getArgument(0));
+                String type = inv.getArgument(1);
+                if (u == null) return 0;
+                Map<String, Integer> inv2 = u.getPowerUps();
+                if (!inv2.containsKey(type)) return 0;
+                inv2.put(type, inv2.get(type) + 1);
+                u.setPowerUps(inv2);
+                return 1;
+            }
+        });
         // 100 starting gems so purchases fit
         service = new PowerUpService(new EconomyService(repo, 5, 100, 5), repo, gameService, duels);
     }
@@ -179,6 +210,69 @@ class PowerUpServiceTest {
     void usingWhatYouDontHoldFails() {
         assertThrows(IllegalStateException.class,
             () -> service.use("richmond", "FREEZE", null, "ada"));
+    }
+
+    /**
+     * The duplication exploit: one held unit must produce exactly one effect under
+     * concurrency.
+     *
+     * <p>{@code use} used to read the whole {@code powerUps} map, subtract one in Java, and
+     * save the entire wallet row — the same read-modify-write {@code buy} was already
+     * converted away from. Two calls racing on a player who holds ONE FREEZE both observed
+     * {@code held = 1}, both passed the check, and both called {@code lockPlayerInput}: two
+     * opponents frozen off a single purchase. (Reveal and extra-life duplicate the same
+     * way.) The reservation is now an atomic conditional decrement, so the second caller
+     * loses against {@code power_ups > 0}.
+     */
+    @Test
+    void oneHeldUnitYieldsExactlyOneEffectUnderConcurrency() throws Exception {
+        when(duels.hasActiveDuelBetween(eq("richmond"), anyString())).thenReturn(true);
+        service.buy("richmond", "FREEZE");   // exactly one
+
+        int threads = 16;
+        java.util.concurrent.ExecutorService pool =
+            java.util.concurrent.Executors.newFixedThreadPool(threads);
+        java.util.concurrent.CountDownLatch start = new java.util.concurrent.CountDownLatch(1);
+        java.util.concurrent.atomic.AtomicInteger succeeded = new java.util.concurrent.atomic.AtomicInteger();
+
+        for (int i = 0; i < threads; i++) {
+            final String victim = "victim-" + i;
+            pool.submit(() -> {
+                try {
+                    start.await();
+                    service.use("richmond", "FREEZE", null, victim);
+                    succeeded.incrementAndGet();
+                } catch (Exception ignored) {
+                    // Everyone but the one winner is expected to fail "you do not hold a".
+                }
+                return null;
+            });
+        }
+        start.countDown();
+        pool.shutdown();
+        assertTrue(pool.awaitTermination(10, java.util.concurrent.TimeUnit.SECONDS));
+
+        assertEquals(1, succeeded.get(),
+            "exactly one of sixteen racing uses may succeed off a single held unit");
+        verify(gameService, times(1)).lockPlayerInput(anyString(), anyLong());
+        assertEquals(0, service.inventory("richmond").getOrDefault("FREEZE", 0),
+            "the single unit is spent exactly once");
+    }
+
+    /**
+     * A refused effect hands the reserved unit back — the reservation must not leak an item
+     * on the failure path either.
+     */
+    @Test
+    void aReservedUnitIsRefundedWhenTheEffectRefuses() {
+        when(duels.hasActiveDuelBetween("richmond", "stranger")).thenReturn(false);
+        service.buy("richmond", "FREEZE");
+
+        assertThrows(SecurityException.class,
+            () -> service.use("richmond", "FREEZE", null, "stranger"));
+
+        assertEquals(1, service.inventory("richmond").get("FREEZE"),
+            "the reserved unit must be returned when the board effect refuses");
     }
 
     private static long countEmpty(SudokuBoard b) {

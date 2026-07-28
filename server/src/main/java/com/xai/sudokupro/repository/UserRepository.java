@@ -120,6 +120,47 @@ public interface UserRepository extends JpaRepository<User, Long>,
     long countFriendEdge(@Param("userId") Long userId, @Param("friendId") Long friendId);
 
     /**
+     * Spends one held unit of a power-up, atomically, only if the player still holds one.
+     * Returns 1 when a unit was consumed, 0 when the player held none.
+     *
+     * <p>Required for the same reason {@link #deductGemsIfAffordable} is: {@code PowerUpService.use}
+     * read the whole {@code powerUps} map, decremented in Java, and saved the entire wallet
+     * row — the exact read-modify-write its sibling {@code buy} was already converted away
+     * from. Two concurrent uses both observed {@code held = 1} and both succeeded, so a
+     * player could FREEZE two opponents or reveal two cells off one purchase; and the
+     * full-row save reverted any gem charge that committed in between, wholesale.
+     *
+     * <p>Pushing the compare-and-decrement into one statement makes "do you hold one" a
+     * single atomic decision. The {@code power_ups > 0} guard is what a concurrent second
+     * call fails against, and the row lock the {@code UPDATE} takes is what serialises the
+     * two, so the outcome does not depend on what either transaction read earlier.
+     */
+    @Transactional
+    @org.springframework.data.jpa.repository.Modifying(clearAutomatically = true, flushAutomatically = true)
+    @Query(value = "UPDATE user_power_ups SET power_ups = power_ups - 1 "
+        + "WHERE power_ups_key = :type AND power_ups > 0 "
+        + "AND user_id = (SELECT id FROM users WHERE username = :username)",
+        nativeQuery = true)
+    int decrementPowerUpIfHeld(@Param("username") String username, @Param("type") String type);
+
+    /**
+     * Returns one unit of a power-up the player still has a row for. Returns 1 if the row
+     * was incremented, 0 if no such row exists.
+     *
+     * <p>The compensating action for {@link #decrementPowerUpIfHeld}: when a use is reserved
+     * but the board effect then refuses (not your game, no active duel, no derivable cell),
+     * the reserved unit is handed back so a rejected use costs nothing. Only ever called on
+     * a row {@code decrementPowerUpIfHeld} just decremented, so the row is known to exist.
+     */
+    @Transactional
+    @org.springframework.data.jpa.repository.Modifying(clearAutomatically = true, flushAutomatically = true)
+    @Query(value = "UPDATE user_power_ups SET power_ups = power_ups + 1 "
+        + "WHERE power_ups_key = :type "
+        + "AND user_id = (SELECT id FROM users WHERE username = :username)",
+        nativeQuery = true)
+    int incrementPowerUp(@Param("username") String username, @Param("type") String type);
+
+    /**
      * Adds {@code amount} gems and {@code xp} atomically, in the database.
      *
      * <p>Companion to {@link #deductGemsIfAffordable}, and needed for the same reason.
