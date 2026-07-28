@@ -187,8 +187,20 @@ public interface LeaderboardRepository extends JpaRepository<User, Long> {
     @Cacheable(value = "xpPointLeaders", key = "#minXp + '-' + #minLevel + '-' + #pageable")
     List<User> findXpPointLeaders(@Param("minXp") int minXp, @Param("minLevel") int minLevel, Pageable pageable);
 
+    /**
+     * Population averages for players active since {@code since}.
+     *
+     * <p>The {@code SELECT new map(...)} is load-bearing. A plain multi-select
+     * ({@code SELECT AVG(...) as avgPoints, ...}) returns {@code Object[]} from JPQL — the
+     * {@code as} aliases are cosmetic — so binding the result to a {@code Map<String,Double>}
+     * threw {@code ConversionException} the first time this ran. It never had run: the only
+     * caller, {@code getLeaderboardStats}, is not wired to any endpoint, and the service
+     * test mocks this method, so the broken projection was invisible. {@code new map(...)}
+     * asks Hibernate to build the map keyed by the aliases, which is what the return type
+     * promises.
+     */
     @Transactional(readOnly = true)
-    @Query("SELECT AVG(u.points) as avgPoints, AVG(u.duelWins) as avgDuelWins, AVG(u.cosmicDrip) as avgCosmicDrip " +
-           "FROM User u WHERE u.lastLogin > :since")
+    @Query("SELECT new map(AVG(u.points) as avgPoints, AVG(u.duelWins) as avgDuelWins, "
+         + "AVG(u.cosmicDrip) as avgCosmicDrip) FROM User u WHERE u.lastLogin > :since")
     Map<String, Double> getLeaderboardStatsSince(@Param("since") LocalDateTime since);
 }

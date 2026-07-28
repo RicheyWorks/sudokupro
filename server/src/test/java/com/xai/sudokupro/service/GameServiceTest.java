@@ -1,6 +1,5 @@
 package com.xai.sudokupro.service;
 
-import com.xai.sudokupro.engine.ChaosEngine;
 import com.xai.sudokupro.model.SudokuBoard;
 import com.xai.sudokupro.model.EnhancedMove;
 import com.xai.sudokupro.model.SudokuCell;
@@ -33,7 +32,6 @@ class GameServiceTest {
     @Mock private RedisTemplate<String, SudokuBoard> redisTemplate;
     @Mock private AnalyticsService        analyticsService;
     @Mock private AntiCheatEngine         antiCheatEngine;
-    @Mock private ChaosEngine             chaosEngine;
     @Mock private ValueOperations<String, SudokuBoard> valueOps;
 
     private GameService gameService;
@@ -47,7 +45,6 @@ class GameServiceTest {
         lenient().doNothing().when(valueOps).set(anyString(), any(), anyLong(), any());
 
         // Stub side-effects called during createNewGame.
-        lenient().doNothing().when(chaosEngine).onGameEvent(anyString(), anyString());
         lenient().doNothing().when(multiplayerBroadcaster).broadcastGameStart(anyString(), anyString());
         lenient().when(gameRepository.save(any())).thenAnswer(inv -> inv.getArgument(0));
 
@@ -66,7 +63,7 @@ class GameServiceTest {
         gameService = new GameService(
             realSolver, gameRepository, multiplayerBroadcaster,
             redisTemplate, rng, playerState, gameLockManager,
-            analyticsService, antiCheatEngine, chaosEngine
+            analyticsService, antiCheatEngine
         );
     }
 
@@ -106,7 +103,7 @@ class GameServiceTest {
         GameService service = new GameService(
             stuckSolver, gameRepository, multiplayerBroadcaster,
             redisTemplate, rng, new PlayerStateStore(stringRedis), new GameLockManager(stringRedis),
-            analyticsService, antiCheatEngine, chaosEngine);
+            analyticsService, antiCheatEngine);
         service.setEconomyService(economy);
 
         SudokuBoard board = service.createNewGame(1, "p-stuck", false, false);

@@ -1,6 +1,7 @@
 package com.xai.sudokupro.service;
 
 import com.xai.sudokupro.model.SudokuBoard;
+import com.xai.sudokupro.util.Constants;
 import com.xai.sudokupro.model.SudokuCell;
 import com.xai.sudokupro.repository.GameRepository;
 import io.micrometer.core.instrument.MeterRegistry;
@@ -122,9 +123,17 @@ public class PuzzleEditorService {
     /**
      * How hard the board is to finish, 0 (nothing left to do) to 10.
      *
-     * <p>Driven by the number of EMPTY cells. It used to be {@code (81 - emptyCells) / 9},
-     * i.e. the clue count — exactly backwards: a completed grid scored 9 ("hardest") and a
-     * grid with a single clue scored 0 ("easiest").
+     * <p>Returns a tier on the game's 1..5 scale ({@code Constants.Difficulty}), NOT a raw
+     * 0-10 count. It used to return {@code emptyCells / 9}, a 0-10 value on a completely
+     * different scale from the 1-5 tiers every other producer of the {@code difficulty}
+     * column uses — and the column is what {@code EconomyService} multiplies for the solve
+     * payout ({@code max(1, difficulty) * 10} gems and XP) and what the anti-cheat
+     * fast-solve window scales by. A 17-clue custom puzzle (64 empty cells) scored 7, paying
+     * 70 gems+XP against the 50 ceiling of a real NIGHTMARE board — a farmable 40% premium
+     * on a grid the author already knows the answer to, plus a widened cheat window. Mapping
+     * to the real tier scale removes the premium and keeps the value in the range every
+     * consumer expects. Thresholds follow the generator's own per-tier removal counts
+     * ({@code EASY 40, MEDIUM 48, HARD 52, EXTREME 54, NIGHTMARE 55}).
      */
     public int estimateDifficulty(SudokuBoard board) {
         if (board == null) {
@@ -135,8 +144,11 @@ public class PuzzleEditorService {
             .filter(cell -> cell.getValue() == 0)
             .count();
 
-        int difficulty = emptyCells / GRID_SIZE;
-        return Math.min(10, Math.max(0, difficulty));
+        if (emptyCells >= Constants.Difficulty.NIGHTMARE.cellsRemoved) return 5;
+        if (emptyCells >= Constants.Difficulty.EXTREME.cellsRemoved)   return 4;
+        if (emptyCells >= Constants.Difficulty.HARD.cellsRemoved)      return 3;
+        if (emptyCells >= Constants.Difficulty.MEDIUM.cellsRemoved)    return 2;
+        return 1;
     }
 
     private void validatePlayerId(String playerId) {

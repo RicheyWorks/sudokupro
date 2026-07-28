@@ -1,6 +1,5 @@
 package com.xai.sudokupro.service;
 
-import com.xai.sudokupro.engine.ChaosEngine;
 import com.xai.sudokupro.model.EnhancedMove;
 import com.xai.sudokupro.model.GameEvent;
 import com.xai.sudokupro.model.SudokuBoard;
@@ -50,7 +49,6 @@ public class GameService {
     private final SecureRandomGenerator randomGenerator;
     private final AnalyticsService     analyticsService;
     private final AntiCheatEngine      antiCheatEngine;
-    private final ChaosEngine          chaosEngine;
 
     // activeGames is a per-pod CACHE of boards — the authoritative copy lives in
     // Redis/DB (getGame reads through, mutations write through). Player streaks,
@@ -119,6 +117,25 @@ public class GameService {
         this.economyService = economyService;
     }
 
+    /*
+     * The ChaosEngine dependency is GONE, and so is the class (with FateEntityManager,
+     * LuckProfile and MemoryBank). Same doctrine as the pass 18-21 removals — features that
+     * ran, logged and returned normally while accomplishing nothing:
+     *
+     * ChaosEngine was write-only. Every move paid two SecureRandom draws and ~5 concurrent-
+     * map operations INSIDE the per-game lock updating luck/karma/fatigue state that no
+     * code anywhere read; the STREAK and RESET events each allocated a brand-new
+     * SecureRandom on the request thread. The player-visible mechanics the state was meant
+     * to drive — reality shift, fatigue penalty, clutch moments — were unreachable code.
+     * FateEntityManager registered 18 "fate entities" at startup that nothing ever
+     * evaluated, and whose only output was a server log line; the MultiplayerBroadcaster it
+     * injected and never called was the fossil of the intended player-visible path.
+     * MemoryBank logged events to debug and answered every summary request with a
+     * confident "no recorded history yet".
+     *
+     * NOTE: chaos-mode SWAPS are a different feature and are alive — triggerChaosSwap runs
+     * off randomGenerator on chaos-mode boards and is covered by ChaosSwapLegalityTest.
+     */
     @Autowired
     public GameService(AISolverService aiSolverService, GameRepository gameRepository,
                        MultiplayerBroadcaster multiplayerBroadcaster,
@@ -127,8 +144,7 @@ public class GameService {
                        PlayerStateStore playerState,
                        GameLockManager gameLockManager,
                        AnalyticsService analyticsService,
-                       AntiCheatEngine antiCheatEngine,
-                       ChaosEngine chaosEngine) {
+                       AntiCheatEngine antiCheatEngine) {
         this.aiSolverService       = Objects.requireNonNull(aiSolverService);
         this.gameRepository        = Objects.requireNonNull(gameRepository);
         this.multiplayerBroadcaster= Objects.requireNonNull(multiplayerBroadcaster);
@@ -138,7 +154,6 @@ public class GameService {
         this.gameLocks             = Objects.requireNonNull(gameLockManager);
         this.analyticsService      = Objects.requireNonNull(analyticsService);
         this.antiCheatEngine       = Objects.requireNonNull(antiCheatEngine);
-        this.chaosEngine           = Objects.requireNonNull(chaosEngine);
     }
 
     // =====================================================================
@@ -183,7 +198,6 @@ public class GameService {
         }
         saveToRedis(gameId, board);
         persistBoard(board);
-        chaosEngine.onGameEvent("RESET", pid);
         multiplayerBroadcaster.broadcastGameStart(gameId, pid);
         logger.info("Game created id={} player={} difficulty={}", gameId, pid, difficulty);
         return board;
@@ -458,7 +472,6 @@ public class GameService {
                 Map.of("row", String.valueOf(move.row()), "col", String.valueOf(move.col()),
                        "value", String.valueOf(move.newVal()))));
 
-            chaosEngine.onGameEvent("MOVE", playerId);
             saveToRedis(gameId, board);
             persistBoard(board);
 
@@ -469,7 +482,6 @@ public class GameService {
                 // only makes sense once getSolveTime() reflects the real elapsed duration.
                 if (antiCheatEngine.detectCheating(board.getSolveTime().toMillis(), board.getDifficulty())) {
                     antiCheatEngine.flagPlayer(playerId);
-                    chaosEngine.onGameEvent("RAGE", playerId);
                 }
                 // Feed the running suspicion score the AntiCheatScheduler enforces on.
                 // Nothing in the application did this: the score's only writer was
@@ -485,7 +497,6 @@ public class GameService {
                 // constant only exists as of pass 15 and this is its only emission point.
                 analyticsService.recordEvent(new GameEvent(GameEvent.EventType.STREAK_UPDATE, playerId,
                     Map.of("streak", String.valueOf(playerState.getStreak(playerId)))));
-                chaosEngine.onGameEvent("STREAK", playerId);
                 endGame(gameId, playerId);
             } else if (board.isInfiniteMode() && board.getLives() <= 0) {
                 endGame(gameId, playerId);
@@ -995,14 +1006,11 @@ public class GameService {
         return playerState.isPlayerLocked(playerId);
     }
 
-    public void alterGameRulesTemporarily(String playerId) {
-        activeGames.values().stream()
-            .filter(b -> playerId.equals(b.getPlayerId()))
-            .forEach(b -> {
-                if (randomGenerator.chance(0.5)) b.enableTensRule();
-                else b.enableDiagonalRules();
-            });
-    }
+    // alterGameRulesTemporarily(playerId) is GONE, with the luck/karma engine that was its
+    // only intended trigger (ChaosEngine.applyRealityShift, which itself had no callers).
+    // A method that rewrote a player's live rule set was reachable by nothing — which is
+    // fortunate, because it also broadcast no update, so the player's client would never
+    // have learned the rules changed.
 
     public void triggerCosmicEvent(SudokuBoard board, String playerId) {
         switch (randomGenerator.nextInt(3)) {
@@ -1010,7 +1018,6 @@ public class GameService {
             case 1 -> board.addCosmicHint(aiSolverService);
             case 2 -> board.invertRandomBox(randomGenerator);
         }
-        chaosEngine.updateLuck(playerId, 0.05);
         playerState.addCosmicPoints(playerId, 2);
     }
 
@@ -1028,13 +1035,11 @@ public class GameService {
 
     public int  getActiveGamesCount()           { return activeGames.size(); }
     public Map<String,SudokuBoard> getActiveGames() { return Collections.unmodifiableMap(activeGames); }
-    public String getPlayerLuckProfile(String p)    { return chaosEngine.exportLuckProfileJson(p); }
     public int  getPlayerCosmicPoints(String p)     { return playerState.getCosmicPoints(p); }
     public int  getPlayerStreak(String p)           { return playerState.getStreak(p); }
 
     public void resetPlayerStats(String playerId) {
         playerState.resetPlayer(playerId);
-        chaosEngine.resetPlayerState(playerId);
     }
 
     // =====================================================================

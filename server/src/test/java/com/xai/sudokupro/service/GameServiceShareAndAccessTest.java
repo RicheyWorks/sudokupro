@@ -224,8 +224,7 @@ class GameServiceShareAndAccessTest {
             mock(com.xai.sudokupro.websocket.MultiplayerBroadcaster.class),
             redis, rng,
             new PlayerStateStore(stringRedis), new GameLockManager(stringRedis),
-            mock(AnalyticsService.class), mock(AntiCheatEngine.class),
-            mock(com.xai.sudokupro.engine.ChaosEngine.class));
+            mock(AnalyticsService.class), mock(AntiCheatEngine.class));
     }
 
     /** Runs a snapshot through the PRODUCTION import path. */

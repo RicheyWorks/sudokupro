@@ -15,6 +15,7 @@ import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.ArgumentMatchers.anyLong;
+import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.Mockito.*;
 
 /**
@@ -143,6 +144,40 @@ class AntiCheatSchedulerTest {
         scheduler.scanForCheaters();
         assertEquals(1, scheduler.getLastFlagged().size());
         assertTrue(scheduler.getLastFlagged().containsKey(PLAYER_ID));
+    }
+
+    /**
+     * The board-pattern detector must resolve every board's owner in ONE batch query, not a
+     * findById per board.
+     *
+     * <p>It used to call findUserByPlayerId inside the loop over up to 500 boards — 500
+     * single-row lookups a minute, every minute, for a detector that fires on almost nobody.
+     * The batch fix is behaviour-preserving (same users, same decisions), so the regression
+     * guard is the query shape itself: many boards, at most one owner lookup call.
+     */
+    @Test
+    void theBoardPatternDetectorBatchLoadsOwnersInOneQuery() {
+        java.util.List<com.xai.sudokupro.model.SudokuBoard> boards = new java.util.ArrayList<>();
+        for (int i = 0; i < 50; i++) {
+            com.xai.sudokupro.model.SudokuBoard b =
+                new com.xai.sudokupro.model.SudokuBoard(2, false, false, 0, "g-" + i);
+            b.setPlayerId("player-" + i);
+            boards.add(b);
+        }
+        // Isolate the board-pattern detector: the other detectors resolve owners from
+        // THEIR maps (move rates, suspicion), so empty those to keep this test about the
+        // board path alone.
+        when(engine.getCheatSuspicionScores()).thenReturn(java.util.Collections.emptyMap());
+        when(engine.getMoveRates()).thenReturn(java.util.Collections.emptyMap());
+        when(gameRepository.findActiveUnfinishedGames(any(), any())).thenReturn(boards);
+        when(userRepository.findByUsernameIn(any())).thenReturn(java.util.List.of());
+
+        scheduler.scanForCheaters();
+
+        // One batch lookup for the whole page of boards...
+        verify(userRepository, times(1)).findByUsernameIn(any());
+        // ...and never a per-board single-row lookup (the N+1 the batch replaced).
+        verify(userRepository, never()).findByUsername(anyString());
     }
 
     /** Scanning with nothing suspicious must not touch the database or throw. */

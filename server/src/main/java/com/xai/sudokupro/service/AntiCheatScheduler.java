@@ -258,9 +258,23 @@ public class AntiCheatScheduler {
         List<SudokuBoard> recentBoards = gameRepository.findActiveUnfinishedGames(cutoff, PageRequest.of(0, 500))
             .stream()
             .collect(Collectors.toList());
+
+        // Batch-resolve every board's owner in ONE query instead of a findById per board.
+        // This used to call findUserByPlayerId inside the loop — up to 500 single-row
+        // lookups a minute, every minute, forever, for a detector that fires on almost
+        // nobody. The owners are usernames (the authenticated principal's name); collect
+        // the distinct set, load them once, and look up from the map.
+        Set<String> owners = recentBoards.stream()
+            .map(SudokuBoard::getPlayerId)
+            .filter(id -> id != null && !id.isBlank() && !"anonymous".equals(id) && !id.startsWith("__"))
+            .collect(Collectors.toSet());
+        Map<String, User> usersByName = owners.isEmpty() ? Map.of()
+            : userRepository.findByUsernameIn(owners).stream()
+                .collect(Collectors.toMap(User::getUsername, u -> u, (a, b) -> a));
+
         recentBoards.forEach(board -> {
             String playerId = board.getPlayerId();
-            User user = findUserByPlayerId(playerId);
+            User user = usersByName.get(playerId);
             if (user != null) {
                 double suspicionScore = suspicionScores.getOrDefault(playerId, 0.0);
                 int cosmicMoves = (int) board.getMoveHistory().stream()

@@ -1,7 +1,6 @@
 package com.xai.sudokupro.service;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
-import com.xai.sudokupro.engine.ChaosEngine;
 import com.xai.sudokupro.model.EnhancedMove;
 import com.xai.sudokupro.model.SudokuBoard;
 import com.xai.sudokupro.model.SudokuCell;
@@ -126,7 +125,7 @@ class GameServiceCacheCoherenceTest {
         GameService service = new GameService(
             new AISolverService(rng), repo, mock(MultiplayerBroadcaster.class),
             boardRedis, rng, new PlayerStateStore(downRedis), new GameLockManager(downRedis),
-            mock(AnalyticsService.class), mock(AntiCheatEngine.class), mock(ChaosEngine.class));
+            mock(AnalyticsService.class), mock(AntiCheatEngine.class));
         service.setVersionRedis(versionRedis);
         return service;
     }

@@ -1,6 +1,5 @@
 package com.xai.sudokupro.service;
 
-import com.xai.sudokupro.engine.ChaosEngine;
 import com.xai.sudokupro.model.EnhancedMove;
 import com.xai.sudokupro.model.SudokuBoard;
 import com.xai.sudokupro.repository.GameRepository;
@@ -61,7 +60,7 @@ class GameServicePowerUpEffectTest {
         gameService = new GameService(
             new AISolverService(rng), gameRepository, broadcaster, redisTemplate, rng,
             new PlayerStateStore(downRedis), new GameLockManager(downRedis),
-            mock(AnalyticsService.class), mock(AntiCheatEngine.class), mock(ChaosEngine.class));
+            mock(AnalyticsService.class), mock(AntiCheatEngine.class));
     }
 
     private long countEmpty(SudokuBoard board) {

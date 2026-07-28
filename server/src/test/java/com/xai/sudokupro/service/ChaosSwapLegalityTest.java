@@ -109,8 +109,7 @@ class ChaosSwapLegalityTest {
             mock(PlayerStateStore.class),
             mock(GameLockManager.class),
             mock(AnalyticsService.class),
-            mock(AntiCheatEngine.class),
-            mock(com.xai.sudokupro.engine.ChaosEngine.class));
+            mock(AntiCheatEngine.class));
     }
 
     @Test

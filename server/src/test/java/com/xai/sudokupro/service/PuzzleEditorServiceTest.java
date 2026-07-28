@@ -203,7 +203,7 @@ class PuzzleEditorServiceTest {
         service.createCustomPuzzle(copyOf(VALID_PUZZLE), "player-1", false);
 
         // 51 blanks, counted by hand from VALID_PUZZLE, over nine rows.
-        assertEquals(5, captureSaved().getDifficulty(),
+        assertEquals(2, captureSaved().getDifficulty(),
             "the estimate was computed and then thrown away, leaving difficulty 0");
     }
 
@@ -455,37 +455,63 @@ class PuzzleEditorServiceTest {
 
     // ── difficulty estimation ─────────────────────────────────────────────────
 
-    /** A finished grid has nothing left to solve; the old formula scored it 9 of 10. */
+    /** A finished grid has nothing left to solve; it is the easiest tier, 1. */
     @Test
     void aCompletedGridIsTheEasiestPossibleBoard() {
-        assertEquals(0, service.estimateDifficulty(boardOf(SOLUTION)));
+        assertEquals(1, service.estimateDifficulty(boardOf(SOLUTION)));
     }
 
-    /** 51 blanks over nine rows. Counted by hand from VALID_PUZZLE. */
+    /**
+     * 51 blanks (30 clues) maps to tier 2 on the game's 1..5 scale — the scale the economy
+     * and anti-cheat both read. This used to assert 5, treating the editor's old 0-10 count
+     * as if it were a tier; that mismatch is exactly what would have paid a 17-clue custom
+     * board 70 gems, over a real NIGHTMARE's 50.
+     */
     @Test
-    void difficultyOfTheThirtyClueBoardIsFive() {
-        assertEquals(5, service.estimateDifficulty(boardOf(VALID_PUZZLE)));
+    void difficultyOfTheThirtyClueBoardMapsToTierTwo() {
+        assertEquals(2, service.estimateDifficulty(boardOf(VALID_PUZZLE)));
     }
 
     /** Implementation-independent invariant: taking clues away cannot make a board easier. */
     @Test
     void fewerCluesIsNeverEasier() {
         int[][] fewerClues = copyOf(VALID_PUZZLE);
-        for (int c = 0; c < 9; c++) fewerClues[0][c] = 0;   // 21 clues left
+        for (int r = 0; r < 9; r++)
+            for (int c = 0; c < 9; c++) fewerClues[r][c] = 0;   // wipe to the emptiest grid
 
         int harder = service.estimateDifficulty(boardOf(fewerClues));
         int easier = service.estimateDifficulty(boardOf(VALID_PUZZLE));
         assertTrue(harder > easier,
-            "removing three clues rated the board " + harder + " vs " + easier);
+            "an empty grid must rate harder than a 30-clue one: " + harder + " vs " + easier);
     }
 
     @Test
-    void difficultyStaysInsideZeroToTen() {
+    void difficultyStaysInsideTheOneToFiveTierScale() {
         int[][] oneClue = new int[9][9];
-        oneClue[0][0] = 5;
+        oneClue[0][0] = 5;   // 80 empty cells — the emptiest legal grid
 
         int d = service.estimateDifficulty(boardOf(oneClue));
-        assertTrue(d >= 0 && d <= 10, "difficulty out of range: " + d);
+        assertTrue(d >= 1 && d <= 5, "difficulty must be a 1..5 tier, got: " + d);
+        assertEquals(5, d, "80 empties is the hardest tier");
+    }
+
+    /**
+     * The editor must never write a difficulty the economy would over-pay for. This pins the
+     * whole exploit closed: for every legal empty-cell count, the estimate stays within the
+     * tier range EconomyService multiplies, so no custom board can out-earn a NIGHTMARE.
+     */
+    @Test
+    void noLegalBoardEstimatesAboveTheNightmareTier() {
+        for (int empties = 0; empties <= 81; empties++) {
+            int[][] grid = new int[9][9];
+            int filled = 81 - empties;
+            int placed = 0;
+            outer:
+            for (int r = 0; r < 9 && placed < filled; r++)
+                for (int c = 0; c < 9 && placed < filled; c++) { grid[r][c] = 1; placed++; }
+            int d = service.estimateDifficulty(boardOf(grid));
+            assertTrue(d >= 1 && d <= 5, empties + " empties gave tier " + d);
+        }
     }
 
     @Test
@@ -501,7 +527,7 @@ class PuzzleEditorServiceTest {
 
         assertEquals(1.0, counterCount("sudokupro.custom.puzzles.created", "verified", "true"));
         assertEquals(0.0, counterCount("sudokupro.custom.puzzles.created", "verified", "false"));
-        assertEquals(1.0, counterCount("sudokupro.custom.puzzles.by.difficulty", "level", "5"));
+        assertEquals(1.0, counterCount("sudokupro.custom.puzzles.by.difficulty", "level", "2"));
         assertEquals(0.0, counterCount("sudokupro.custom.puzzles.failed"));
     }
 
